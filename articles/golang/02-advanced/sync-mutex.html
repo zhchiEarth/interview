@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.Mutex 原理 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.Mutex 原理
+
+> RWMutex 单独成篇 → [sync.RWMutex 原理](sync-rwmutex.html)
+
+## 一、Mutex 是干嘛用的
+
+互斥锁解决的核心问题：**多个 goroutine 同时操作一份共享状态时，要保证"一次只有一个能操作"**——典型场景如修改共享 map、累加全局计数器、写文件。
+
+```go
+var mu sync.Mutex
+var count int
+
+mu.Lock()
+count++          // 这里只会有一个 G 在执行
+mu.Unlock()
+```
+
+### Go Mutex 的设计目标
+
+| 目标 | 怎么做到 |
+|---|---|
+| **无竞争时几乎零开销** | 一次 CAS 拿到锁（~20 ns） |
+| **轻度竞争时不进内核** | 多核环境下自旋几次试一下 |
+| **重度竞争才挂起** | 进入 runtime 的 sema 等待队列，让出 P |
+| **防止老 G 饿死** | 饥饿模式：等太久的 G 优先拿锁 |
+
+### 三条铁律
+
+- **不可重入**——拿了锁的 G 再 Lock 自己 → **死锁**（Go 没有 ReentrantLock）
+- **不能被复制**——复制后两份 state 各自更新，锁就坏了（`go vet` 会报）
+- **解锁的不必是加锁的 G**——但实战中几乎都是同一个；跨 G 解锁很容易写错
+
+---
+
+## 二、整体结构：8 字节做出一把锁
+
+```go
+type Mutex struct {
+    state int32   // 状态位 + 等待者数
+    sema  uint32  // runtime 信号量,等待者挂在这里
+}
+```
+
+总共 **8 字节**——这就是一把锁的所有数据。
+
+```
+┌──────────────────────────┐
+│   Mutex (8 字节)         │
+├──────────────────────────┤
+│   state (4 字节,int32)   │  ← Locked / Woken / Starving + 等待者数
+│   sema  (4 字节,uint32)  │  ← runtime 信号量,等待 G 挂在这里
+└──────────────────────────┘
+```
+
+### 核心思路
+
+> **能用 CAS 解决就别进内核**。
+
+进内核（syscall + 调度切换）大约 **3000~10000 ns**；一次 CAS 大约 **5~20 ns**——**差 100 ~ 1000 倍**。
+
+所以 Mutex 设计的所有复杂度，本质上都是为了"**尽量在用户态用原子操作搞定，迫不得已才让 G 挂起**"。
+
+---
+
+## 三、state 字段：把 4 件事塞进 32 bit
+
+```text
+高 29 bit                            低 3 bit
+─────────────────────────────────────────────
+   等待者数 N                       S  W  L
+                                   │  │  └── Locked   (bit 0)：1=被锁住
+                                   │  └───── Woken    (bit 1)：1=有 G 被唤醒去抢
+                                   └──────── Starving (bit 2)：1=饥饿模式
+
+例：state = 0b...0010_111 = 等待者 2 个、Starving=1、Woken=1、Locked=1
+```
+
+### 各位详解
+
+| 位 | 名字 | 含义 | 谁会改 |
+|---|---|---|---|
+| 0 | **Locked** | 1 = 锁被持有 | Lock/Unlock 时 CAS |
+| 1 | **Woken** | 1 = 已有等待者被唤醒去抢了 | 防止 Unlock 唤醒多个，避免"惊群" |
+| 2 | **Starving** | 1 = 当前处于饥饿模式 | 进入/退出饥饿模式时 |
+| 3~31 | **waiter** | 等待这把锁的 G 数量 | 入队 +1，出队 -1 |
+
+### 为什么要塞一起
+
+**一次 CAS 同时改多个位**：
+
+例如 Lock 抢到锁的瞬间，要同时做：
+- Locked 置 1
+- Woken 清零（"我抢到了，不用别人再来抢"）
+- 自己如果是等待者，要把 waiter 数减 1
+
+如果这些状态分散在多个字段，**就需要多次原子操作**——中间还可能被其他 G 看见不一致状态。塞一起一次 CAS 解决，又快又安全。
+
+---
+
+## 四、Lock 完整流程（4 阶段）
+
+```text
+                G 调 Lock()
+                    │
+                    ▼
+   ┌──────────────────────────────────────┐
+   │ ① Fast Path: CAS state Locked 0→1?   │
+   └──────────────┬───────────────────────┘
+                  │
+            成功 ─┤── 失败
+        拿到锁返回│
+                  ▼
+   ┌──────────────────────────────────────┐
+   │ ② Spin Phase: 自旋抢锁                │
+   │    条件: 多核 + 自旋 < 4 次 +         │
+   │          锁未释放 + 非饥饿模式         │
+   │    动作: PAUSE 指令空转                │
+   │    成功: Locked 变 0 → 立刻 CAS 抢    │
+   └──────────────┬───────────────────────┘
+                  │
+            失败 ─┤
+                  ▼
+   ┌──────────────────────────────────────┐
+   │ ③ Park Phase: 真的挂起                │
+   │    state.waiter++           原子加     │
+   │    runtime_SemacquireMutex(&sema)     │
+   │    → G 进入 _Gwaiting,M 解绑去跑别的  │
+   └──────────────┬───────────────────────┘
+                  │
+          被唤醒 ─┤
+                  ▼
+   ┌──────────────────────────────────────┐
+   │ ④ Wake Phase: 醒来后处理              │
+   │    看等了多久?                         │
+   │    >1ms → 把 state.Starving 置 1      │
+   │    饥饿模式 → 直接拿锁 (Unlock 已交付) │
+   │    正常模式 → 回到 ① 重抢              │
+   └──────────────────────────────────────┘
+```
+
+### Fast Path：99% 走这里
+
+无竞争时一条 CAS 指令搞定：
+
+```go
+// 伪代码
+if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+    return  // 拿到锁了, ~20 ns
+}
+```
+
+`state == 0` 表示锁空闲，CAS 把它改成 `mutexLocked (=1)`。这是最常见的路径，应用代码中 **99% 的 Lock 调用**都走这里。
+
+### Spin Phase：为什么要自旋
+
+> **一句话(最重要):用少量 CPU 空转，换掉一次昂贵的上下文切换。**
+
+**上下文切换为什么昂贵?**
+
+- **陷入内核**：park / 唤醒要从用户态切进内核态，走 trap + 系统调用路径
+- **保存 / 恢复现场**：寄存器、栈指针、PC 全要存下来，切回时再原样还原
+- **调度器开销**：内核得重新挑一个线程来跑，过一遍调度逻辑
+- **缓存 / TLB 变冷**：被换下去的线程，它的 L1/L2 缓存、TLB 大概率被新线程冲掉；切回来一片冷数据要重新预热——这往往是最隐蔽也最贵的一笔
+- **量级**：一次切换 ~几千 ns（μs 级），而自旋一次只要几十 ns——**差 100 ~ 1000 倍**
+
+如果 CAS 失败，**不要立刻睡** ——锁可能马上就被释放：
+
+```
+锁的持有者: ─────────不知道还要多久───────→ Unlock()
+                                              ↑
+   我 CAS 失败 ─── 自旋几次 ─── 抢到了 ✓
+                     ~50 ns
+
+VS. 立刻睡:
+   我 CAS 失败 ─── 挂起 sema ─── 唤醒 ─── 抢
+                     几千 ns       几千 ns
+```
+
+**多核环境下宁可空转一会儿**。Go 的自旋限制：
+
+1. 必须**多核** CPU（单核自旋没意义，持有者跑不到 Unlock）
+2. 自旋次数 **< 4 次**（每次 30 个 PAUSE 指令）
+3. 锁仍然被持有（持有者快放锁的迹象）
+4. **不在饥饿模式**（饥饿模式禁止抢锁，直接交付）
+
+### Park Phase：真的拿不到就挂起
+
+自旋失败了，说明锁的持有者确实在做长事——**老老实实进 runtime 等待队列**：
+
+```go
+runtime_SemacquireMutex(&m.sema, queueLifo, skipframes)
+```
+
+这一步：
+1. 在 `m.sema` 这个信号量上挂一个 sudog 节点（包含当前 G）—— sudog 是什么、为什么所有同步原语都用它？见 [sudog：阻塞/唤醒的通用节点](../03-expert/sudog.html)
+2. 调 `gopark()` → G 状态变 `_Gwaiting`
+3. M 解绑当前 G，去跑别的 G
+
+> 注意：`m.sema` 不是 OS 信号量（sem_wait/sem_post 那种），是 **Go runtime 内部实现的 G 等待队列**——见后面"信号量是什么"章节。
+
+### Wake Phase：被唤醒后
+
+被 Unlock 唤醒后，**先看自己等了多久**：
+
+```
+醒来时间 - 第一次挂起时间 > 1ms?
+   ├─ 是 → 进入饥饿模式 (state.Starving=1)
+   │        Unlock 已经把锁直接交给我了, 不用再抢
+   └─ 否 → 正常模式, 回到 ① Fast Path 跟新 G 一起抢
+```
+
+---
+
+## 五、Unlock 完整流程
+
+```text
+                Unlock()
+                    │
+                    ▼
+   ┌──────────────────────────────────────┐
+   │ ① CAS: state -= mutexLocked          │
+   │    把 Locked 位清 0                   │
+   └──────────────┬───────────────────────┘
+                  │
+            还有等待者?
+            ├─ 没 → 完事 (state == 0)
+            └─ 有 ──┐
+                    ▼
+   ┌──────────────────────────────────────┐
+   │ ② 看模式选择唤醒策略                  │
+   │                                       │
+   │  正常模式:                             │
+   │    唤醒一个等待者 G                    │
+   │    标记 Woken=1 (防止重复唤醒)         │
+   │    被唤醒的 G 跟新 G 抢锁              │
+   │                                       │
+   │  饥饿模式:                             │
+   │    不清 Locked 位 (避免新 G 抢)        │
+   │    直接把锁"交付"给队首 G              │
+   │    队首 G 醒来就持锁,不用 CAS          │
+   └──────────────────────────────────────┘
+```
+
+### Fast Path：也是一条 CAS
+
+无等待者的常见情况：
+
+```go
+new := atomic.AddInt32(&m.state, -mutexLocked)
+if new == 0 {
+    return  // 锁释放了, 没人等, 完事 ~10 ns
+}
+// 否则要处理唤醒
+```
+
+### Slow Path：唤醒一个等待者
+
+```go
+runtime_Semrelease(&m.sema, handoff, skipframes)
+```
+
+`handoff` 参数：
+- `false`：正常模式，把锁释放，唤醒一个 G，被唤醒的 G 醒来后还要去抢
+- `true`：饥饿模式，**直接把锁交付**给队首 G——队首醒来发现 Locked 还是 1，但锁是它的了，跳过抢锁阶段
+
+---
+
+## 六、正常模式 vs 饥饿模式
+
+这是 Go 1.9 加入的设计，**理解它就理解了 Mutex 的精髓**。
+
+### 没有饥饿模式会怎样
+
+只有正常模式时，**老 G 可能永远抢不到锁**：
+
+```text
+时刻 T0: 锁被 G_lock 持有, G_old 已挂起等待
+
+时刻 T1: G_lock 调 Unlock
+         ├─ 唤醒 G_old (但唤醒+调度需要几千 ns)
+         └─ 此时新来的 G_new 调 Lock()
+
+       G_old 醒来 ─────────────┐
+       从 sema 出队              │ 同时 CAS state
+       (缓存冷、刚醒来还要调度)  │
+                                 │
+       G_new 已在 CPU 上跑       │
+       (缓存预热、CAS 立刻执行)  │
+                                 ▼
+              G_new 抢赢的概率 >> G_old
+
+时刻 T2: G_new 拿到锁,G_old 又睡回 sema
+时刻 T3: 重复上面流程,G_old 又输给下一个 G_new
+...
+G_old 等了很久,还是拿不到 → 饿死
+```
+
+这就是 **lock convoy / unfair scheduling** 问题——Mutex 的吞吐很高（CPU 上跑的 G 总是赢），但**最差延迟可能无界**。
+
+### 饥饿模式怎么救
+
+```text
+G_old 在 sema 队列里等了 >1ms
+         │
+         ▼
+  把 state.Starving 置 1   ← 切换到饥饿模式
+         │
+         ▼
+  从此:
+    ├─ 新来的 G_new 调 Lock → 直接进队尾,不许抢
+    │     (Lock 看到 Starving=1 就 park, 不走 spin)
+    │
+    ├─ Unlock 时不解 Locked 位,直接把锁"交付"给队首 G_old
+    │     (G_old 醒来发现自己就是新持有者)
+    │
+    └─ G_old 醒来时:
+          - 等待时间 < 1ms ? → 清掉 Starving 位 (危险解除)
+          - 还是 > 1ms  ? → 保持饥饿模式
+          - 自己是队列最后一个 → 也清 Starving
+```
+
+### 两种模式对照表
+
+| 模式 | 新到的 G | 等待队列里的 G | 优先级 |
+|---|---|---|---|
+| **正常** | 自旋抢锁（缓存热，常赢） | 醒来跟新 G 抢 | **吞吐** |
+| **饥饿** | 不能抢，必须排队 | 队首直接拿，不用抢 | **公平** |
+
+### 两个阈值
+
+```
+进入饥饿: 等待时间 > 1ms       (starvationThresholdNs = 1e6)
+退出饥饿: 队首 G 等待 < 1ms
+         或者 当前 G 是队列里最后一个
+```
+
+动态切换——平时跑吞吐，发现有 G 等太久了立刻切公平，等公平问题解除了再切回吞吐。
+
+---
+
+## 七、sema 信号量是什么
+
+很多人以为 `m.sema` 是 POSIX 信号量（`sem_wait` / `sem_post`），其实不是——它是 **Go runtime 自己实现的 G 等待队列**：
+
+```go
+runtime_SemacquireMutex(&m.sema, lifo, skipframes)
+   ↓ 实际做的事
+1. 在 sudog (semaphore wait queue) 上挂一个节点,记录:
+   - 当前 G
+   - 等待的 sema 地址
+   - 进入时间 (用于饥饿判定)
+2. 调 gopark() → 当前 G 状态变 _Gwaiting
+3. M 解绑当前 G,去 P 队列拿下一个 G 跑
+
+runtime_Semrelease(&m.sema, handoff, skipframes)
+   ↓
+1. 从 sudog 队列取一个等待节点 (LIFO)
+2. 调 goready() → 那个 G 状态变 _Grunnable
+3. 加入 P 的本地队列,等被调度
+```
+
+### 心智模型：一把锁 = 一条队列
+
+> **理解 Mutex 时,直接把 `m.sema` 当成一条队列就行**：一把锁一条队，所有等这把锁的 G（的 sudog）按先后排在这条队上，先睡先排；Unlock 时从队里捞一个唤醒。看懂 Lock/Unlock、饥饿模式，这个模型完全够用。
+
+只需在脑子里留一个**小星号**，被追问"队列到底存哪"时不卡壳：
+
+| 心智模型 | 精确的真相 |
+|---|---|
+| `m.sema` 是个队列 | 它只是个 `uint32`，4 字节存不下队列——它是队列的 **key（门牌号）** |
+| 队列就在 sema 里 | 队列在**全局 `semtable`** 里，靠 `&m.sema` 哈希定位 |
+| 所有 sudog 排这 | ✅ 这句**完全对**——等同一把锁的 sudog 确实串在同一条链上 |
+
+### 真实结构：semtable → 桶 → treap → waitlink
+
+`m.sema` 自己不存队列，runtime 用一张**全局表 `semtable`** 存所有锁的等待者：
+
+```text
+   &m.sema (取地址当 key)
+        │  哈希: (uintptr(&m.sema) >> 3) % 251
+        ▼
+   全局 semtable[251]   (251 个桶, 进程唯一)
+   桶0 桶1 ... 桶k ... 桶250
+                │
+                ▼  桶里一棵 treap(BST+堆), 按【地址】排序
+                      node(addr=B)         ← 每个不同地址 = 一个 treap 节点(队头)
+                     /          \
+              node(addr=A)   node(addr=&m.sema)   ← 我们这把锁
+                                   │
+                                   ▼  waitlink 链: 等【同一把锁】的 G 排这条
+                            sudog → sudog → sudog
+                            (G_a)   (G_b)   (G_c)
+```
+
+两层别混：
+
+- **treap 层**：解决"很多把**不同的锁**哈希进了同一个桶"，按地址 O(log n) 找到目标队。每个地址在 treap 里只放**一个代表 sudog**（队头）。
+- **waitlink 层**：**同一把锁**的多个等待 G，串在那个代表 sudog 后面。**这条链才是心智模型里的那条"队"。**
+
+> 为什么哈希分 251 个桶？**降低锁竞争**——不同的锁散到不同桶，各桶各有小锁，互不阻塞。
+
+入队 / 出队（对应上面的 Semacquire / Semrelease）：
+
+```text
+入队 (Park):
+   acquireSudog → 锁住桶 → 在 treap 找 &m.sema
+     ├─ 第一个等这把锁 → 把 sudog 插成新 treap 节点 (按 ticket 旋转保持平衡)
+     └─ 已有人等       → 追加到该节点的 waitlink 尾 (饥饿交付时 LIFO 插队头)
+   → gopark() → G 变 _Gwaiting
+
+出队 (Unlock):
+   锁住桶 → 在 treap 找到 &m.sema 节点 → 从 waitlink 取一个 sudog
+     └─ 若 waitlink 空了 → 把该地址节点从 treap 删掉
+   → goready(g) → G 变 _Grunnable 回 P 队列
+```
+
+> sudog 是什么、为什么所有同步原语都用它 → [sudog：阻塞/唤醒的通用节点](../03-expert/sudog.html)
+
+### 为什么不直接用 OS 信号量
+
+| 维度 | OS 信号量 (sem_wait) | Go runtime sema |
+|---|---|---|
+| 切换开销 | syscall + 调度上下文切换（几千 ns） | 纯用户态 gopark/goready（几百 ns） |
+| 可见性 | 让出 OS 线程 | 只让出 G，M 继续跑别的 G |
+| 与 P 协作 | 不知道 | 走 GMP 调度，效率高 |
+
+**Go 的 sema 完全在 runtime 内部**——不切换线程，不进内核，只是把 G 挂到一个等待链表上让 M 去跑别人。
+
+---
+
+## 八、Lock 性能数据（直觉值）
+
+| 场景 | 耗时（数量级） |
+|---|---|
+| 无竞争 Lock + Unlock | **~20 ns**（Fast Path 一次 CAS） |
+| 自旋一次成功 | ~50 ns |
+| 自旋失败 + 挂起 + 唤醒 | **~5000 ns** |
+| 跨 NUMA 节点的缓存争抢 | 更慢 |
+
+→ **临界区比 20 ns 还短时，Mutex 的开销已经超过临界区本身**——这种场景考虑用原子操作 / lock-free 数据结构。
+
+---
+
+## 九、常见使用陷阱
+
+### ① Mutex 不能被复制
+
+```go
+// ❌ 错的
+type Counter struct{ mu sync.Mutex }
+
+func (c Counter) Inc() {     // 值接收者!
+    c.mu.Lock()              // 锁的是 Counter 的拷贝, 没意义
+    c.mu.Unlock()
+}
+```
+
+修法：用指针接收者 `func (c *Counter) Inc()`。`go vet` 会报这种错。
+
+### ② Mutex 不可重入
+
+```go
+// ❌ 死锁
+func recursive(mu *sync.Mutex) {
+    mu.Lock()
+    defer mu.Unlock()
+    recursive(mu)   // 自己等自己, 死锁
+}
+```
+
+Go 故意不支持重入——逼你**用更清晰的设计**（比如把临界区拆小、避免回调内拿同一把锁）。
+
+### ③ 解锁的不必是加锁的 G
+
+```go
+// 合法但容易写错
+func produce(mu *sync.Mutex, ch chan<- func()) {
+    mu.Lock()
+    ch <- mu.Unlock   // 让别的 G 去解锁
+}
+```
+
+虽然 Go 允许，但**强烈建议同一个 G 加同一个 G 解**，否则代码极难推理。
+
+### ④ defer Unlock 的开销
+
+```go
+mu.Lock()
+defer mu.Unlock()
+// 临界区
+```
+
+`defer` 在 Go 1.14+ 用开放编码几乎零开销（详见 [Defer 是怎么实现的？](defer.html)）——**正常用就行**，别为了"省"那点开销而显式 Unlock 然后被异常路径漏掉。
+
+---
+
+## 十、一图总结
+
+```
+┌────────── Mutex (8 字节) ────────┐
+│  state (32 bit)                  │
+│   ├─ Locked   (1 bit)            │
+│   ├─ Woken    (1 bit)            │
+│   ├─ Starving (1 bit)            │
+│   └─ waiterN  (29 bit)           │
+│  sema  (32 bit)                  │ ← runtime G 等待队列
+└──────────────────────────────────┘
+
+Lock 流程 (4 阶段):
+   ① Fast: CAS Locked 0→1    [~20ns, 99% 走这]
+   ② Spin: PAUSE 自旋 4 次     [多核 + 锁快放时]
+   ③ Park: sema 挂起          [~5000ns]
+   ④ Wake: 醒后看等了多久,
+           >1ms → 进饥饿模式
+
+Unlock:
+   ① CAS Locked 1→0
+   ② 唤醒一个等待者
+      正常: 唤醒去抢
+      饥饿: 直接交付队首
+
+两种模式:
+   正常 (追吞吐): 新 G 自旋抢锁 (缓存热,常赢)
+   饥饿 (保公平): 新 G 不许抢,锁直接交队首
+   阈值: 等待 > 1ms 进饥饿, < 1ms 退饥饿
+
+性能直觉:
+   无竞争:    ~20 ns   (CAS)
+   轻度竞争:  ~50 ns   (自旋成功)
+   重度竞争: ~5000 ns  (挂起+唤醒)
+```
+
+**一句话**：Mutex = **state 位运算 + CAS + runtime 信号量**；先 Fast Path 抢，再自旋几次，最后挂起；**正常模式追吞吐、饥饿模式保公平**，两种模式按等待时间 1ms 阈值动态切换。8 字节就实现了一把高性能、防饿死、跨平台的互斥锁。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-mutex" data-base="../../"></script>
+</body>
+</html>

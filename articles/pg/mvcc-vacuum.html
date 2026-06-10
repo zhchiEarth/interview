@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MVCC 与 VACUUM · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# MVCC 与 VACUUM
+
+> 一句话：PostgreSQL 的 MVCC 把**旧版本直接留在堆表里**（不像 InnoDB 把旧版放 undo 段），每行靠隐藏列 **xmin / xmax** + 事务快照 + 提交日志(clog) 判断可见性；代价是 UPDATE/DELETE 会留下**死元组**导致表膨胀，必须靠 **VACUUM** 回收空间、靠 **FREEZE** 防止 32 位事务 ID **回卷(wraparound)**。
+
+> 本文以 PostgreSQL 主流版本（**PG 12 ~ 16**，以 PG 16 为准）为基准，机制在这些版本间无本质差异。隔离级别、快照如何防异常见 [事务与隔离级别](transaction.html)。
+
+## 一、PG 的 MVCC 和 MySQL 不一样：旧版本就在堆表里
+
+MVCC（Multi-Version Concurrency Control，多版本并发控制）的目标都一样——**读不阻塞写、写不阻塞读**。但 PG 和 InnoDB 在"旧版本放哪里"上做了**完全不同**的选择，这是 PG 一切特性（死元组、VACUUM、回卷）的根源。
+
+| | PostgreSQL | MySQL InnoDB |
+|---|---|---|
+| 旧版本存哪 | **直接留在堆表(heap)里**，新旧版本是表里并存的多行 | 旧版本放进 **undo 段**，表里只留最新行 |
+| 更新方式 | UPDATE = **插入一行新元组** + 把旧元组标记为"已删" | **就地修改**，旧值写一份到 undo log |
+| 旧版本回收 | 死元组堆积，靠 **VACUUM / autovacuum** 异步清理 | undo 由 **purge 线程**清理 |
+| 读旧版本 | 直接读堆里那一行旧元组 | 沿 undo 版本链(roll_pointer)重建 |
+| 副作用 | 表 / 索引**膨胀(bloat)**；事务 ID **回卷**风险 | undo 表空间增长；长事务撑大 undo |
+
+```text
+   PostgreSQL: 旧版本就在表里                InnoDB: 表里只有最新, 旧版去 undo
+   ┌─ heap page ─────────────┐              ┌─ heap ─┐   ┌─ undo log ─┐
+   │ (v1) balance=100 [dead] │              │ 最新行  │──→│ 旧版本 100 │
+   │ (v2) balance=200 [dead] │              │ bal=300 │   │ 旧版本 200 │
+   │ (v3) balance=300 [live] │              └────────┘   └────────────┘
+   └─────────────────────────┘
+```
+
+### 1.1 每个元组的隐藏系统列：xmin / xmax
+
+PG 每个元组(tuple，即表里的一行物理记录)除了用户列，还带几个隐藏系统列，MVCC 最关键的是两个事务 ID：
+
+| 系统列 | 含义 |
+|---|---|
+| **xmin** | **创建（INSERT，或 UPDATE 产生的新版本）这个元组的事务 ID** |
+| **xmax** | **删除 / 更新（使其失效）这个元组的事务 ID**；为 0 表示该元组当前未被删除 |
+
+可以直接 SELECT 出来看（`xmin`/`xmax` 是系统列）：
+
+```sql
+-- 任何表都能查这两个隐藏列
+SELECT xmin, xmax, * FROM accounts WHERE id = 1;
+
+-- 看当前事务 id（每条语句的 xid 不同, 64 位封装值见第六节）
+SELECT txid_current();
+```
+
+## 二、更新 = 插入新元组 + 旧元组打 xmax → 产生死元组
+
+PG **不就地修改**一行。一条 UPDATE 实际做了两件事：
+
+```text
+   UPDATE accounts SET balance = 200 WHERE id = 1;   -- 假设当前事务 xid = 50
+
+   步骤①  把旧元组的 xmax 设为 50      (标记"我被 50 删了")
+   步骤②  在堆里插入一个新元组         (xmin=50, xmax=0, balance=200)
+
+   ┌─ heap ─────────────────────────────────┐
+   │ 旧: balance=100  xmin=10  xmax=50  ◄─── 变成"死元组候选"           │
+   │ 新: balance=200  xmin=50  xmax=0   ◄─── 当前活元组                 │
+   └─────────────────────────────────────────┘
+```
+
+- 当事务 50 **提交**后，旧元组对任何新事务都不再可见 → 它就成了 **死元组(dead tuple)**，占着空间但没用。
+- DELETE 更简单：只设旧元组的 xmax，不插新元组，旧元组同样变死元组。
+- **关键结论**：PG 里 UPDATE 和 DELETE 都会产生死元组，**高频更新的表死元组堆积极快**。这是 PG 运维的核心矛盾，VACUUM 就是来解决它的。
+
+## 三、可见性判断：快照 + xmin/xmax + 提交日志(clog)
+
+一个元组对"当前事务"是否可见，PG 综合三样东西判断：
+
+1. **事务快照(snapshot)**：记录"在某一刻，哪些事务正在运行(还没提交)"。核心三部分——`xmin`(最早还活跃的 xid，比它早的都已结束)、`xmax`(下一个将分配的 xid，即上界)、`xip_list`(此刻仍活跃的 xid 列表)。
+2. **元组的 xmin / xmax**：谁创建、谁删除了它。
+3. **提交日志 clog（pg_xact）**：记录每个事务的最终状态——已提交 / 已回滚 / 进行中。光看 xmin 还不够，得查 clog 确认那个事务**到底提交没提交**。
+
+可见性的直觉规则（简化版）：
+
+```text
+   元组可见  ⇔  ① 它的 xmin 已提交(查 clog) 且对我的快照"可见"
+                  (即 xmin < 快照.xmin, 或不在 xip_list 活跃列表里)
+              且 ② 它的 xmax 无效 —— 要么 xmax=0(没被删),
+                  要么删除它的事务尚未提交 / 已回滚(查 clog)
+
+   反之, 只要"创建它的事务在我看来还没提交"或"删除它的事务在我看来已提交",
+   这个版本就对我不可见。
+```
+
+```text
+   假设我的快照: xmin=48, 活跃事务 {49}, xmax=51 (上界)
+   ┌────────────────────────────────────────────────────────────┐
+   │ 元组A xmin=10(已提交) xmax=0          → 可见 (创建早已提交,未删)  │
+   │ 元组B xmin=10(已提交) xmax=50(已提交) → 不可见 (已被提交事务删除) │
+   │ 元组C xmin=49(活跃中)  xmax=0          → 不可见 (创建者还没提交)  │
+   │ 元组D xmin=60(>=上界)  xmax=0          → 不可见 (我快照之后才出现) │
+   └────────────────────────────────────────────────────────────┘
+```
+
+因为旧版本就在堆表里、各带 xmin/xmax，不同事务拿不同快照，**各看各的版本**，于是读不加锁、读写互不阻塞——这就是 PG 的 MVCC。隔离级别决定了**快照在什么时机生成**（每条语句一个 / 整个事务一个），详见 [事务与隔离级别](transaction.html)。
+
+## 四、HOT 更新（Heap-Only Tuple）：少建索引项的优化
+
+UPDATE 既然要插一个新元组，按理说**所有索引**都得新增一个指向新元组的索引项——即便你改的列跟索引毫无关系。这会让索引疯狂膨胀。PG 用 **HOT（Heap-Only Tuple，堆内元组）** 优化这种情况。
+
+**触发 HOT 的两个条件**：
+
+1. 本次 UPDATE **没有修改任何被索引的列**；
+2. **新元组能放进旧元组所在的同一个数据页**（页内有空闲空间）。
+
+满足时，PG 不为新版本新建任何索引项，而是在页内用**指针链(HOT chain)**把旧元组指向新元组：
+
+```text
+   普通更新: 每个索引都要加一项指向新元组 → 索引膨胀
+       index ──→ 旧元组
+       index ──→ 新元组   (新增索引项)
+
+   HOT 更新: 索引项不动, 仍指向旧元组所在行指针, 页内链到新版本
+       index ──→ [行指针 ctid] ──HOT chain──→ 旧元组 → 新元组(同页)
+                                              访问时顺链找到最新可见版本
+```
+
+收益：
+
+- **减少索引写入和索引膨胀**——尤其是只更新非索引列(如更新一个计数、状态)的高频场景。
+- 死元组在同页内可被一种轻量回收方式（page-level/HOT pruning，普通查询经过该页时顺手做）就地清理，缓解膨胀。
+
+> 面试点：**HOT 的前提是"不改索引列"**。所以"给频繁更新的列建索引"要谨慎——会让 UPDATE 失去 HOT 优化、加剧膨胀。
+
+## 五、死元组堆积 → 膨胀(bloat) → 必须回收：VACUUM
+
+死元组不会自己消失，越积越多就是**膨胀(bloat)**：表文件和索引文件越来越大，但有效数据没增加 → 扫描更慢、缓存命中更差、磁盘更费。回收靠 VACUUM 家族。
+
+| 操作 | 做什么 | 锁 | 空间还给谁 |
+|---|---|---|---|
+| **VACUUM**（普通） | 扫描表，把死元组占的空间**标记为可复用**，登记进空闲空间映射(FSM)；顺带做 FREEZE、更新可见性映射(VM) | 弱锁(`SHARE UPDATE EXCLUSIVE`)，**不阻塞**读写 | **不还给 OS**，留给本表后续 INSERT/UPDATE 复用 |
+| **VACUUM FULL** | **重写整张表**到一个新文件，只保留活元组，彻底紧致 | **`ACCESS EXCLUSIVE` 全程锁表**，期间读写全阻塞 | **真正还给操作系统**（表文件变小） |
+| **autovacuum** | 后台守护进程，**按阈值自动**触发普通 VACUUM / ANALYZE | 同普通 VACUUM，不阻塞业务 | 同普通 VACUUM |
+
+```text
+   VACUUM        : 死元组空间 → 标记可复用(本表内循环利用), 文件大小不变, 不锁表
+   VACUUM FULL   : 重写整表 → 文件缩小, 空间还 OS, 但全程 ACCESS EXCLUSIVE 锁表 ⚠
+```
+
+```sql
+-- 普通 vacuum（不锁表，可在线上做）
+VACUUM (VERBOSE, ANALYZE) accounts;
+
+-- VACUUM FULL：会全程锁表，仅在维护窗口对膨胀严重的表做
+VACUUM FULL accounts;
+
+-- 看表的死元组数量与上次 (auto)vacuum 时间
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+FROM pg_stat_user_tables
+WHERE relname = 'accounts';
+```
+
+### 5.1 autovacuum：自动触发的阈值
+
+autovacuum 守护进程定期检查每张表，当**死元组数**超过阈值时触发。默认公式（可按表覆盖）：
+
+```text
+   触发阈值 = autovacuum_vacuum_threshold              (默认 50)
+            + autovacuum_vacuum_scale_factor * 表行数   (默认 0.2, 即 20%)
+
+   例: 100 万行的表 → 死元组超过约 50 + 20万 = 200050 行时触发 vacuum
+```
+
+> 运维常见坑：**大表 + 默认 0.2 比例** = 要积累 20% 死元组才清理，膨胀已经很大。生产上常对热点大表调小 `scale_factor`（如 0.05）或调大 autovacuum 并行/速度参数。**长事务**会"卡住"vacuum——只要有个老快照还可能看到那些死元组，VACUUM 就不敢回收它们(`xmin horizon`)，于是死元组持续堆积。排查膨胀第一件事就是看有没有长事务/空闲事务(`idle in transaction`)。
+
+## 六、事务 ID 回卷(wraparound)与 FREEZE（高频考点）
+
+这是 PG 独有、且**能让数据库强制停机**的严重问题，必考。
+
+**根因**：PG 的事务 ID(**xid**)是 **32 位**的（约 42 亿），用完会**绕回(wraparound)**从头再来。可见性判断本质是比较 xid 大小("谁在前谁在后")，而 xid 是个**环**——PG 用"一半在过去、一半在未来"的模运算来比较远近。如果一个很老的元组的 xmin 一直留着不处理，等 xid 绕了一圈回来，这个老 xid 会突然被判定成"**未来的事务**" → 该元组**凭空消失**(对所有人不可见) → 数据丢失。
+
+```text
+   xid 是 32 位环 (不是直线):
+                    现在(current xid)
+                        │
+            过去 ◄──────┼──────► 未来
+                        │
+   老元组 xmin 落在"现在"很远的背后; 随着 xid 推进绕一圈,
+   若不处理, 这个老 xmin 会从"很久以前"漂移成"在前方(未来)"
+   → 被误判为未来事务 → 元组不可见 → 数据"消失"  ⚠
+```
+
+**解决：FREEZE（冻结）**。VACUUM 会把"足够老、且已确定对所有事务可见"的元组的 xmin **冻结**——标记为一个特殊的"永远在过去"状态(现代 PG 用元组头的 frozen 标志位实现)，从此它**不参与 xid 大小比较**，永远可见，回卷再也影响不到它。
+
+```text
+   普通老元组   xmin = 100   → 参与 xid 比较, 有回卷风险
+   冻结后        xmin = (frozen) → 视为"无限久远", 永远可见, 不再比较  ✅
+```
+
+**防回卷是 autovacuum 的核心职责之一**。相关阈值：
+
+```text
+   autovacuum_freeze_max_age (默认 ~2 亿): 一张表最老未冻结 xid 的"年龄"超过它,
+       → 即使死元组不多, 也强制触发一次 "anti-wraparound autovacuum" 来 FREEZE
+```
+
+**如果连这个都拦不住**（比如 autovacuum 被关、长事务长期阻塞、巨量写入）——xid 年龄逼近 32 位上限时，PG 为保护数据会**主动拒绝继续分配新 xid**：先告警，再强制数据库进入**只读 / 拒绝写入**状态，必须停下来手动 VACUUM(常需单用户模式)才能恢复。这就是生产事故里著名的"PG 因事务 ID 回卷停机"。
+
+```sql
+-- 监控离回卷还有多远：看库 / 表的事务年龄
+SELECT datname, age(datfrozenxid) AS xid_age
+FROM pg_database
+ORDER BY xid_age DESC;
+-- xid_age 越接近 autovacuum_freeze_max_age 越危险, 接近 ~21 亿则濒临停机
+```
+
+> 补充：现代 PG（64 位事务封装 `txid` 对外展示为 64 位以避免应用层混淆，但**内部 MVCC 仍是 32 位 xid**，回卷问题依旧存在）。所以"PG 内部 xid 是 32 位、会回卷、靠 FREEZE 防"这个结论在 PG 16 仍然成立。
+
+## 七、对比 MySQL InnoDB：旧版本治理的两种哲学
+
+```text
+   PostgreSQL                         MySQL InnoDB
+   ─────────────                       ─────────────
+   旧版本 → 留堆表                      旧版本 → undo 段
+   清理   → VACUUM / autovacuum (异步)  清理   → purge 线程 (异步)
+   膨胀   → 表/索引 bloat, 需 vacuum     膨胀   → undo 表空间增长
+   特有问题 → 32位 xid 回卷, 需 FREEZE   特有问题 → 长事务撑爆 undo / 历史链变长
+   读旧版 → 直接读堆里那一行            读旧版 → 沿 undo roll_pointer 重建
+```
+
+- 共同点：都靠 MVCC 做到读写不互相阻塞；都用一个**异步清理机制**回收旧版本；都怕**长事务**(都会阻止旧版本被回收)。
+- 不同点：PG 把旧版本和活数据混在一张堆表里 → 膨胀直接体现在主表、还多出"xid 回卷"这个独有大坑；InnoDB 旧版本隔离在 undo → 主表干净，但长事务会把 undo 和历史版本链撑得很大。
+- InnoDB 的 MVCC（DB_TRX_ID / DB_ROLL_PTR / ReadView / undo 版本链）细节见 [MySQL 事务与隔离级别](../mysql/transaction.html)。
+
+## 一句话总结
+
+> PG 的 MVCC 把**旧版本直接留在堆表**里，每行靠 **xmin（创建事务）/ xmax（删除事务）** + **事务快照** + **clog（提交日志）** 三者判断可见性；UPDATE = 插新元组 + 旧元组打 xmax，于是必然产生**死元组**，**HOT** 优化能在"不改索引列且同页有空间"时省掉索引项。死元组堆积 → **膨胀(bloat)**，靠 **VACUUM**（标记空间可复用、不锁表、不还 OS）/ **VACUUM FULL**（重写整表、还 OS、但全程锁表）/ **autovacuum**（按死元组比例阈值自动）回收。最致命的是 **32 位事务 ID 回卷**——老元组不 **FREEZE** 会被误判为未来事务而消失，autovacuum 负责防回卷，拦不住时 PG 会强制只读停机。对比 MySQL：InnoDB 把旧版本放 undo、靠 purge 清理，没有回卷问题但长事务会撑爆 undo。隔离级别如何用快照防异常见 [事务与隔离级别](transaction.html)。（基于 PG 16）
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/mvcc-vacuum" data-base="../"></script>
+</body>
+</html>

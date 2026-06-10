@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB vs MyISAM 存储引擎 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# InnoDB vs MyISAM 存储引擎
+
+> 一句话：存储引擎是 MySQL 中**真正负责数据存取**的插件、可在建表时**按表选择**（`ENGINE=InnoDB`）；**InnoDB**（5.5 起默认）支持**事务、外键、行锁、崩溃恢复（redo log）、MVCC**，且是**聚簇索引（索引即数据，叶子存整行）**；**MyISAM** 不支持事务/外键、只有**表锁**、崩溃不可靠，但**索引与数据分离**、维护了精确总行数所以 `COUNT(*)` 很快——绝大多数场景都该用 InnoDB。
+
+> 本文默认讨论 **MySQL InnoDB 存储引擎**（5.5+ 默认引擎），版本以 **8.0** 为基准，涉及版本差异处会显式标注。相关：[一条 SQL 是怎么执行的？](architecture.html)、[MySQL 索引原理](index.html)、[事务与隔离级别](transaction.html)。
+
+## 一、存储引擎是什么
+
+MySQL 是**分层**的：Server 层负责解析、优化、执行 SQL，下面的**存储引擎层**才真正负责**数据怎么存、怎么取、用什么索引结构、要不要事务和锁**（架构见 [一条 SQL 是怎么执行的？](architecture.html)）。
+
+存储引擎是**插件式**的，而且**粒度是表级**——同一个库里，不同表可以用不同引擎，建表时用 `ENGINE=` 指定：
+
+```sql
+-- 建表时指定引擎(不写则用默认引擎,5.5+ 默认 InnoDB)
+CREATE TABLE t_order (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  amount DECIMAL(10,2)
+) ENGINE=InnoDB;
+
+-- 改已有表的引擎
+ALTER TABLE t_log ENGINE=MyISAM;
+
+-- 查看可用引擎与当前默认引擎
+SHOW ENGINES;
+SHOW VARIABLES LIKE 'default_storage_engine';
+```
+
+最常被拿来对比的就是 **InnoDB** 和 **MyISAM**。
+
+## 二、InnoDB vs MyISAM 大对比表
+
+| 维度 | InnoDB | MyISAM |
+|---|---|---|
+| **事务** | ✅ 支持（ACID） | ❌ 不支持 |
+| **外键** | ✅ 支持 | ❌ 不支持 |
+| **锁粒度** | **行锁**（基于索引）+ 表锁，并发好 | 只有**表锁**，写时锁整表，并发差 |
+| **崩溃恢复** | ✅ 靠 **redo log**（WAL），宕机可恢复 | ❌ 无 redo log，崩溃后表可能损坏，需 `REPAIR TABLE` 修，且不保证不丢 |
+| **索引组织** | **聚簇索引**：叶子节点 = 整行数据（数据即索引） | **非聚簇索引**：索引与数据分离，叶子存**行地址** |
+| **MVCC（多版本并发）** | ✅ 支持（读不阻塞写） | ❌ 不支持 |
+| **`COUNT(*)`（无条件）** | 需扫描统计（有优化，但不维护精确总数） | **极快**：内部维护了精确总行数，直接返回 |
+| **全文索引 FULLTEXT** | ✅ 支持（5.6+） | ✅ 支持（更早就有） |
+| **空间索引 SPATIAL** | ✅ 支持（5.7+ R-Tree） | ✅ 支持 |
+| **物理文件** | `.ibd`（表空间，数据+索引在一起）+ 共享的 `ibdata`/redo 等 | `.MYD`（数据）+ `.MYI`（索引）+ `.sdi`/`.frm`（表结构） |
+| **适用场景** | **OLTP、高并发读写、要事务/外键**（绝大多数业务） | 读多写极少、不要事务的归档/统计表、纯查表（如今已很少用） |
+
+记忆主线：**InnoDB = 事务 + 行锁 + 崩溃恢复 + 聚簇索引 + MVCC**；MyISAM 把这些几乎都没有，换来的是结构简单、`COUNT(*)` 快、单纯读取轻量。
+
+## 三、聚簇索引差异（核心区别，配图）
+
+两者最本质的结构差异在于 **数据和索引的关系**。索引底层都是 [B+ 树](index.html)，区别在叶子节点存什么。
+
+### 3.1 InnoDB：聚簇索引，数据即索引（叶子 = 整行）
+
+InnoDB 是**索引组织表**：表数据本身就是按主键组织的一棵 B+ 树（聚簇索引），**主键 B+ 树的叶子节点直接存放整行数据**。所以"找到主键 = 找到整行"，数据和主键索引是同一棵树，存在同一个 `.ibd` 文件里。
+
+```text
+InnoDB 主键(聚簇)索引: 叶子直接存整行
+         ┌───────────────┐
+         │  10 │ 35 │ 68 │           ← 非叶子: 键 + 指针
+         └──┬─────┬────┬─┘
+            ▼          ...
+   ┌──────────────────────────────┐
+   │ id=10 | name,age,addr...(整行)│ ◄─► 下一个叶子 ...   ← 叶子 = 整行数据
+   └──────────────────────────────┘
+   (二级索引叶子只存「索引列 + 主键值」,查非索引列要「回表」到聚簇索引)
+```
+
+> 因此 InnoDB 用二级索引查非索引列要**回表**，自增主键能避免页分裂——这些细节见 [MySQL 索引原理](index.html)。
+
+### 3.2 MyISAM：索引与数据分离（叶子存行地址）
+
+MyISAM 把**索引和数据分开存**：数据按插入顺序存在 **`.MYD`** 文件里，索引（无论主键还是二级索引）单独存在 **`.MYI`** 文件里。索引 B+ 树的**叶子节点存的不是整行，而是该行在数据文件里的地址（行指针）**。
+
+```text
+MyISAM: 索引(.MYI) 与 数据(.MYD) 分离,叶子存「行地址」
+   ┌──────── .MYI (索引文件) ────────┐        ┌──── .MYD (数据文件) ────┐
+   │  主键索引 B+ 树                  │        │ row0: id=10 name=... │
+   │     叶子: [ key=10 | 地址 ]──────┼──────► │ row1: id=35 name=... │
+   │     叶子: [ key=35 | 地址 ]──────┼──────► │ row2: id=68 name=... │
+   │  二级索引 B+ 树                  │        │ ...                  │
+   │     叶子: [ name | 地址 ]────────┼──────► └──────────────────────┘
+   └─────────────────────────────────┘
+```
+
+关键差异：MyISAM 里**主键索引和二级索引地位平等**，叶子都是"键 + 行地址"，二级索引查询拿到地址后**直接定位数据文件**，没有 InnoDB 那种"二级索引→主键→回表查聚簇索引"的两棵树过程。代价是它无法享受聚簇索引带来的"主键范围扫描数据天然连续"等好处，也没有事务/崩溃恢复。
+
+## 四、为什么 MyISAM 的 `COUNT(*)` 快
+
+`SELECT COUNT(*) FROM t;`（无 WHERE 条件、统计总行数）这条语句两者表现差很多：
+
+```text
+MyISAM: 表里用一个专门的计数器维护着「精确总行数」
+        → COUNT(*) 直接读这个数返回,O(1),极快
+
+InnoDB: 因为 MVCC,不同事务在同一时刻「可见的行数」可能不同
+        → 无法维护一个对所有事务都正确的全局总数
+        → 必须实时统计(挑选一个最小的可用索引,逐行数可见的行)
+```
+
+为什么 InnoDB 不能像 MyISAM 那样存一个总数？因为 **MVCC**：同一时刻，不同事务通过 ReadView 看到的"有效行"数量可能不一样（有的事务能看到某行、有的看不到），所以不存在一个对所有事务都成立的"总行数"，只能在执行时按当前事务的可见性逐行统计。
+
+InnoDB 侧的**优化**（让它不至于太慢）：
+
+- 优化器会挑**最小的那个二级索引**来扫（而不是扫聚簇索引整行），因为二级索引更小、一页能放更多键，扫得更快。
+- 注意区别：`COUNT(*)`、`COUNT(1)`、`COUNT(主键)` 在 InnoDB 中性能基本一致（都按行计数，不取列值）；`COUNT(普通列)` 还要判该列是否为 NULL，略慢。**别迷信 `COUNT(1)` 比 `COUNT(*)` 快**，官方明确 `COUNT(*)` 是专门优化过的。
+- 实在要海量数据的近似总数，可用 `SHOW TABLE STATUS` 里的 `Rows`（估算值，不精确）或单独维护计数表 / Redis 计数器。
+
+> 这条快只在"统计**全表**总行数"成立。一旦带 `WHERE` 条件，MyISAM 也得真的去扫/过滤，优势不再。
+
+## 五、为什么 InnoDB 成为默认（5.5+）
+
+**MySQL 从 5.5 版本起把默认存储引擎从 MyISAM 改成了 InnoDB**，根本原因是现代业务（OLTP）的核心诉求 MyISAM 满足不了：
+
+```text
+  现代业务要什么          MyISAM           InnoDB
+  ─────────────────────────────────────────────────
+  事务(转账/下单)          ✗ 没有           ✓ ACID
+  高并发写                 ✗ 表锁,写堵死     ✓ 行锁,并发高
+  宕机不丢/可恢复           ✗ 可能损坏        ✓ redo log 崩溃恢复
+  读写不互相阻塞           ✗ 没有 MVCC       ✓ MVCC
+  数据完整性(外键)         ✗ 不支持          ✓ 支持
+```
+
+- **事务与崩溃恢复**：互联网业务普遍需要事务保证一致性、需要宕机后数据不丢且可自动恢复，这是 InnoDB 的 redo log / undo log 才有的能力。
+- **行锁 + MVCC**：高并发读写下，MyISAM 的表锁会让写操作把整张表锁死，吞吐极低；InnoDB 的行锁 + MVCC 让"读不阻塞写、写不阻塞读"，并发能力强得多。
+- 综合下来，MyISAM 仅在"几乎只读、不要事务"的极少数场景才有一点点优势，已不足以作为默认，故 5.5+ 默认 InnoDB。
+
+> 事务、MVCC、行锁、隔离级别的机制细节见 [事务与隔离级别](transaction.html)。
+
+## 六、其它引擎一句话
+
+除了这两个，还有几个偶尔会被问到的引擎，知道用途即可：
+
+| 引擎 | 一句话 |
+|---|---|
+| **Memory**（旧名 HEAP） | 数据全放**内存**，读写极快但**重启即丢**；默认哈希索引，适合临时表/缓存类数据 |
+| **Archive** | 只支持 **INSERT 和 SELECT**（不支持 UPDATE/DELETE/索引），**高压缩比**，适合海量归档日志冷数据 |
+| **CSV** | 数据以**纯文本 CSV** 文件存储，可被 Excel 等直接打开，便于与外部数据交换；不支持索引 |
+
+## 一句话总结
+
+> 存储引擎是 MySQL 中**真正负责数据存取的插件、按表选择**（`ENGINE=InnoDB`）。**InnoDB（5.5+ 默认）** 支持 **事务、外键、行锁、崩溃恢复（redo log）、MVCC**，是**聚簇索引（数据即索引，叶子存整行，单文件 .ibd）**；**MyISAM** 不支持事务/外键、只有**表锁**、崩溃不可靠，**索引与数据分离（.MYI 索引 + .MYD 数据，叶子存行地址）**，但维护了精确总行数所以无条件 `COUNT(*)` 极快（InnoDB 因 MVCC 无法维护统一总数，需扫最小二级索引统计）。正因事务/行锁/崩溃恢复/MVCC 是现代 OLTP 刚需，MySQL **5.5 起默认 InnoDB**，绝大多数场景都该用它。架构见 [一条 SQL 是怎么执行的？](architecture.html)，索引见 [MySQL 索引原理](index.html)，事务见 [事务与隔离级别](transaction.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="mysql/engines" data-base="../"></script>
+</body>
+</html>

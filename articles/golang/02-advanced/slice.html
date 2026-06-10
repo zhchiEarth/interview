@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slice 底层是怎么实现的？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Slice 底层是怎么实现的？
+
+## 一、slice 是干嘛用的
+
+Go 的数组 `[N]T` 是**值类型 + 固定大小**——传参拷贝、长度编译期定死，**用起来很僵**。
+
+```go
+var a [10]int   // 固定 10 个 int, 想加一个? 改不了
+var b [20]int   // 类型不一样, 不能赋值给 a
+```
+
+slice 在数组之上做了"**动态视图**"层：
+
+```go
+s := []int{1, 2, 3}    // 看起来是数组,实际是 slice
+s = append(s, 4)        // 长度可变 ✓
+s = append(s, 5, 6, 7)  // 容量不够自动扩容
+sub := s[1:4]           // 切片再切片,O(1) 不拷贝
+```
+
+slice 的三个核心特征：
+
+1. **动态长度** —— 用 `append` 可加可减
+2. **共享底层数组** —— 切片不拷贝数据，多个 slice 可指向同一段内存
+3. **按"值"传递 header，按"引用"共享数据** —— Go 里最容易踩坑的地方
+
+→ 理解 slice 的核心就是理解 **"header 是值，data 是引用"** 这个分裂语义。
+
+---
+
+## 二、底层结构：slice = 三个字段
+
+slice 在内存里是个 **24 字节的 header**（64 位机器），不是数组本身：
+
+```go
+type sliceHeader struct {
+    Data unsafe.Pointer  // 指向底层数组起始地址 (8 字节)
+    Len  int             // 当前元素数 (8 字节)
+    Cap  int             // 底层数组从 Data 起的容量 (8 字节)
+}
+```
+
+```
+sliceHeader (24 字节,跟变量在一起):
+  ┌─────────────┐
+  │ Data: 0x...─┼──┐
+  │ Len:  3     │  │
+  │ Cap:  8     │  │
+  └─────────────┘  │
+                   │  指向堆 / 栈 / .rodata 上的数组
+                   ▼
+   底层数组:
+   ┌───┬───┬───┬───┬───┬───┬───┬───┐
+   │ 1 │ 2 │ 3 │ ? │ ? │ ? │ ? │ ? │
+   └───┴───┴───┴───┴───┴───┴───┴───┘
+   ↑               ↑
+   Data        Len 边界 (3)
+                                  Cap 边界 (8)
+```
+
+### Len vs Cap
+
+- **Len**：当前**有效元素数**——`s[i]` 的合法范围是 `[0, Len)`，越界 panic
+- **Cap**：底层数组从 Data 起**还能装多少元素**——append 时 cap 够就不扩容
+
+```go
+s := make([]int, 3, 8)  // Len=3, Cap=8
+s[2] = 100              // ✓ 在 Len 范围内
+s[3] = 100              // ❌ panic: index out of range
+                        //    (即使 Cap 够, Len 之外仍非法)
+s = append(s, 4)        // ✓ Len=4, Cap=8 (没扩容,在 cap 内)
+```
+
+### 三索引切片 `s[low:high:max]`
+
+```go
+arr := [10]int{0,1,2,3,4,5,6,7,8,9}
+s := arr[2:5:7]
+//        │ │ │
+//        │ │ └── max: cap 边界 (从 arr[0] 起的索引)
+//        │ └──── high: len 边界
+//        └────── low: 起点
+//
+// 结果: Data 指向 arr[2], Len = 5-2 = 3, Cap = 7-2 = 5
+```
+
+少写 `:max` 时，默认 `max = len(原数组)`，所以 `arr[2:5]` 的 Cap = 10-2 = 8。
+
+**三索引切片的用途**：**限制 cap，防止 append 时意外覆盖原数组后面的元素**——见后面"陷阱"章。
+
+---
+
+## 三、几种创建方式 vs 底层数组在哪
+
+| 写法 | Len | Cap | 底层数组位置 |
+|---|---|---|---|
+| `var s []int` | 0 | 0 | **nil**（不分配） |
+| `s := []int{}` | 0 | 0 | **空数组占位**（非 nil） |
+| `make([]int, 5)` | 5 | 5 | 堆 / 栈（看逃逸） |
+| `make([]int, 5, 10)` | 5 | 10 | 同上，cap 多分配 5 个 |
+| `make([]int, n)`（n 是变量） | n | n | **堆**（编译期不知大小） |
+| `arr[2:5]`（arr 是数组） | 3 | len(arr)-2 | **共享 arr 的底层** |
+| `[]int{1,2,3}`（字面量） | 3 | 3 | 编译器视情况栈 / 堆 |
+
+`nil slice` 和 `空 slice` 的区别下面专门讲。
+
+---
+
+## 四、append 和扩容（最核心机制）
+
+### 4.1 append 的核心逻辑
+
+```go
+s = append(s, x)
+   ↓
+看 Len < Cap?
+   是 → 把 x 写到 buf[Len], Len++, 返回新 header [O(1), 不分配]
+   否 → 触发扩容: 申请新数组 + 拷贝旧元素 + 写入新元素 + 返回新 header
+```
+
+**关键**：append 返回一个**新的 header**——可能跟原 slice 共享底层数组（cap 够时），也可能完全分家（扩容时）。所以必须 `s = append(s, ...)` 接住返回值。
+
+### 4.2 扩容规则的演变
+
+Go 不同版本的扩容因子有变化：
+
+| 版本 | 阈值 | 小 cap 时 | 大 cap 时 |
+|---|---|---|---|
+| ~ Go 1.17 | 1024 | × 2 | × 1.25 |
+| **Go 1.18+** | **256** | × 2 | **每次 +(oldcap + 3*256)/4**（平滑过渡） |
+
+Go 1.18+ 的实际代码（简化）：
+
+```go
+func growslice(oldCap, newLen int) int {
+    newCap := oldCap
+    doublecap := newCap * 2
+
+    if newLen > doublecap {
+        newCap = newLen              // 一次性 append 大量元素时, 直接拿够
+    } else {
+        if oldCap < 256 {
+            newCap = doublecap        // 小 cap: 翻倍, 增长快
+        } else {
+            // 大 cap: 平滑增长 (从 2× 渐变到 1.25×)
+            for newCap < newLen {
+                newCap += (newCap + 3*256) / 4
+            }
+        }
+    }
+    return roundupsize(newCap)  // 还要按内存分配器的 size class 对齐
+}
+```
+
+### 4.3 实际 cap 经常比"算出来的"大
+
+最后那个 `roundupsize` 会按 [内存分配器的 size class](../03-expert/memory-allocator.html) 对齐：
+
+```go
+s := make([]int, 0, 5)
+fmt.Println(cap(s))   // 输出可能是 6 (!), 不是 5
+                      // 因为 8 字节 * 5 = 40 字节, 上调到 48 字节 size class = 6 个 int
+```
+
+**实战影响**：基准测试时容量不会完全精确符合你算的扩容因子——这是 size class 对齐造成的，不是 bug。
+
+### 4.4 扩容时具体做了什么
+
+```
+Before:                       After append(s, 4):
+
+s.Data ──→ ┌───┬───┬───┐      s.Data ──→ ┌───┬───┬───┬───┬───┬───┐  新数组
+           │ 1 │ 2 │ 3 │                  │ 1 │ 2 │ 3 │ 4 │ ? │ ? │
+           └───┴───┴───┘                  └───┴───┴───┴───┴───┴───┘
+           Len=3 Cap=3                    Len=4 Cap=6
+
+           旧数组没人引用 → GC 回收
+```
+
+完整步骤：
+
+1. 用 `growslice` 算新 cap
+2. 用 `mallocgc` 申请新底层数组（在堆上）
+3. 把旧元素拷过去（`memmove`）
+4. 写入新元素
+5. 返回新 header（Data 指新数组，Len = 旧 Len + n）
+6. 旧数组如果没人引用，下次 GC 回收
+
+---
+
+## 五、为什么会"分家 / 不分家"
+
+这是 slice 最容易迷惑人的地方。**append 到底分不分家，唯一标准是: cap 够不够。**
+
+```go
+// ① cap 够 → 不分家
+a := make([]int, 3, 6)   // cap=6, 还能装 3 个
+b := append(a, 99)        // cap 够, b 仍共享 a 的底层数组
+b[0] = 999                // ⚠️ a[0] 也变成 999!
+
+// ② cap 不够 → 分家
+a := make([]int, 3, 3)   // cap=3, 满了
+b := append(a, 99)        // 扩容! b 用新数组
+b[0] = 999                // a[0] 不受影响
+
+// ③ 同一个变量接住返回值 → 看不出分没分家(也没必要看)
+s := make([]int, 3, 3)
+s = append(s, 99)          // 不管分没分,只有 s 一个引用,无歧义
+```
+
+**铁律**：
+
+> 任何 append 之后，**不要假设和原 slice 共享底层数组**——要么用 `s = append(s, ...)`（只有一个引用），要么显式 `copy` 完全分家。
+
+---
+
+## 六、共享数组的陷阱
+
+### 6.1 切片后修改影响原数组
+
+```go
+a := []int{1, 2, 3, 4, 5}
+b := a[1:3]          // b 看到 [2, 3], 但共享 a 的底层数组
+b[0] = 99            // a 变成 [1, 99, 3, 4, 5]
+```
+
+这是**特性不是 bug**——slice 设计成"零拷贝视图"就是为了快。但你要意识到它。
+
+### 6.2 append 越过 high 边界覆盖原数组
+
+```go
+a := []int{1, 2, 3, 4, 5}
+b := a[1:3]          // Len=2, Cap=4 (默认 max = len(a) = 5, Cap = 5-1 = 4)
+b = append(b, 99)    // cap=4 还够! 不分家
+                     // b 现在是 [2, 3, 99], 底层 b.buf[2] = 99
+                     // 但底层数组 = a 的底层 → a[3] 被覆盖成 99!
+
+// a = [1, 2, 3, 99, 5]  ← 你以为只动了 b, 其实 a 也变了
+```
+
+**修法**：用三索引切片限制 cap
+
+```go
+b := a[1:3:3]        // 强制 Cap = 2 (3-1)
+b = append(b, 99)    // cap=2 不够 → 分家
+                     // a 不受影响 ✓
+```
+
+### 6.3 大数组的切片阻止 GC
+
+```go
+func loadHeader() []byte {
+    data := readBigFile()      // 读到 100MB
+    return data[:32]           // 只要前 32 字节
+}
+// 调用方拿到 32 字节的 slice
+// 但 slice 的 Data 指向 100MB 大数组的开头
+// 整个 100MB 都不能被 GC! 因为 slice 还引用着
+```
+
+**修法**：深拷贝
+
+```go
+func loadHeader() []byte {
+    data := readBigFile()
+    header := make([]byte, 32)
+    copy(header, data[:32])
+    return header              // 现在 100MB 没引用, 可 GC
+}
+
+// 或者 Go 1.21+:
+return slices.Clone(data[:32])
+```
+
+### 6.4 函数参数：slice 是按值传递吗？
+
+```go
+func modify(s []int) {
+    s[0] = 99       // 影响外面! 因为 Data 是共享的
+    s = append(s, 4) // 可能影响外面也可能不影响, 看 cap
+}
+
+a := []int{1, 2, 3}
+modify(a)
+// a[0] 一定是 99 (修改元素影响外面)
+// a 可能变成 [99, 2, 3] 也可能是 [99, 2, 3, 4] —— 看 cap 是否够
+```
+
+slice header **按值传递**（拷贝 Data/Len/Cap 三个字段），**但 Data 指针指向同一段内存**——所以：
+
+- **修改元素** → 影响外面（共享数据）
+- **append** → 不确定（可能扩容分家，可能不）
+- **重新赋值 s = ...** → 只改函数内的 header，外面不变
+
+---
+
+## 七、nil slice vs 空 slice
+
+```go
+var a []int      // nil slice: Data=nil, Len=0, Cap=0
+b := []int{}     // 空 slice: Data 非 nil (指向"空数组"), Len=0, Cap=0
+c := make([]int, 0)  // 同 b
+```
+
+### 行为对比
+
+| 操作 | nil slice (a) | 空 slice (b) |
+|---|---|---|
+| `s == nil` | **true** | **false** |
+| `len(s)` | 0 | 0 |
+| `cap(s)` | 0 | 0 |
+| `for range s` | 不进入循环 | 不进入循环 |
+| `append(s, 1)` | 正常工作（分配底层数组） | 正常工作 |
+| JSON 序列化 | `"null"` | `"[]"` |
+
+**结论**：函数功能上几乎等价，**只有 `== nil` 判断和 JSON 序列化时有区别**。
+
+### 建议
+
+- **返回空集合时返回 `nil` slice**——更省内存，行为正确
+- **判空用 `len(s) == 0` 而不是 `s == nil`**——同时覆盖两种情况
+
+---
+
+## 八、copy 和 slices.Clone
+
+### copy 内置函数
+
+```go
+n := copy(dst, src)   // 拷贝 min(len(dst), len(src)) 个元素, 返回拷贝数
+```
+
+```go
+a := []int{1, 2, 3}
+b := make([]int, len(a))
+copy(b, a)            // b = [1, 2, 3], 完全独立 (不共享底层)
+```
+
+⚠️ **`dst` 必须有足够 Len**（不是 cap）——`copy(make([]int, 0, 10), src)` 拷贝 0 个！
+
+### Go 1.21+ slices.Clone
+
+```go
+import "slices"
+b := slices.Clone(a)   // 等价于 make + copy
+```
+
+更简洁，**推荐用**。
+
+---
+
+## 九、常见陷阱合集
+
+### ① 忘记接 append 返回值
+
+```go
+s := []int{1, 2, 3}
+append(s, 4)         // ❌ s 没变! 编译器警告但能编过
+s = append(s, 4)     // ✓
+```
+
+### ② `for range` 时取元素地址
+
+```go
+s := []int{1, 2, 3}
+ptrs := []*int{}
+for _, v := range s {
+    ptrs = append(ptrs, &v)   // ❌ Go 1.21 前: 全是同一个地址(共享 v)!
+                              //    Go 1.22+: 每轮独立 v, 修复
+}
+```
+
+> Go 1.22+ for-range 变量每轮独立。**老代码仍踩**——升级 Go 1.22+ 或显式拷贝。
+
+### ③ 切片大数组阻止 GC（见 6.3）
+
+### ④ append 越过 high 边界覆盖原数组（见 6.2）
+
+### ⑤ 把 slice 当 set 用
+
+```go
+s := []int{1, 2, 3}
+// 想删元素 2:
+s = append(s[:1], s[2:]...)   // 看着对, 但 [1] 那个位置实际被覆盖
+                              // 如果有别的 slice 引用 s, 它会看到诡异变化
+```
+
+更安全：`slices.Delete(s, 1, 2)`（Go 1.21+）。
+
+---
+
+## 十、实战性能技巧
+
+### ① 预分配 cap 避免反复扩容
+
+```go
+// ❌ 高频扩容
+s := []int{}
+for i := 0; i < 10000; i++ {
+    s = append(s, i)   // 大约 14 次扩容, 14 次内存分配 + 拷贝
+}
+
+// ✓ 一次到位
+s := make([]int, 0, 10000)   // 预分配 cap
+for i := 0; i < 10000; i++ {
+    s = append(s, i)   // 永不扩容, 零分配
+}
+```
+
+### ② 复用 slice (清零但不释放底层数组)
+
+```go
+s = s[:0]            // Len=0, Cap 不变 — 可以再 append 复用底层
+```
+
+适合循环中需要"清空再用"的场景，**省去重新分配的开销**。
+
+### ③ 用 sync.Pool 复用大 slice
+
+频繁创建大 slice 的场景（HTTP buffer 等），用 [sync.Pool](sync-pool.html) 复用，减少 GC 压力。
+
+---
+
+## 十一、一图总结
+
+```
+┌──────── slice (24 字节 header) ────────┐
+│   Data uintptr   ─┐                    │
+│   Len  int        │                    │
+│   Cap  int        │                    │
+└───────────────────┼────────────────────┘
+                    │
+                    ▼
+              底层数组 (堆/栈/.rodata)
+   ┌───┬───┬───┬───┬───┬───┬───┬───┐
+   │ 1 │ 2 │ 3 │ ? │ ? │ ? │ ? │ ? │
+   └───┴───┴───┴───┴───┴───┴───┴───┘
+   ↑         ↑               ↑
+   Data    Len 边界          Cap 边界
+
+   核心机制:
+   ① 切片 = 零拷贝视图        s[a:b:c] O(1), 共享底层
+   ② append 扩容触发条件       Len == Cap → 重新分配 + 拷贝
+   ③ 扩容因子 (Go 1.18+)        cap<256: ×2;  cap≥256: 渐变 1.25×
+   ④ 实际 cap 按 size class 对齐  比算出的常大 1~3
+
+   分家 / 不分家:
+   ─────────────────────────────────────
+   append(s, x) 后 cap 够 → 不分家 (危险!)
+   append(s, x) 后 cap 不够 → 扩容分家
+
+   实战铁律:
+   ① append 一定接住返回值       s = append(s, ...)
+   ② 切大数组只用一小段 → 深拷贝   slices.Clone
+   ③ 截取后想 append → 三索引       a[low:high:max] 防覆盖
+   ④ 预知容量 → make 时给 cap      避免反复扩容
+   ⑤ 函数返空 → 返 nil 而不是 []   省内存,语义清晰
+   ⑥ 判空 → len(s) == 0           覆盖 nil 和空两种
+```
+
+**一句话**：slice = **(Data, Len, Cap) 三件套 header**，本身按值传递但 Data 共享数据；append 的"**分家/不分家**"完全看 cap 够不够——这一个机制衍生出所有诡异行为。**三索引切片限 cap、slices.Clone 深拷、预分配 cap** 是绕开陷阱的三件套。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/slice" data-base="../../"></script>
+</body>
+</html>

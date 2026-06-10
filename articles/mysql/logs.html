@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>三大日志：redo / undo / binlog · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 三大日志：redo / undo / binlog
+
+> 一句话：**redo log** 是 InnoDB 的**物理日志**，靠 **WAL + 循环写**实现崩溃恢复（crash-safe）；**undo log** 是**逻辑日志**，记反操作以支撑**回滚（原子性）+ MVCC 版本链**；**binlog** 是 Server 层的**逻辑日志**，**追加写**、用于**主从复制和数据恢复**；redo 与 binlog 靠**两阶段提交**保持一致。
+
+> 本文默认讨论 **MySQL InnoDB 存储引擎**。其中 redo / undo 是 InnoDB 引擎层的日志，binlog 是 MySQL Server 层的日志（任何引擎都有）。事务、MVCC 细节见 [事务与隔离级别](transaction.html)，索引细节见 [MySQL 索引原理](index.html)。
+
+## 一、为什么需要这三种日志（先建立全局图）
+
+一次普通的 `UPDATE` 背后，三种日志各干一件事：
+
+```text
+   UPDATE t SET c=c+1 WHERE id=2;
+
+   ┌──────────────────────── InnoDB 引擎层 ────────────────────────┐
+   │  undo log : 先记下"反操作"(c=c-1)，用于回滚 + 给 MVCC 留旧版本   │
+   │  redo log : 记下"哪个数据页做了什么物理改动"，先写日志(WAL)      │
+   └───────────────────────────────────────────────────────────────┘
+   ┌──────────────────────── MySQL Server 层 ─────────────────────┐
+   │  binlog   : 记下这条逻辑变更，用于主从复制 / 归档恢复            │
+   └───────────────────────────────────────────────────────────────┘
+```
+
+| 日志 | 所属层 | 物理 / 逻辑 | 解决的核心问题 | 关联特性 |
+|---|---|---|---|---|
+| **redo log** | InnoDB 引擎层（特有） | **物理日志** | 崩溃后恢复"已提交但还没刷盘"的改动 | **持久性 Durability** |
+| **undo log** | InnoDB 引擎层（特有） | **逻辑日志** | 回滚未提交事务 + 提供 MVCC 旧版本 | **原子性 Atomicity** + 隔离性(MVCC) |
+| **binlog** | MySQL Server 层 | **逻辑日志** | 主从复制 + 基于时间点的数据恢复 | 复制 / 归档 |
+
+## 二、redo log（重做日志）—— 物理日志 + WAL + 循环写
+
+### 2.1 它是什么：记"某个数据页上做了什么改动"
+
+redo log 是 **InnoDB 特有**的**物理日志**——它不记"把 id=2 这行的 c 改成 3"这种逻辑，而是记**"在表空间 X、页号 Y、偏移 Z 处，把值改成了什么"**这种物理层面的改动。崩溃后照着重放（redo = 重做）即可把数据页恢复到崩溃前的状态。
+
+### 2.2 WAL：Write-Ahead Logging，先写日志再刷盘
+
+核心思想是 **WAL（预写日志）**：修改数据时，**先把改动写进 redo log（顺序 IO，快），再在合适时机把内存里的脏页异步刷回磁盘数据文件（随机 IO，慢）**。
+
+```text
+   改数据  ─┬─→ ① 改内存中的数据页(Buffer Pool) → 变"脏页"
+            └─→ ② 顺序写 redo log (很快)              ← 事务提交只需保证这一步落盘
+                                                       (脏页可以晚点慢慢刷)
+   ③ 后台线程择机把脏页刷回 .ibd 数据文件 (随机 IO，慢)
+```
+
+好处：把昂贵的随机写攒成批量异步操作，提交时只需一次顺序写日志，既快又不丢数据（崩溃可用 redo 恢复）。
+
+### 2.3 循环写：ib_logfile 固定大小，write pos / checkpoint
+
+redo log 文件**大小固定**（一组文件循环使用，如旧版的 `ib_logfile0`/`ib_logfile1`；MySQL 8.0.30 起改为 `#innodb_redo/` 目录下的多个文件，由 `innodb_redo_log_capacity` 控制总量）。既然固定大小，就只能**循环写（环形）**，用两个指针标记位置：
+
+```text
+        ┌──────────────────── 环形 redo log ────────────────────┐
+        │                                                        │
+        │   ░░░░░░░░░░░░  ←可写区(空闲)→  ████████████████        │
+        │              ↑                  ↑                      │
+        │         checkpoint          write pos                 │
+        │      (擦到这,之前的脏页      (当前写到这)               │
+        │       已安全刷盘可覆盖)                                 │
+        └────────────────────────────────────────────────────────┘
+
+   write pos : 当前记录写到的位置，边写边后移
+   checkpoint: 已经把对应脏页刷盘、可以被覆盖擦除的位置，边擦边后移
+   两者之间(████)= 还没刷盘、不能覆盖的有效 redo
+```
+
+当 `write pos` 追上 `checkpoint`（环写满了），说明有大量脏页还没刷盘，必须**先停下来推进 checkpoint（刷一批脏页）**才能继续写——这就是写入抖动的一个来源。
+
+### 2.4 crash-safe：崩溃恢复
+
+正因为有 redo log，InnoDB 才具备 **crash-safe**：数据库异常重启后，会扫描 redo log，把**已提交但还没来得及刷盘的改动重放**回数据页，保证"提交即不丢"。这是持久性的根基。
+
+### 2.5 redo log buffer 与刷盘时机：innodb_flush_log_at_trx_commit
+
+redo 也不是每条都直接写磁盘——先进内存里的 **redo log buffer**，再落到 OS page cache，最后 `fsync` 到磁盘。事务提交时刷到哪一步，由 `innodb_flush_log_at_trx_commit` 控制：
+
+```text
+   redo log buffer ──write()──→ OS page cache ──fsync()──→ 磁盘(redo 文件)
+       (进程内存)                 (内核内存)                 (持久)
+```
+
+| 取值 | 提交时行为 | 安全性 | 性能 |
+|---|---|---|---|
+| **0** | 提交**不**主动刷；后台每秒把 buffer write+fsync 到磁盘 | 最低：MySQL **进程崩溃**就可能丢最近 ~1s 事务 | 最高 |
+| **1** | 提交时把 redo **write + fsync 到磁盘**（默认值） | 最高：提交即落盘，宕机不丢 | 最低 |
+| **2** | 提交时只 **write 到 OS page cache，不 fsync**；由后台每秒 fsync | 中：**MySQL 进程崩溃不丢**（数据在 OS 手里），但**整机/OS 崩溃**可能丢 ~1s | 中 |
+
+> 记忆：**0 看进程也看 OS（都怕）、1 最安全（默认）、2 只怕操作系统/掉电**。1 是 ACID 持久性的保证，0/2 是拿"最多丢 1 秒"换吞吐。
+
+## 三、undo log（回滚日志）—— 逻辑日志，原子性 + MVCC
+
+### 3.1 它是什么：记"反操作"的逻辑日志
+
+undo log 是**逻辑日志**，记的是**能撤销本次修改的反向操作**：
+
+```text
+   你执行            undo 记录(反操作)
+   INSERT 一行   →   一条 DELETE
+   DELETE 一行   →   一条 INSERT(把整行旧值塞回去)
+   UPDATE 某列   →   一条 UPDATE(把列改回旧值)
+```
+
+### 3.2 作用一：保证原子性（回滚）
+
+事务执行中途失败、或显式 `ROLLBACK` 时，InnoDB **逆序执行 undo 里的反操作**，把数据恢复到事务开始前——这正是 **原子性（要么全做、要么全不做）** 的实现机制。
+
+### 3.3 作用二：支撑 MVCC 版本链
+
+每行有隐藏列 `DB_ROLL_PTR`（回滚指针）指向该行在 undo log 里的**上一个旧版本**，历次修改被串成一条**版本链**。快照读时沿链找到"对当前事务可见"的历史版本，从而做到**读不加锁、读写不阻塞**（细节见 [事务与隔离级别](transaction.html) 的 MVCC 一节）。
+
+```text
+   当前行(最新) ──roll_ptr──→ 旧版本 ──roll_ptr──→ 更旧版本 ──→ ...
+                              (都存在 undo log 里)
+```
+
+### 3.4 purge：清理不再需要的 undo
+
+旧版本不能立刻删——可能还有更早开始的事务（旧 ReadView）要读它。InnoDB 用后台 **purge 线程**：当某个 undo 旧版本**不再被任何活跃事务的 ReadView 需要**时，才真正清理回收。所以**长事务会拖住 purge**，导致 undo（历史版本链）堆积、回滚段膨胀——这是长事务的一大危害。
+
+## 四、binlog（归档日志）—— Server 层逻辑日志，追加写
+
+### 4.1 它是什么：Server 层、逻辑、可归档
+
+binlog 是 **MySQL Server 层**的日志（不属于某个引擎），是**逻辑日志**，记录所有引起数据变更的操作。它**追加写（append）**：写满一个文件就切换到下一个（如 `binlog.000001 → 000002`），**不循环、不覆盖**，因此可以长期保留、归档。
+
+```text
+   redo log : 固定大小、环形循环写、会被覆盖   → 只能做"崩溃恢复"，存不下全部历史
+   binlog   : 不断追加新文件、不覆盖、可归档   → 能做"主从复制 + 时间点恢复"
+```
+
+### 4.2 两大用途：主从复制 + 数据恢复
+
+- **主从复制**：从库拉取主库 binlog，重放其中的变更，实现数据同步（异步 / 半同步复制都基于它）。
+- **数据恢复（PITR）**：用"全量备份 + 之后的 binlog 重放"恢复到任意时间点（point-in-time recovery），比如误删数据后恢复到删除前一刻。
+
+### 4.3 三种格式：statement / row / mixed
+
+由 `binlog_format` 控制：
+
+| 格式 | 记什么 | 优点 | 缺点 |
+|---|---|---|---|
+| **statement** | 记**原始 SQL 语句** | 日志小、可读性好 | 含 `now()`/`uuid()`/`limit` 无 `order by` 等**不确定函数**时，主从重放结果可能不一致 |
+| **row** | 记**每一行被改成什么**（行的前后镜像） | 主从**绝对一致**，恢复最可靠 | 日志量大（如 `update` 全表会记每一行） |
+| **mixed** | MySQL 自动选：一般用 statement，遇到**不确定语句自动切 row** | 折中：兼顾体积与一致性 | 行为依赖 MySQL 判断，可读性介于两者之间 |
+
+> MySQL 5.7.7 起**默认 `row`**（8.0 仍是 row）。生产上为复制安全普遍用 **row**（常配 `binlog_row_image=minimal` 减小体积）。面试要点：**statement 体积小但有主从不一致风险，row 一致但大，mixed 折中**。
+
+## 五、redo log vs binlog 对比（高频考点）
+
+| 维度 | redo log | binlog |
+|---|---|---|
+| **所属层** | InnoDB 引擎层（**InnoDB 特有**） | MySQL Server 层（所有引擎共用） |
+| **物理 / 逻辑** | **物理日志**（页号+偏移+改动） | **逻辑日志**（SQL 或行的变更） |
+| **写入方式** | **循环写**（固定大小、会覆盖） | **追加写**（不断新建文件、不覆盖） |
+| **用途** | **崩溃恢复**（crash-safe） | **主从复制 + 时间点恢复** |
+| **crash-safe** | **有**（恢复未刷盘的已提交改动） | 无（它不负责恢复数据页，只负责复制/归档） |
+| **谁产生** | 只有 InnoDB 写 | 由 Server 层统一写 |
+
+> 一个关键追问：**"为什么有了 binlog 还要 redo log？"** 因为 binlog 是逻辑、追加、不记"某页是否已刷盘"，**无法判断崩溃时哪些改动还没落盘**，做不到 crash-safe；而且早期 MyISAM 等引擎本就没有 redo。redo 的物理 + 环形 + checkpoint 机制专门为"崩溃恢复数据页"而生。反过来，redo 会被覆盖、存不下全部历史，做不了复制和归档，所以两者缺一不可。
+
+## 六、两阶段提交（2PC）—— 让 redo 与 binlog 状态一致（重点）
+
+### 6.1 为什么需要两阶段提交
+
+redo（引擎层）和 binlog（Server 层）是**两份独立的日志**，要保证"**要么都生效、要么都不生效**"。如果不做协调，崩溃在两者写入之间，就会**主库自身（按 redo 恢复）和从库（按 binlog 重放）数据不一致**：
+
+```text
+   假设没有 2PC，先写 redo 后写 binlog：
+     写完 redo → 崩溃 → binlog 没写
+     ⇒ 主库恢复后这条改动"在"(redo 重放了)，但从库"没有"(没 binlog) → 主从不一致
+
+   反过来先 binlog 后 redo 同样会错。
+```
+
+### 6.2 流程：redo(prepare) → 写 binlog → redo(commit)
+
+InnoDB 把 redo log 的提交拆成 **prepare / commit 两个阶段**，中间夹着 binlog：
+
+```text
+   ① 写 redo log，置 prepare 状态     (引擎层)
+   ② 写 binlog 并刷盘                  (Server 层)   ← 以它为"事务是否提交"的最终依据
+   ③ 写 redo log，置 commit 状态       (引擎层)
+
+       prepare(redo) ──→ 写 binlog ──→ commit(redo)
+```
+
+### 6.3 崩溃恢复时怎么判定：看 binlog 是否完整
+
+重启恢复时，对处于 **prepare** 状态的 redo，根据**对应 binlog 是否完整**决定提交还是回滚：
+
+```text
+   扫描 redo，对每个事务:
+     ├─ redo 已是 commit                    → 直接提交
+     ├─ redo 是 prepare，且 binlog 完整存在  → 提交(补写 commit)   ① 之后 ② 已成功
+     └─ redo 是 prepare，但 binlog 不完整    → 回滚              ② 没成功，当作没发生
+```
+
+核心思想：**以"binlog 是否成功落盘"作为事务最终是否提交的唯一依据**，prepare/commit 两阶段把"引擎层提交"和"binlog 落盘"绑定，保证两份日志最终状态一致 → 主从、恢复都不会错乱。
+
+> 崩溃在各步的结果：①后崩（redo=prepare、无 binlog）→ 回滚；②后崩（redo=prepare、binlog 完整）→ 提交；③后崩（redo=commit）→ 提交。无论崩在哪，主库恢复结果都和 binlog 是否写成功一致。
+
+## 七、"双 1" 配置：最安全的落盘组合
+
+要做到"提交即不丢"，需要 redo 和 binlog **都在提交时强制刷盘**，即所谓 **双 1**：
+
+```sql
+-- redo: 每次事务提交都把 redo log fsync 到磁盘
+SET GLOBAL innodb_flush_log_at_trx_commit = 1;
+-- binlog: 每次事务提交都把 binlog fsync 到磁盘
+SET GLOBAL sync_binlog = 1;
+```
+
+| 参数 | =1（双 1，最安全） | 放松（=0 / =N） |
+|---|---|---|
+| `innodb_flush_log_at_trx_commit` | 提交即 fsync redo，宕机不丢 redo | 0/2 拿"最多丢 1s"换吞吐 |
+| `sync_binlog` | 提交即 fsync binlog，宕机不丢 binlog | 0 由 OS 决定、N 累积 N 个事务才 fsync，更快但可能丢 binlog |
+
+> **双 1** 是金融级"一条都不能丢"的标准配置，代价是每次提交两次 fsync（吞吐下降）。可用**组提交（group commit）**把多个事务的 fsync 合并来缓解。对可容忍少量丢失的场景，常把它们放松成 `2` + `sync_binlog=100~1000` 换取更高吞吐——这是性能与可靠性的经典权衡。
+
+## 一句话总结
+
+> **redo（物理 / 引擎层 / 循环写 / crash-safe）** 靠 WAL 先写日志再刷脏页，崩溃后重放未落盘的已提交改动，刷盘时机由 `innodb_flush_log_at_trx_commit`（0 怕进程也怕 OS、1 最安全、2 只怕 OS/掉电）控制；**undo（逻辑 / 引擎层）** 记反操作，既做回滚保**原子性**、又串成版本链支撑 **MVCC**，靠 purge 清理、长事务会拖住它；**binlog（逻辑 / Server 层 / 追加写）** 用于**主从复制 + 时间点恢复**，格式 statement（小但可能不一致）/ row（大但一致，默认）/ mixed（折中）。redo 与 binlog 用 **两阶段提交（prepare → 写 binlog → commit）** 以"binlog 是否完整"为准保持一致；最安全配置是 **双 1**（`innodb_flush_log_at_trx_commit=1` + `sync_binlog=1`）。事务与 MVCC 全貌见 [事务与隔离级别](transaction.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="mysql/logs" data-base="../"></script>
+</body>
+</html>

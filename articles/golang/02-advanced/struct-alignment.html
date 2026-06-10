@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>struct 内存对齐 &amp; 字段顺序优化 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# struct 内存对齐 & 字段顺序优化
+
+## 一、为什么有内存对齐
+
+CPU 读内存是**按"对齐边界"批量读**——一次读 8 字节、16 字节、32 字节这种整块。如果数据没对齐：
+
+```
+8 字节对齐:
+   ┌─────┬─────┬─────┐
+   │  0  │  8  │ 16  │   ← 这些地址 CPU 一次读一个
+   └─────┴─────┴─────┘
+
+要读地址 5 的 8 字节 int (横跨对齐边界):
+   ┌─────┬─────┬─────┐
+   │     │  ▒▒▒│▒    │   ← 横跨两个 8 字节块
+   └─────┴─────┴─────┘
+   → CPU 要读两次再拼起来 (慢 2-10×)
+   → 某些架构 (ARM) 直接 crash
+```
+
+**编译器的解法**：自动在字段之间插 **padding**，保证每个字段从对齐边界开始——**用空间换性能 + 兼容性**。
+
+---
+
+## 二、对齐规则
+
+### 各类型的对齐边界
+
+| 类型 | 大小 | 对齐 |
+|---|---|---|
+| `bool` / `int8` / `uint8` / `byte` | 1 | **1** |
+| `int16` / `uint16` | 2 | **2** |
+| `int32` / `uint32` / `float32` / `rune` | 4 | **4** |
+| `int64` / `uint64` / `float64` / `complex64` | 8 | **8** |
+| 指针 / `uintptr` | 8（64 位） | **8** |
+| `string`（16 字节 header） | 16 | **8**（按指针对齐） |
+| `slice`（24 字节 header） | 24 | **8** |
+| `interface`（16 字节） | 16 | **8** |
+| `map` / `chan`（指针） | 8 | **8** |
+
+**规则**：
+
+1. **每个字段的偏移量必须是其对齐边界的整数倍**
+2. **整个 struct 的大小必须是其最大字段对齐边界的整数倍**
+
+→ 这两条规则强制编译器**插 padding**。
+
+---
+
+## 三、一个经典例子：24 字节 vs 16 字节
+
+```go
+// ❌ Bad: 24 字节
+type Bad struct {
+    a bool   // 1 字节, offset 0
+    b int64  // 8 字节, 但要 8 字节对齐 → offset 必须是 8 → 插 7 字节 padding
+    c bool   // 1 字节, offset 16
+                // struct 总大小必须是 8 的倍数 → 末尾 padding 7 字节
+}
+
+// ✓ Good: 16 字节
+type Good struct {
+    b int64  // 8 字节, offset 0
+    a bool   // 1 字节, offset 8
+    c bool   // 1 字节, offset 9
+                // 末尾 padding 6 字节
+}
+```
+
+### 内存布局可视化
+
+```
+Bad (24 字节):
+   ┌─────┬───────────────────────┬─────────────────────┬─────┬───────────────────────┐
+   │ a:1 │   padding (7 字节)     │     b (8 字节)       │ c:1 │   padding (7 字节)     │
+   └─────┴───────────────────────┴─────────────────────┴─────┴───────────────────────┘
+   0     1                       8                     16   17                      24
+
+Good (16 字节):
+   ┌─────────────────────┬─────┬─────┬───────────────────────────┐
+   │     b (8 字节)       │ a:1 │ c:1 │   padding (6 字节)         │
+   └─────────────────────┴─────┴─────┴───────────────────────────┘
+   0                     8     9    10                          16
+```
+
+**省了 8 字节（33%）**——只是字段顺序不同。
+
+---
+
+## 四、查看对齐：`unsafe` 三件套
+
+```go
+import "unsafe"
+
+unsafe.Sizeof(Bad{})           // 24
+unsafe.Sizeof(Good{})          // 16
+
+unsafe.Alignof(Bad{})          // 8  (struct 的对齐 = 最大字段对齐)
+unsafe.Alignof(Bad{}.b)        // 8
+
+unsafe.Offsetof(Bad{}.a)       // 0
+unsafe.Offsetof(Bad{}.b)       // 8  (前面 a + 7 padding)
+unsafe.Offsetof(Bad{}.c)       // 16
+```
+
+**最常用 `Sizeof` 看 struct 大小**——快速验证字段顺序对不对。
+
+---
+
+## 五、字段排序的"从大到小"原则
+
+```go
+// 把字段按对齐大小从大到小排:
+type Optimized struct {
+    // 8 字节字段 (指针 / int64 / float64 / string / slice header / interface)
+    PtrField     *Foo
+    IntField     int64
+    StringField  string
+
+    // 4 字节字段
+    Int32Field   int32
+
+    // 2 字节字段
+    Int16Field   int16
+
+    // 1 字节字段 (放最后)
+    BoolField    bool
+    ByteField    byte
+}
+```
+
+这样**最多浪费 7 字节末尾 padding**——不会有中间 padding。
+
+### 实战：用工具检查
+
+```bash
+# go vet 自带 fieldalignment 分析
+go vet -fieldalignment ./...
+
+# 或独立工具
+go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
+fieldalignment ./...
+
+# 第三方更详细的工具
+go install honnef.co/go/tools/cmd/structlayout@latest
+structlayout -json mypackage MyStruct
+```
+
+`fieldalignment` 会给出**最优字段顺序建议**——直接照搬即可。
+
+---
+
+## 六、嵌套 struct 的对齐
+
+```go
+type Inner struct {
+    a int32   // 4
+    b int64   // 8 (对齐 8) → 前面 4 字节 padding
+}
+// Inner 大小: 16 (4 + 4padding + 8)
+
+type Outer struct {
+    x bool     // 1 + 7 padding
+    y Inner    // 16, 必须 8 对齐 → 紧跟在 padding 后
+}
+// Outer 大小: 24
+```
+
+嵌套 struct **被当作一个"对齐为最大字段对齐"的复合块**——不会被打散。
+
+---
+
+## 七、特殊例外 1：刻意 padding 防止伪共享
+
+**高并发场景**，多个 CPU 同时写**同一个 cache line（64 字节）**的不同变量，会触发 **false sharing**——cache line 反复在 CPU 间同步，性能暴跌：
+
+```go
+// ❌ 多 CPU 同时改不同 counter, false sharing
+type Counters struct {
+    a uint64   // CPU 1 在改
+    b uint64   // CPU 2 在改
+    // a 和 b 在同一个 cache line, 互相干扰
+}
+```
+
+**修法：故意 padding 到 cache line 边界（64 字节）**：
+
+```go
+type PaddedCounter struct {
+    count uint64
+    _     [56]byte   // 凑齐 64 字节 = 1 个 cache line
+}
+
+type Counters struct {
+    a PaddedCounter
+    b PaddedCounter
+    // 每个 counter 独占一个 cache line, 互不干扰
+}
+```
+
+→ **空间换性能**——大幅减少 cache line 颠簸。
+
+### Go runtime 内部就用这招
+
+`runtime.mutex` / `sync.Pool.local` 等高频并发结构都做了 cache line padding。
+
+---
+
+## 八、特殊例外 2：atomic.Int64 在 32 位系统
+
+Go 1.19+ 的 `atomic.Int64` / `atomic.Uint64`：
+
+```go
+type Int64 struct {
+    _ noCopy
+    _ align64       // 32 位系统上强制 8 字节对齐!
+    v int64
+}
+```
+
+**32 位系统上，普通字段可能只 4 字节对齐**——但 64 位原子操作要求 8 字节对齐才安全。`align64` 是个空类型，告诉编译器"这字段必须 8 字节对齐"。
+
+```go
+// 32 位系统:
+type Bad struct {
+    flag bool      // 1
+    count int64    // ❌ 可能只 4 字节对齐 → atomic.AddInt64 panic!
+}
+
+// 用 atomic.Int64 自动对齐
+type Good struct {
+    flag  bool
+    count atomic.Int64   // ✓ 总是 8 字节对齐
+}
+```
+
+---
+
+## 九、什么时候必须管字段顺序
+
+| 场景 | 重要性 |
+|---|---|
+| **大量实例**（几百万的 struct） | **必须管**——每实例省 8 字节，百万实例省 8MB |
+| **网络传输的结构** | 注意——但一般用 protobuf 等不直接 marshal struct |
+| **公开的 API struct** | 重要——但要权衡可读性 vs 紧凑 |
+| **小数据 / 临时变量** | 不用管 |
+| **可读性优先的业务 struct** | 一般不用管，除非 vet 提示 |
+
+### 不要过度优化
+
+```go
+// ❌ 为了省 8 字节把字段乱排, 可读性炸
+type User struct {
+    ID        int64
+    CreatedAt time.Time    // 24 字节
+    Email     string       // 16 字节
+    Name      string       // 16 字节
+    Active    bool
+}
+// 这个顺序就是"从大到小"了, 别再调
+
+// ✅ 业务 struct 优先按"逻辑分组" 排
+type User struct {
+    // 标识
+    ID    int64
+    Email string
+
+    // 业务字段
+    Name   string
+    Active bool
+
+    // 时间戳
+    CreatedAt time.Time
+    UpdatedAt time.Time
+}
+```
+
+→ **vet 提示大于 16 字节差异时才调**——小差异不值得牺牲可读性。
+
+---
+
+## 十、一图总结
+
+```
+            内存对齐核心规则
+                    │
+              CPU 按对齐边界批量读
+              不对齐 → 多次读 / crash
+                    │
+              编译器自动插 padding
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+     两条铁律                 字段对齐表
+     ① 字段 offset             8 字节: int64/指针/string/slice header
+       = 对齐的倍数             4 字节: int32/rune/float32
+     ② struct 总大小            2 字节: int16
+       = 最大对齐的倍数         1 字节: bool/byte
+
+   优化策略:
+     字段按对齐大小"从大到小"排
+     → 最多浪费末尾 7 字节
+     → 不会有中间 padding
+
+   工具:
+     unsafe.Sizeof / Alignof / Offsetof
+     go vet -fieldalignment ./...
+     fieldalignment 独立工具
+
+   特殊场景:
+     ① 高并发 → 故意 padding 到 64 字节 (防 false sharing)
+     ② 32 位系统 atomic.Int64 → 用 atomic.Int64 自动对齐
+     ③ 嵌套 struct → 整块对齐 (最大字段对齐)
+
+   什么时候管:
+     ✅ 百万实例 (省内存大)
+     ✅ vet 提示 > 16 字节差异
+     ❌ 小差异 / 临时变量 → 可读性优先
+```
+
+**一句话**：内存对齐 = **CPU 按对齐边界读内存的硬件要求**，编译器自动插 padding 保证；**字段按对齐大小从大到小排**能消除中间 padding（例: 24 字节 → 16 字节，省 33%）。**用 `go vet -fieldalignment` 自动检查**；**高并发场景反过来——故意 padding 到 64 字节 cache line 防 false sharing**。**百万实例的 struct 必管，业务 struct 可读性优先**。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/struct-alignment" data-base="../../"></script>
+</body>
+</html>

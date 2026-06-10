@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Defer 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Defer 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **defer = 函数 return 前自动跑的钩子。** 三条语义：**LIFO · 参数立即求值（闭包才延迟）· 能改命名返回值**；底层是 `g._defer` 链表，1.14+ 开放编码近零开销；**唯一真要避的坑：循环里 defer**（降级堆分配 + 资源迟释放）。
+
+记不全时，按这条**记忆主线：三条语义 + 一个底层 + 五个坑**展开（详细推演看[正文](defer.html)）：
+
+---
+
+## 📜 三条语义 —— 所有坑的根源
+
+**① LIFO：后注册的先跑**
+
+```text
+defer A(); defer B(); defer C()   →  跑的顺序 C → B → A
+```
+为什么？资源嵌套获取、反序释放才对（`open→lock→conn` 反过来 `conn→unlock→close`）。
+
+**② 参数立即求值，闭包才延迟**
+
+```text
+defer f(x)              → x 在「注册那一刻」就快照拷贝
+defer func(){ f(x) }()  → x 在「执行那一刻」才读（延迟）
+```
+
+**③ 能改命名返回值（必须命名）**
+
+```text
+return 1  ≡  ① result = 1  →  ② 跑 defer（能看/能改 result）  →  ③ 真正 return result
+```
+所以 `func f() (result int) { defer func(){ result++ }(); return 1 }` 返回 **2**；匿名返回值在第 ① 步就把值拷走了，defer 改不动。
+
+---
+
+## ⚙️ 一个底层 —— g._defer 链表 + 三代演化
+
+```text
+注册 defer = 往 g._defer 链表「头部」插一个节点
+函数 return = 从链表头开始跑   → 天然 LIFO ✓
+```
+
+| 代 | 版本 | 节点在哪 | 开销 |
+|---|---|---|---|
+| 堆链表 | ≤1.12 | 堆 | ~10× |
+| 栈链表 | 1.13 | 栈帧 | ~7× |
+| **开放编码** | **1.14+（默认）** | **不要节点** | **~1×** |
+
+- **开放编码** = 编译期把 defer **直接展开成普通调用** + 一个 `deferBits`（8 位 bitmap，标记运行时实际注册了哪些）。
+- **用得上的条件**：≤ 8 个 defer / 不在循环里 / 可静态分析。
+- **panic 时临时降级回链表**：正常 return 走开放编码（快），panic 时 runtime 临时建 `_defer` 链表，保证 `recover()` 仍能截住。
+
+---
+
+## ⚠️ 五个坑 —— 记根因，能推出所有写法
+
+```text
+① 作用域是 func 不是 {}        → 循环里 defer：性能炸(降级堆分配) + fd 占到函数结束
+       修：把循环体抽成内层函数（defer 认 func 不认 {}），或循环里别 defer
+② 参数立即求值                 → 计时 defer log(time.Since(start)) 算成 0；for+闭包；值 receiver
+       修：要延迟就套闭包 defer func(){ ... }()
+③ defer 链是 goroutine-local   → 拦不住「别的 goroutine」的 panic
+       修：每个 goroutine 自己 defer+recover
+④ recover 只在 defer 函数体里有效 → 普通调用 recover() / 套一层子函数都返 nil
+       修：recover 必须「直接」写在 defer 挂的那个函数体里
+⑤ 绕过 runtime 就跳过           → os.Exit / log.Fatal 不跑 defer（panic、Goexit 会跑）
+       修：要清理资源就别用 os.Exit/log.Fatal，改 return error
+```
+
+> 一句话串：**坑 ① 是「作用域错位」，②④ 是「时机错位」，③⑤ 是「跑不跑得到」。**
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/defer-memo" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Doris vs ClickHouse vs MySQL 怎么选 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Doris vs ClickHouse vs MySQL 怎么选
+
+> 一句话：MySQL 是行存事务型 OLTP；Doris 是 MPP OLAP，兼顾实时更新、多表 join 与高并发；ClickHouse 是极致单表聚合的 OLAP。三者解决不同问题，按场景选。
+
+## 一、三者一句话定位
+
+- **MySQL**：行式存储的 **OLTP** 数据库。强在单行/小范围的增删改查、事务（ACID）、高频点写点读。是业务系统的「主库」，不是用来跑大数据分析的。
+- **Apache Doris**：MPP 架构的 **OLAP** 数据库，列存 + 向量化。强在大数据量的聚合分析，同时**兼顾多表分布式 join、实时 upsert、较高并发**，且**兼容 MySQL 协议**、运维简单。是「实时数仓 / 分析层」的通用选择。
+- **ClickHouse**：列存 **OLAP** 数据库，强在**单表（宽表）的扫描与聚合极快**，吞吐天花板很高。但**多表 join 较弱、更新能力弱、分布式运维偏重**。是「海量日志/事件宽表、单表打天下」场景的利器。
+
+> 想先搞清 Doris 本身架构，见 [Doris 是什么 · 架构与原理](overview.html)。
+
+## 二、大对比表
+
+> 下表中 Doris 以 **2.x** 为基准，ClickHouse/MySQL 为常见生产形态的定性对比，具体性能随版本与场景而变，仅供选型参考。
+
+| 维度 | MySQL | Apache Doris (2.x) | ClickHouse |
+| --- | --- | --- | --- |
+| 定位 | OLTP（事务） | OLAP（实时分析） | OLAP（分析） |
+| 存储模型 | **行存** | **列存** | **列存** |
+| 事务 / ACID | 强（InnoDB） | 不支持行级事务（导入有原子性） | 基本不支持事务 |
+| 单行点查/点写 | 强项 | 一般（非设计目标） | 弱 |
+| 大数据聚合扫描 | 弱（行存吃亏） | 强 | **极强（单表最快梯队）** |
+| **多表 JOIN** | 支持，但大表 join 吃力 | **强**（MPP 分布式 join + Shuffle，优化器支持多种 join） | **较弱**（偏向单表/宽表，分布式 join 受限） |
+| **UPDATE / 实时更新** | 强（任意行更新） | **支持**（Unique 模型 Merge-on-Write，按主键 upsert） | **弱**（ReplacingMergeTree 异步合并、mutation 重） |
+| **并发能力** | 高（OLTP） | **较高**（点查/小聚合可支撑高 QPS） | 偏低（单查询易吃满资源，高并发需调优） |
+| 运维复杂度 | 低 | **低**（仅 FE/BE 两类进程，自动副本均衡，无外部依赖） | **偏高**（分片/副本需手工规划，依赖 ZooKeeper/Keeper） |
+| SQL / 协议 | MySQL 协议 | **兼容 MySQL 协议**，标准 SQL | 自有 SQL 方言 + HTTP/Native 协议 |
+| 扩展 / 分布式 | 单机为主，分库分表靠中间件 | **原生分布式**，加 BE 即扩容、自动均衡 | 原生分布式，但分片/副本/Distributed 表需手工设计 |
+| 数据导入 | INSERT / 主从复制 | Stream Load / Routine Load(Kafka) / Broker Load / INSERT 等 | INSERT / Kafka 引擎 / 各类导入工具 |
+
+## 三、Doris vs ClickHouse 重点辨析
+
+这俩都是列存 OLAP，最容易纠结。核心差异：
+
+### Doris 的优势
+
+- **MPP 多表 join 强**：天生支持把多张表的数据按 join key 跨节点 Shuffle 再 join，优化器会选择 broadcast / shuffle / colocate 等 join 策略。适合**星型/雪花模型**的数仓建模，不必把一切打成大宽表。
+- **兼容 MySQL 协议**：现有 MySQL 客户端、JDBC、BI 工具直接接入，团队上手快。
+- **运维简单**：只有 **FE / BE 两类组件**，无外部 ZooKeeper 依赖；扩缩容时**自动做副本均衡**，几乎不用人工搬数据。
+- **实时 upsert（Unique 模型 Merge-on-Write）**：能按主键做实时更新/删除，且查询时不必再付出旧版本「读时合并」的代价，适合 CDC 入仓、订单状态变更等**需要更新**的场景。
+
+### ClickHouse 的优势
+
+- **单表扫描聚合极快**：在单张大宽表上做过滤、聚合，吞吐处于业界最快梯队，列存压缩比也很高。
+- **适合宽表 / 海量事件日志**：把维度提前打平进一张大表，靠极致单表性能取胜。
+
+### ClickHouse 的短板（相对 Doris）
+
+- **多表 join 较弱**：分布式 join 能力与易用性不如 Doris，复杂多表关联往往要靠预先做宽表来规避。
+- **更新能力弱**：没有真正的实时按主键 upsert，靠 `ReplacingMergeTree` 等做异步去重合并，`ALTER ... UPDATE`（mutation）是重操作，不适合频繁更新。
+- **运维偏重**：分片（shard）、副本（replica）、`Distributed` 表都要手工规划，集群协调依赖 **ZooKeeper / ClickHouse Keeper**。
+
+> 一句话：**要多表 join、要更新、要省运维、要 MySQL 生态 → Doris；只追单表宽表的极致聚合吞吐、能接受预建宽表与较重运维 → ClickHouse。**
+
+## 四、各自适合什么场景（结论）
+
+| 选它 | 当你的场景是…… |
+| --- | --- |
+| **MySQL** | 业务交易主库；高频单行读写；强一致事务；数据量与并发在单实例可承受范围。**不要拿它跑大数据分析。** |
+| **Apache Doris** | 实时数仓 / 实时报表 / 即席分析；**需要多表 join**（星型/雪花模型）；**需要按主键实时更新**（CDC 入仓、状态变更）；希望**运维省心**、复用 MySQL 协议与 BI 生态；要求较高查询并发。 |
+| **ClickHouse** | 海量日志 / 事件流的**单表（宽表）**分析；以单表聚合吞吐为第一优先级；更新需求弱；团队能承担分片/副本规划与较重运维。 |
+
+## 一句话总结
+
+MySQL 管事务（行存 OLTP），Doris 管「又要分析、又要 join、又要更新、还要省运维」的实时 OLAP（MPP 列存 + MySQL 协议 + Unique 模型 upsert），ClickHouse 管「单表宽表聚合的极致吞吐」；纠结 Doris 还是 ClickHouse 时，看是否需要多表 join / 实时更新 / 轻运维——需要就选 Doris，纯单表极致吞吐就选 ClickHouse。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/vs" data-base="../"></script>
+</body>
+</html>

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>消费者与消费组 Rebalance · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 消费者与消费组 Rebalance
+
+> 一句话：消费组让"组内独占、组间广播"成为可能，而 Rebalance 是组内成员变动时重新分配分区的代价——理解它的触发、过程与 Cooperative 优化，就理解了消费端 90% 的坑。
+
+## 一、消费组 Consumer Group：并行的基本单位
+
+```text
+                 Topic: orders（4 个 Partition）
+                 P0    P1    P2    P3
+                  │     │     │     │
+       ┌──────────┴─────┴─────┴─────┴──────────┐
+       │                                        │
+  Consumer Group A（同组）            Consumer Group B（另一组）
+   ├ C1 ← P0, P1                       ├ C1 ← P0, P1
+   └ C2 ← P2, P3                       └ C2 ← P2, P3
+   （组内独占：一个 P 只给一个 C）      （组间广播：B 组重新全量消费一遍）
+```
+
+- **组内独占 + 负载均衡**：同一个消费组内，**一个 partition 同一时刻只会被组内的一个 consumer 消费**。分区在组内成员间均摊，这就是消费端横向扩展的方式。
+- **组间广播**：不同消费组之间**互不影响**，各自从头到尾全量消费同一份数据（各自维护一套 offset）。一份订单流，既能被"计费组"消费，也能被"风控组"消费。
+- **消费并行度 ≤ 分区数**：组内 consumer 多于 partition 数时，**多出来的 consumer 会空闲**（分不到分区）。所以想加并行，先加分区（见 [Kafka 知识地图](knowledge-graph.html) 分区调优）。
+
+| 关系 | 结论 |
+|---|---|
+| consumer 数 < 分区数 | 有 consumer 分到多个分区 |
+| consumer 数 = 分区数 | 1:1，最理想 |
+| consumer 数 > 分区数 | 多出来的 consumer 闲置 |
+
+---
+
+## 二、Pull 模型：为什么是拉不是推
+
+Kafka 消费端是 **Pull（消费者主动拉）**，不是 Broker 主动 Push。
+
+| 维度 | Pull（Kafka 采用） | Push（Broker 推） |
+|---|---|---|
+| 速率控制 | **消费者按自己能力拉**，不会被压垮 | 慢消费者会被推爆（OOM / 积压） |
+| 批量 | 消费者可一次拉一批，吞吐高 | Broker 难判断该攒多大批 |
+| 缺点 | 没数据时**空轮询**浪费 CPU | —— |
+
+- **空轮询的解法 = long poll**：拉取请求带 `fetch.max.wait.ms`（默认 500ms）和 `fetch.min.bytes`。当数据不足 `min.bytes` 时，Broker 会**挂起请求最多等 `fetch.max.wait.ms`**，攒够或超时才返回，避免消费者忙等空转。
+
+---
+
+## 三、offset 提交：消费进度存在哪、怎么提交
+
+### 3.1 位点存在哪
+
+- offset（消费位点）存在 Kafka 的**内部 topic `__consumer_offsets`**（0.9 之后；更早的版本存在 ZooKeeper）。
+- key = `(group.id, topic, partition)`，value = 提交的 offset。它是个 compact topic，只保留每个 key 的最新值。
+
+### 3.2 自动提交 vs 手动提交
+
+| 方式 | 配置 | 风险 |
+|---|---|---|
+| **自动提交** | `enable.auto.commit=true`（默认），按 `auto.commit.interval.ms`（默认 5s）周期提交 | 提交时机不受业务控制：**到点先提交了 offset，业务却还没处理完 → 崩溃后漏消费**；或处理完崩溃但还没到提交点 → 重复消费 |
+| **手动提交** | `enable.auto.commit=false`，业务处理完显式提交 | 提交时机可控，更安全 |
+
+### 3.3 同步 vs 异步手动提交
+
+```text
+commitSync()    阻塞直到 Broker 确认；失败自动重试；慢但可靠
+commitAsync()   提交后立即返回，带回调；快但失败不自动重试（怕覆盖更大的 offset）
+```
+
+**生产常见组合**：循环里用 `commitAsync()` 提高吞吐，在消费者关闭 / Rebalance 前的 `finally` 里用一次 `commitSync()` 兜底。
+
+---
+
+## 四、分区分配策略
+
+由 `partition.assignment.strategy` 指定，决定"哪个 consumer 拿哪些分区"。
+
+| 策略 | 行为 | 特点 |
+|---|---|---|
+| **Range**（默认之一） | 按**单个 topic** 把分区连续切段分给消费者 | 多 topic 时**前面的消费者容易分得多**，不均衡 |
+| **RoundRobin** | 把所有订阅 topic 的分区**整体轮询**分配 | 更均匀，但组内订阅不一致时易乱 |
+| **Sticky** | 尽量**保留上一次的分配结果**，只动必须动的 | 减少分区迁移带来的抖动 |
+| **CooperativeSticky**（2.4+） | Sticky 的**增量重平衡**版本 | 不 Stop-The-World，详见第六节 |
+
+> 经验：能用 **CooperativeSticky** 就用它；退一步用 **Sticky**。核心诉求都是"少搬分区"。
+
+---
+
+## 五、Rebalance（重平衡）：组内重新洗牌
+
+### 5.1 触发条件
+
+- 组内**成员增减**（新 consumer 加入 / 老 consumer 退出或心跳超时被踢）
+- 消费者**订阅的 topic 变化**（如正则订阅匹配到新 topic）
+- 订阅 topic 的**分区数变化**（分区只能增不能减）
+
+### 5.2 谁来协调 + 两阶段过程
+
+```text
+            ┌─────────── Group Coordinator（某个 Broker）──────────┐
+            │  由 __consumer_offsets 的分区 Leader 所在 broker 担任  │
+            └───────────────────────────────────────────────────────┘
+                         ▲                          │
+          ① JoinGroup    │                          │ ② SyncGroup
+   所有成员上报订阅信息 →  │                          │ ← Leader 把方案交给 Coordinator
+   Coordinator 选出       │                          │   Coordinator 下发给每个成员
+   一个 Group Leader     │                          ▼
+                      C1 / C2 / C3 ...        各成员拿到自己的分区
+```
+
+1. **Group Coordinator**：某个 broker 充当协调者，负责管理组成员、收发心跳、触发 Rebalance。
+2. **JoinGroup**：所有成员把订阅信息发给 Coordinator，Coordinator 从中选出一个 **Group Leader（某个 consumer）**。
+3. **SyncGroup**：**Group Leader 在客户端侧算出分配方案**，发回给 Coordinator，再由 Coordinator 下发给每个成员。（分配逻辑跑在客户端，便于自定义策略。）
+
+### 5.3 最大痛点：Eager 模式 Stop-The-World
+
+传统 **Eager（贪婪）重平衡**：Rebalance 一开始，**组内所有 consumer 先放弃（revoke）全部分区**，等新方案下发后再重新认领。
+
+```text
+Eager 模式时间线：
+  正常消费 ──┐
+            ├── 全组放弃所有分区（STW，全组停止消费）── 重新分配 ── 恢复消费
+  触发 Rebalance
+```
+
+- 后果：**全组暂停消费（Stop-The-World）**，分区越多 / 成员越多，停顿越久，消费积压越严重。
+
+---
+
+## 六、Cooperative Rebalance（2.4+）：增量重平衡
+
+针对 Eager 的 STW，2.4 引入 **协作式（增量）重平衡**（对应 `CooperativeStickyAssignor`）。
+
+- 思路：**不再全员放弃全部分区**，而是**只回收"需要换主"的那部分分区**，没受影响的分区**继续正常消费**。
+- 分两轮 Rebalance：第一轮算出哪些分区要迁移并只 revoke 这些；第二轮把它们分给新归属者。
+
+```text
+Cooperative（增量）：
+  C1: P0 P1 ──────────────────（P0 P1 全程不受影响，继续消费）
+  C2: P2 P3 ──┐
+              └ 只回收 P3 → 分给新加入的 C3
+  C3 加入 ────────────────────── 拿到 P3
+```
+
+| 对比 | Eager（贪婪） | Cooperative（增量，2.4+） |
+|---|---|---|
+| Rebalance 时未受影响分区 | **一起停**（STW） | **继续消费** |
+| 回收范围 | 全部分区 | 仅受影响分区 |
+| 停顿影响 | 大 | **大幅减少 STW** |
+
+---
+
+## 七、重复消费 / 漏消费：本质是提交时机问题
+
+是否重复 / 是否丢，**完全取决于 offset 提交相对业务处理的先后顺序**。
+
+```text
+先处理后提交（At Least Once）：
+   拉取 → 业务处理 → 提交 offset
+   崩在"处理完、提交前" → 重启后重新拉到 → 【可能重复，但不丢】
+
+先提交后处理（At Most Once）：
+   拉取 → 提交 offset → 业务处理
+   崩在"提交后、处理前" → offset 已前移 → 【可能丢，但不重复】
+```
+
+| 诉求 | 做法 |
+|---|---|
+| 不丢（可容忍重复） | **先处理后提交** + 手动 `commitSync` |
+| 彻底不重 | 业务侧**幂等**：唯一键 / Redis 去重，配合 At Least Once |
+| 自动提交的风险 | 提交点与处理进度不对齐，重复和丢都可能发生 → 关键链路关掉自动提交 |
+
+> 配套：副本与 ISR 决定 Broker 端不丢，见 [副本机制](replica.html)；Coordinator 之外的 Controller 选举见 [高可用：Controller 选举](election.html)。
+
+---
+
+## 一句话总结
+
+> **消费组 = 并行单位**（组内独占、组间广播、并行度 ≤ 分区数）；**Pull + long poll** 让消费者自控速率；**offset 存 `__consumer_offsets`**，手动提交比自动提交可控；**Rebalance** 由 Coordinator 经 JoinGroup/SyncGroup 协调，Eager 模式会 **STW**，**2.4+ 的 Cooperative 增量重平衡**大幅缓解；重复还是丢，看你**先提交还是先处理**。（版本：分配策略与 Cooperative 基于 Kafka 2.4+；offset 内部 topic 自 0.9 起。）
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/consumer" data-base="../"></script>
+</body>
+</html>

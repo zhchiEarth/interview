@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pprof 实战：5 种 profile 各看什么 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# pprof 实战：5 种 profile 各看什么
+
+> 一句话：pprof 是 Go 性能分析瑞士军刀；CPU/Heap/Goroutine/Block/Mutex 五种 profile 分别对应五类问题。
+
+## 引入
+
+```go
+import _ "net/http/pprof"
+go http.ListenAndServe(":6060", nil)
+```
+
+## 5 种 profile
+
+| Profile | URL / 命令 | 看什么 |
+|---|---|---|
+| **CPU** | `/debug/pprof/profile?seconds=30` | 哪些函数最吃 CPU |
+| **Heap** | `/debug/pprof/heap` | 内存分配在哪、当前在用多少 |
+| **Goroutine** | `/debug/pprof/goroutine` | 哪些 G 在哪卡着（goroutine 泄漏） |
+| **Block** | `/debug/pprof/block` | 谁在等锁/chan/sync 原语 |
+| **Mutex** | `/debug/pprof/mutex` | 哪些 Mutex 持锁/争锁严重 |
+
+block 和 mutex 默认关，要 `runtime.SetBlockProfileRate / SetMutexProfileFraction` 打开。
+
+## CPU 怎么用
+
+```bash
+# 采 30s
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+
+# 交互
+(pprof) top10              # 自身耗时 Top
+(pprof) top10 -cum         # 累计耗时 Top
+(pprof) list FuncName      # 看具体函数行级
+(pprof) web                # 浏览器看火焰图（要 graphviz）
+
+# 一步火焰图
+go tool pprof -http=:8080 cpu.pprof
+```
+
+## Heap 两种视角
+
+```bash
+# 默认 inuse_space：当前还在用的
+go tool pprof -inuse_space http://.../heap
+
+# alloc_space：累积分配（找"高频小对象"）
+go tool pprof -alloc_space http://.../heap
+```
+
+## Goroutine 泄漏
+
+```bash
+# 看每个调用栈现在有多少 G
+curl http://localhost:6060/debug/pprof/goroutine?debug=1 | head -50
+```
+
+## 一句话总结
+
+> CPU 找热点、Heap 找内存源、Goroutine 找泄漏、Block/Mutex 找锁竞争；别等线上烧了才学。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/pprof" data-base="../../"></script>
+</body>
+</html>

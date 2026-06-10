@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>context 的设计与使用 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# context 的设计与使用
+
+## 一、context 是干嘛用的
+
+服务端代码中**一个请求往往要触发多个下游操作**：
+
+```
+HTTP handler
+   ├── 调 DB
+   ├── 调 Redis
+   ├── 调 RPC service A
+   └── 调 RPC service B (并行)
+```
+
+如果客户端**断开连接** / **超过 SLA**，所有下游调用都该**立刻停下来**——不该让 DB 跑完一个 30 秒的查询发现没人要结果了。
+
+`context` 提供这三件事：
+
+| 能力 | 用途 |
+|---|---|
+| **取消信号** | 上游一声令下，所有下游同时停 |
+| **超时 / 截止时间** | 不准跑超过这个时间 |
+| **跨函数的请求级 KV** | 像 traceID、租户 ID 这种跟整个请求走的元数据 |
+
+→ context 是 Go 服务端的"**请求生命周期管理**"统一约定。
+
+---
+
+## 二、context.Context 接口
+
+```go
+type Context interface {
+    Deadline() (deadline time.Time, ok bool)
+    Done() <-chan struct{}     // ← 核心: 一个用来"收取消信号"的 channel
+    Err() error
+    Value(key any) any
+}
+```
+
+**核心是 `Done()`**——返回一个 channel：
+
+- 上游没取消 → 这个 channel 永远阻塞
+- 上游一旦取消 → channel 被 close → **所有监听者同时收到信号**
+
+这正是 [channel close 是广播信号](../../channel/internals.html) 的应用：
+
+```go
+select {
+case <-ctx.Done():
+    return ctx.Err()         // 上游取消了, 退出
+case result := <-ch:
+    return result, nil       // 正常完成
+}
+```
+
+---
+
+## 三、四种构造函数
+
+```go
+// ① Background: 一切的根 (主函数 / init 用)
+ctx := context.Background()
+
+// ② TODO: "我应该有 ctx 但还没拿到, 先占个位"
+ctx := context.TODO()
+
+// ③ WithCancel: 手动取消
+ctx, cancel := context.WithCancel(parent)
+defer cancel()                          // 必须 defer!
+
+// ④ WithTimeout: 多久后自动取消
+ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+defer cancel()
+
+// ⑤ WithDeadline: 到某时刻自动取消
+ctx, cancel := context.WithDeadline(parent, time.Now().Add(3*time.Second))
+defer cancel()
+
+// ⑥ WithValue: 携带请求级元数据
+ctx = context.WithValue(parent, traceIDKey{}, "req-abc-123")
+```
+
+`WithTimeout` 其实就是 `WithDeadline(parent, now + d)` 的语法糖。
+
+### Background vs TODO
+
+| context | 用在哪 |
+|---|---|
+| `Background()` | main、init、tests 的**根 context** |
+| `TODO()` | **占位**——告诉读代码的人"这里应该传 ctx，将来要补" |
+
+行为上完全一样，**语义区别**——团队约定，让 `TODO` 成为 lint 检查点。
+
+---
+
+## 四、树形传播：父取消 → 所有子取消
+
+context 的核心机制：**每次 With* 都在父 context 下挂一个子 context**，形成一棵树。
+
+```
+Background
+   ├── ctx1 = WithCancel(Background)
+   │     ├── ctx2 = WithTimeout(ctx1, 3s)
+   │     │     └── ctx3 = WithValue(ctx2, k, v)
+   │     └── ctx4 = WithCancel(ctx1)
+   └── ctx5 = WithCancel(Background)
+```
+
+**广播规则**：
+
+```
+父被取消    → 所有后代都自动取消
+某子被取消  → 不影响兄弟和父
+```
+
+时间线：
+
+```
+t=0:  调 cancel1()     →  ctx1.Done() 关
+                       →  ctx2.Done() 关 (因为 ctx2 监听 ctx1)
+                       →  ctx3.Done() 关
+                       →  ctx4.Done() 关
+                       (ctx5 不受影响)
+
+t=10: ctx5 没被取消, 仍正常
+```
+
+### 三种取消触发条件
+
+任一发生就取消：
+
+1. **手动调 `cancel()`**
+2. **超时 / 截止时间到**（WithTimeout / WithDeadline）
+3. **父 context 被取消**（向下传播）
+
+→ 一旦取消，`ctx.Done()` channel 关闭，所有监听者收到信号。
+
+---
+
+## 五、内部实现：三种 ctx 类型
+
+`context` 包内部用**链式组合**实现，不同 With* 产生不同结构：
+
+```go
+type cancelCtx struct {
+    Context              // 嵌入父 ctx
+    mu       sync.Mutex
+    done     atomic.Value  // chan struct{}
+    children map[canceler]struct{}  // 子 ctx 集合
+    err      error
+}
+
+type timerCtx struct {
+    cancelCtx              // 嵌入 cancelCtx
+    deadline time.Time
+    timer    *time.Timer
+}
+
+type valueCtx struct {
+    Context                // 嵌入父 ctx
+    key, val any
+}
+
+type emptyCtx int            // Background / TODO 用这个
+```
+
+### 三种类型的特点
+
+| 类型 | 干啥用 | 关键字段 |
+|---|---|---|
+| `emptyCtx` | Background / TODO | 啥也没有 |
+| `cancelCtx` | WithCancel | `done` channel + `children` 集合 |
+| `timerCtx` | WithTimeout / WithDeadline | 加了一个 `time.Timer` |
+| `valueCtx` | WithValue | 一对 `key, val`，链式查找 |
+
+### 取消是怎么传播的
+
+```
+ctx1 = WithCancel(parent)
+   ↓ 内部:
+   parent.children[ctx1] = present  ← 父记住所有子
+
+cancel1() 被调:
+   ↓
+   ctx1.done channel close
+   ↓
+   遍历 ctx1.children, 递归 cancel 每个子
+```
+
+→ 取消是 **O(树大小)** 的递归，但实际上 ctx 树通常很浅。
+
+### Value 是怎么查的
+
+```go
+ctx = context.WithValue(parent, "k1", "v1")
+ctx = context.WithValue(ctx, "k2", "v2")
+ctx.Value("k1")   // 怎么找到?
+```
+
+```go
+// 伪代码:
+func (c *valueCtx) Value(key any) any {
+    if c.key == key { return c.val }
+    return c.Context.Value(key)  // ← 递归找父
+}
+```
+
+**链式向上查找**——每次 `WithValue` 只新建一个「装一对 KV」的节点，`Value(k)` 从当前 ctx 沿 parent 链**逐节点比对 key**，命中即返回，没命中就往父级走：
+
+```text
+WithValue × N 叠出来的是一条链（不是 map！）：
+  ctxN → … → ctx2 → ctx1 → background
+   每个节点只装 1 对 KV
+
+ctx.Value("k1")     → 从 ctxN 一路比到 ctx1          （O(链深) 线性扫描）
+ctx.Value("不存在")  → 一直走到根 background 才返回 nil  （最坏，全程走完）
+```
+
+→ 所以 **WithValue 滥用会让查找变慢**：是 **O(链深) 的线性查找而非 map O(1)**，链越深、查得越频繁（尤其 hot path / 高 QPS）越明显，找不存在的 key 最亏。**别拿它当全局变量塞业务参数**——只放 traceID 这类少量跨切面数据，hot path 取一次缓存到变量。
+
+---
+
+## 六、监听取消的标准模式
+
+### 模式 1：select 等结果或取消
+
+```go
+func fetch(ctx context.Context) (Result, error) {
+    ch := make(chan Result, 1)
+    go func() {
+        ch <- doWork()
+    }()
+
+    select {
+    case r := <-ch:
+        return r, nil
+    case <-ctx.Done():
+        return Result{}, ctx.Err()      // → context.Canceled / DeadlineExceeded
+    }
+}
+```
+
+### 模式 2：循环中检查取消
+
+```go
+func process(ctx context.Context, items []Item) error {
+    for _, item := range items {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+        }
+        // 处理 item
+    }
+    return nil
+}
+```
+
+⚠️ **慎用**——每轮 select 有开销。批量场景可以**每 N 轮检查一次**或直接靠下游调用响应 ctx。
+
+### 模式 3：把 ctx 透传给下游
+
+```go
+func handler(ctx context.Context) {
+    db.QueryContext(ctx, ...)            // 标准库都接受 ctx
+    redis.GetContext(ctx, ...)
+    http.NewRequestWithContext(ctx, ...)
+}
+```
+
+**只要每一层都把 ctx 透传下去，整个调用栈天然支持取消**——这就是 context 设计的核心目的。
+
+---
+
+## 七、Go 1.21+ 的新 API
+
+### WithCancelCause / Cause
+
+```go
+ctx, cancel := context.WithCancelCause(parent)
+cancel(errors.New("user disconnected"))
+
+// 监听端能拿到原因
+err := context.Cause(ctx)
+// err = "user disconnected"
+```
+
+**用途**：debug 时知道**是什么原因导致取消**，而不是只看到 `context.Canceled`。
+
+### WithDeadlineCause / WithTimeoutCause
+
+同上，带原因的版本。
+
+### AfterFunc
+
+```go
+stop := context.AfterFunc(ctx, func() {
+    log.Println("ctx canceled, cleanup...")
+})
+defer stop()
+```
+
+ctx 取消时**自动调用 f**——避免手动开 goroutine 等 `<-ctx.Done()`。
+
+---
+
+## 八、几条铁律 + 反模式
+
+### ① cancel 必须调用（用 defer）
+
+```go
+ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+defer cancel()         // ⚠️ 缺这行会内存泄漏!
+```
+
+为什么？`WithTimeout` 内部启动一个 timer + 在父 ctx 上挂个子节点。**不 cancel** 会：
+
+- timer 不释放
+- 父 ctx 的 children map 持有这个 ctx 不释放
+- 直到父 ctx 取消才一起回收
+
+→ **每个 With* 返回的 cancel 都必须调**，哪怕 timeout 已经自然到期。
+
+### ② ctx 不要存到 struct 里
+
+```go
+// ❌ 反模式
+type Server struct {
+    ctx context.Context
+}
+```
+
+context 是**请求级**的——每个请求一个 ctx。存到 struct 里等于"一个 ctx 用一辈子"，违背设计意图。
+
+**正确**：每次方法调用传 ctx：
+
+```go
+func (s *Server) Handle(ctx context.Context, req Request) error
+```
+
+### ③ ctx 必须第一个参数
+
+```go
+// ✓
+func DoSomething(ctx context.Context, arg1, arg2 string) error
+
+// ❌
+func DoSomething(arg1 string, ctx context.Context) error  // 团队约定不允许
+```
+
+### ④ WithValue 只放跨切面数据
+
+适合：traceID / requestID / 租户 ID / 认证信息
+
+**不适合**：
+
+```go
+// ❌ 把业务参数塞 ctx
+ctx = context.WithValue(ctx, "userID", 123)
+ctx = context.WithValue(ctx, "userName", "Alice")
+ctx = context.WithValue(ctx, "userEmail", "...")
+ctx = context.WithValue(ctx, "page", 2)
+ctx = context.WithValue(ctx, "sort", "asc")
+```
+
+业务参数走显式函数参数——**不要把 ctx 当成"隐式参数袋"**。
+
+### ⑤ key 用自定义类型，不用 string
+
+```go
+// ❌ 用字符串 key
+ctx = context.WithValue(ctx, "userID", 123)
+// 跟别人的包键名撞车
+
+// ✓ 用未导出的类型
+type userIDKey struct{}
+ctx = context.WithValue(ctx, userIDKey{}, 123)
+```
+
+避免**包之间互相覆盖**。
+
+### ⑥ 不传 nil ctx
+
+```go
+// ❌
+DoSomething(nil, ...)
+
+// ✓
+DoSomething(context.TODO(), ...)
+```
+
+`nil` ctx 会让所有 ctx 方法 panic。
+
+---
+
+## 九、性能 & 内存影响
+
+### 取消传播开销
+
+```
+cancel() → 锁 cancelCtx + 关 done channel + 递归子 ctx
+```
+
+链浅时 O(1)，链很深时 O(N)。**实战中 ctx 树很浅**（一般 < 10 层），可以忽略。
+
+### Value 查找开销
+
+每次 `ctx.Value(k)` 沿 parent 链向上查——**链每多一层多一次比较 + 解引用**。
+
+不要在 hot path 频繁调用 `ctx.Value()`——**取一次缓存到变量**。
+
+### 不调 cancel 的内存泄漏
+
+最常见的生产问题。监控指标：
+
+- `go tool pprof -goroutine` 看 goroutine 数
+- 看 `context.WithTimeout` 调用栈对应的 goroutine 是不是堆积
+
+---
+
+## 十、一图总结
+
+```
+                  context.Context
+                        │
+                  四个接口方法
+   ┌──────┬─────┬────────┬─────────┐
+   │ Done │ Err │ Value  │Deadline │
+   └──────┴─────┴────────┴─────────┘
+        │
+        ▼
+   核心是 Done() 返回的 channel:
+     未取消 → 永远阻塞
+     取消   → close → 所有监听者收到广播
+
+   构造:
+   ┌─────────────┬──────────────────────────┐
+   │ Background  │ 树根, main/init 用       │
+   │ TODO        │ 占位, 等着补              │
+   │ WithCancel  │ 手动取消, 必 defer cancel│
+   │ WithTimeout │ 自动取消 (相对时长)       │
+   │ WithDeadline│ 自动取消 (绝对时刻)       │
+   │ WithValue   │ 携带 KV (慎用)           │
+   └─────────────┴──────────────────────────┘
+
+   传播规则:
+                Background
+                   │
+              cancelCtx_1 ─── cancel1() ─→ 子全部取消
+              │     │
+        timerCtx_2  cancelCtx_3
+        │
+        valueCtx_4
+
+   父被取消 → 所有后代取消 ✓
+   子被取消 → 不影响父和兄弟 ✓
+
+   ctx 标准用法:
+     func F(ctx context.Context, ...) error {
+         select {
+         case <-ctx.Done():  return ctx.Err()
+         case r := <-ch:     return r
+         }
+     }
+
+   铁律:
+     ① 每个 With* 的 cancel 必 defer 调用
+     ② ctx 第一个参数, 不存 struct
+     ③ WithValue 只放跨切面数据 (traceID 等)
+     ④ key 用自定义类型, 不用 string
+     ⑤ 不传 nil ctx, 用 TODO 占位
+     ⑥ 别用 ctx.Value 当业务参数袋
+```
+
+**一句话**：context 是**请求生命周期的统一约定**——一棵 ctx 树通过 `Done()` channel 广播取消信号，配合 `WithTimeout` / `WithCancel` 让整个调用链能"上游一声令下，下游全部停下"。**核心机制就是 channel close 的广播**，"取消"只是用法。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/context" data-base="../../"></script>
+</body>
+</html>

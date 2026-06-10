@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>逃逸分析：什么变量会逃到堆？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 逃逸分析：什么变量会逃到堆？
+
+## 一、逃逸分析是干嘛的
+
+**逃逸分析 = Go 编译器在编译期判断"这个变量需不需要分配到堆上"的过程**。
+
+判断规则一句话：
+
+> 变量的**生命周期会不会超过它所在的函数**？
+> - 不会 → **栈分配**（函数返回时栈帧一弹，变量跟着没了，免费）
+> - 会 → **堆分配**（GC 接管，靠引用计数 + 三色标记决定何时回收）
+
+"逃逸"这个词是从**编译器视角**说的：变量的引用"**跑出了**当前栈帧的边界"，就叫逃逸。
+
+---
+
+## 二、为什么我们关心逃逸（栈 vs 堆的真实代价）
+
+| 维度 | 栈分配 | 堆分配 |
+|---|---|---|
+| 分配速度 | **移动 SP 寄存器**（一条指令） | 走 `runtime.mallocgc`，可能加锁、可能触发 GC |
+| 释放速度 | **函数返回自动释放**（一条指令） | GC 标记 + 清扫，工作量随对象数线性增长 |
+| 局部性 | 紧凑、cache 友好 | 散落在堆上，cache 不友好 |
+| 对 GC 的影响 | **零** | 增加 GC 扫描压力 |
+
+实测：热路径上一次堆分配 ≈ 一次锁竞争的开销；高并发下大量小对象堆分配是 **Go 服务最常见的性能瓶颈之一**。
+
+> 优化 Go 性能 = 优化 GC 压力 = 优化堆分配 = **避免不必要的逃逸**。
+
+---
+
+## 三、什么时候栈，什么时候堆——决策规则
+
+### 决策树（编译器实际做的事）
+
+```
+       声明一个变量 / 调用 new / make
+                    │
+                    ▼
+       ┌─────────────────────────────┐
+       │ 大小是不是编译期已知 + 小?   │
+       │ (一般 < 64KB)               │
+       └───────────┬─────────────────┘
+                   │
+            ┌──────┴──────┐
+            │否           │是
+            ▼             ▼
+        ⚠️ 堆          ┌──────────────────────────────────┐
+                       │ 这个变量的引用会不会"流出"       │
+                       │ 当前函数边界?                    │
+                       │ (return / 存全局 / 存到逃逸的对象│
+                       │  内 / 通过 channel/goroutine 传出)│
+                       └────────────┬─────────────────────┘
+                                    │
+                          ┌─────────┴─────────┐
+                          │否                  │是 (或编译器证不了"否")
+                          ▼                    ▼
+                       ✅ 栈                ⚠️ 堆
+```
+
+**核心法则**：编译器对"不会逃逸"的判断必须**确定无疑**，否则**保守地放堆**——宁可慢点，也不能让悬空指针发生。
+
+⚠️ **取地址 `&x` 本身不会让 x 逃逸**——只有当那个地址"流出了"函数边界，才算逃逸。
+
+---
+
+### ✅ 栈分配的典型场景（编译器能证明"不逃逸"）
+
+#### 场景 A：纯局部变量，从不取地址
+
+```go
+func sum() int {
+    a := 1            // 栈
+    b := 2            // 栈
+    return a + b      // 没取地址,寿命完全在函数内
+}
+```
+
+`go build -gcflags="-m"` 输出：什么都不报（默认就是栈）。
+
+#### 场景 B：取了地址但没流出
+
+```go
+func swap() (int, int) {
+    a := 1
+    b := 2
+    pa, pb := &a, &b   // 取了地址,但 pa/pb 只在函数内用
+    *pa, *pb = *pb, *pa
+    return a, b        // 返回的是值,不是地址
+}
+// a, b 都不逃逸 — 栈分配
+```
+
+输出：`./main.go:N: &a does not escape`
+
+#### 场景 C：返回**值类型**（不是指针）
+
+```go
+type Point struct{ x, y int }
+
+func mkPoint() Point {
+    return Point{1, 2}    // 值返回, 直接拷贝到调用者栈帧
+}
+// Point 不逃逸 — 栈分配 (实际是 RVO 一样的优化,直接构造在调用者栈)
+```
+
+#### 场景 D：`new(T)` 不逃逸时
+
+很多人以为 `new` 一定是堆——**错**。`new` 只是分配 + 清零 + 返回指针，**逃逸与否还要看返回的指针流向哪里**：
+
+```go
+func sum() int {
+    p := new(int)    // ← 编译器可能把它放栈上!
+    *p = 1
+    return *p
+}
+// 输出: ./main.go:N: new(int) does not escape
+// p 栈分配 (即使是 new)
+```
+
+#### 场景 E：`make([]T, 常量)` 在小容量时
+
+```go
+func work() int {
+    s := make([]int, 4)    // 常量大小,小容量
+    s[0] = 1; s[1] = 2
+    return s[0] + s[1]
+    // s 未 return, 底层数组栈分配
+}
+```
+
+#### 场景 F：传 `*T` 参数，但 callee 不"保存"它
+
+```go
+func use(p *int) int { return *p }   // 只读,不存
+
+func caller() int {
+    x := 42
+    return use(&x)    // x 不逃逸,栈分配
+}
+// 输出: ./main.go:N: p does not escape
+//       ./main.go:N: &x does not escape
+```
+
+关键：编译器做**跨函数的逃逸分析**——只要 callee 不把 `p` 存到比 caller 寿命长的地方，`&x` 就不让 x 逃。
+
+---
+
+### ⚠️ 堆分配的典型场景（编译器无法证明"不逃逸"）
+
+#### 场景 A：地址 return 出去
+
+```go
+func newPoint() *Point {
+    p := Point{1, 2}
+    return &p      // ❌ &p 流出, p 逃逸到堆
+}
+```
+
+输出：`moved to heap: p`
+
+#### 场景 B：存到全局变量 / 闭包捕获后传出
+
+```go
+var sink *Point
+
+func keep() {
+    p := Point{1, 2}
+    sink = &p      // ❌ p 逃逸
+}
+```
+
+#### 场景 C：interface 装箱
+
+```go
+func log(x int) {
+    fmt.Println(x)   // ❌ x 装箱成 interface{},逃逸
+}
+```
+
+#### 场景 D：大小是运行时变量
+
+```go
+func slice(n int) []int {
+    return make([]int, n)    // ❌ n 未知,保守堆分配
+}
+```
+
+#### 场景 E：对象太大，栈帧装不下
+
+```go
+func big() {
+    var arr [1_000_000]int   // ❌ 8MB,塞不进栈帧 → 堆分配
+    use(arr[:])
+}
+```
+
+Go 默认栈起步 2KB，单变量超过 ~64KB 一般会被直接放堆。
+
+#### 场景 F：跨 goroutine
+
+```go
+func async() {
+    p := &Point{1, 2}
+    go process(p)    // ❌ 跨 G, 编译器保守堆分配
+}
+```
+
+---
+
+### 常见误区表
+
+| 误区 | 真相 |
+|---|---|
+| "`new(T)` 一定堆分配" | ❌ 看返回的指针有没有流出函数；不流出就是栈 |
+| "`make()` 一定堆分配" | ❌ 同上，常量大小且不 return 时栈分配 |
+| "取地址 `&x` 就会逃逸" | ❌ 取地址只是必要条件；还要看地址流向 |
+| "传 `*T` 参数会让对象逃逸" | ❌ 看 callee 是否保存它；只读访问不让 caller 变量逃 |
+| "栈上的对象不能有指针" | ❌ 栈对象可以包含指针；GC 会扫描栈上的指针 |
+| "返回值类型 = 不逃逸" | ❌ 返回 interface / 大对象时仍可能逃 |
+| "局部变量 = 栈" | ❌ 只要"引用越界"，局部变量也会被搬到堆 |
+
+---
+
+### 一个例子贯穿所有规则
+
+```go
+type Big struct{ buf [100]int }
+
+func a() {
+    x := Big{}        // ✅ 栈 (没取地址)
+}
+
+func b() Big {
+    return Big{}      // ✅ 栈 (值返回, RVO 直接构造在调用者栈)
+}
+
+func c() *Big {
+    p := &Big{}       // ❌ 堆 (地址 return)
+    return p
+}
+
+func d() {
+    p := &Big{}       // ✅ 栈 (取了地址但没流出)
+    _ = p.buf[0]
+}
+
+func e() {
+    p := new(Big)     // ✅ 栈 (new 也能栈分配!)
+    _ = p.buf[0]
+}
+
+func f() any {
+    return Big{}      // ❌ 堆 (装箱成 interface)
+}
+
+func g(n int) {
+    s := make([]Big, n)  // ❌ 堆 (n 是变量)
+    _ = s
+}
+
+func h() {
+    s := make([]Big, 4)  // ✅ 栈 (常量大小, 不 return)
+    _ = s
+}
+```
+
+每个案例都对应前面决策树的某条路径——读完这 8 个函数，**栈/堆决策机制就装进脑子里了**。
+
+---
+
+## 四、5 大逃逸根因
+
+跟 defer 的坑一样，**所有逃逸场景其实只有 5 个根因**。
+
+### 根因 ①：引用"越界"——指针/地址跑出函数边界
+
+变量的地址被 return 出去、存到全局变量、存到外层对象等，编译器**无法证明它的引用在函数返回前消失**。
+
+```go
+// ❌ 逃逸
+func newPoint() *Point {
+    p := Point{1, 2}
+    return &p          // ← 地址 return 出去, p 必须堆分配
+}
+
+// ❌ 逃逸
+var global *Point
+func keep() {
+    p := Point{1, 2}
+    global = &p        // ← 地址存到全局, p 必须堆分配
+}
+
+// ✓ 不逃逸
+func sum() int {
+    p := Point{1, 2}
+    return p.x + p.y   // ← 没有地址流出, p 栈分配
+}
+```
+
+### 根因 ②：interface 装箱
+
+#### 什么是"装箱"
+
+**装箱（boxing）** = 把一个具体类型的值"包装"成 interface 的过程。这个词来自 Java/C#，Go 沿用了。
+
+为什么需要装箱？因为 `interface` 在内存里**不是值本身**，是一个 **2 字结构**：
+
+```
+var i any = 42
+
+interface 在内存里 (16 字节):
+   ┌─────────────────────┐
+   │  type: *_type       │  ← 指向类型信息 (告诉别人"我是 int")
+   ├─────────────────────┤
+   │  data: unsafe.Pointer ──┐
+   └─────────────────────┘   │
+                             │ 必须指向某处存着真正的 42
+                             ▼
+                   ┌─────────────────┐
+                   │       42        │  ← 真正的数据
+                   └─────────────────┘
+                    (这块内存在哪? = 装箱的核心问题)
+```
+
+**关键**：`data` 字段是**指针**，必须指向某处真实数据。这块"某处"通常**必须在堆**——因为：
+
+- 如果放栈上，interface 一旦传出函数，栈帧弹掉，指针就悬空
+- 编译器为了安全，**默认把装箱的数据放堆**（除非能证明 interface 绝不流出函数）
+
+所以**装箱 ≈ 堆分配**，这是 Go 里最常见的"隐式逃逸"来源。
+
+#### 装箱的典型例子
+
+```go
+// ❌ 装箱 → 堆分配
+var i any = 42                  // int 装进 any
+fmt.Println(42)                 // 参数是 ...any, 42 被装箱
+m := map[string]any{"k": 42}    // 42 装箱后存入 map
+err := errors.New("...")        // *errorString 装箱进 error 接口
+```
+
+#### "拆箱" (unboxing)
+
+反过来从 interface 取回原值，叫**拆箱**：
+
+```go
+var i any = 42
+
+// 类型断言 = 拆箱
+n := i.(int)        // 拆回 int 值
+n, ok := i.(int)    // 带 ok 模式, 不会 panic
+```
+
+拆箱本身不分配内存，只是把数据指针指向的值读出来。
+
+#### 装箱的代价
+
+```go
+// ❌ 逃逸 (fmt.Println 的参数是 ...any)
+func log(x int) {
+    fmt.Println(x)   // x 被装箱到 any → 堆
+}
+
+// ✓ 不逃逸
+func log2(x int) {
+    println(x)       // builtin println 不走 interface
+}
+```
+
+⚠️ **`fmt.*` / `log.*` 是最常见的隐式逃逸源**。热路径上避免 `fmt.Println` / `fmt.Sprintf`，或者改用泛型 / 具体类型签名。
+
+### 根因 ③：编译期大小未知 / 大小过大
+
+```go
+// ❌ 逃逸 — 大小是运行时变量
+func f(n int) []int {
+    s := make([]int, n)   // ← n 未知,保守堆分配
+    return s
+}
+
+// ✓ 不逃逸(看具体大小) — 常量大小,编译期能算
+func g() []int {
+    s := make([]int, 100)  // ← 100 是常量, 小到能塞栈,可能栈分配
+    use(s)
+    return nil
+}
+
+// ❌ 逃逸 — 太大,塞不进栈
+func h() {
+    var arr [10_000_000]int   // ← 80MB, 栈帧装不下,堆分配
+    use(arr[:])
+}
+```
+
+Go 默认栈帧大小起步 2KB（动态增长），但**超过某个阈值**（一般 64KB 量级）的对象一定堆分配。
+
+### 根因 ④：闭包捕获
+
+被闭包按引用捕获的变量，**生命周期跟闭包绑定**——闭包传给别人，变量就跟着到处跑。
+
+```go
+// ❌ 逃逸
+func makeAdder() func(int) int {
+    base := 100               // ← 被闭包捕获并 return 出去
+    return func(x int) int {
+        return base + x       // ← base 逃逸到堆
+    }
+}
+
+// ❌ 逃逸 (但理由不同, 是因为闭包本身要堆分配)
+func work() {
+    x := 1
+    go func() {               // ← 闭包跨 goroutine
+        fmt.Println(x)        // ← x 逃逸
+    }()
+}
+
+// ✓ 不逃逸 — 闭包没被传出去, 在当前栈帧内调用
+func inline() {
+    x := 1
+    f := func() { use(x) }   // 闭包就地用,可能不逃逸
+    f()
+}
+```
+
+### 根因 ⑤：跨 goroutine / channel 传递
+
+变量通过 channel 发送，或被新 goroutine 引用——编译器无法证明寿命，**保守逃逸**。
+
+```go
+// ❌ 逃逸
+func send(ch chan<- *Data) {
+    d := &Data{...}    // 通过 channel 传出去, 逃逸
+    ch <- d
+}
+
+// ❌ 逃逸
+func async() {
+    d := &Data{...}
+    go process(d)      // 跨 goroutine, 编译器保守逃逸
+}
+```
+
+---
+
+## 五、5 根因汇总表
+
+| 根因 | 一句话本质 | 典型场景 |
+|---|---|---|
+| **① 引用越界** | 地址流出当前栈帧（return / 存外层 / 全局变量） | `return &x` / `global = &x` |
+| **② interface 装箱** | 赋给 interface{} 时，value 部分通常逃逸 | `fmt.Println(x)` |
+| **③ 编译期未知/过大** | 大小是变量 / 超出栈阈值 | `make([]T, n)` / 大数组 |
+| **④ 闭包捕获** | 闭包"带走"了变量的引用 | `return func(){ use(x) }` |
+| **⑤ 跨 goroutine / channel** | 编译器无法跨执行流证明寿命 | `go f(x)` / `ch <- x` |
+
+3 大类（再压一层）：
+
+```
+                逃逸根因
+                   │
+       ┌───────────┼───────────┐
+       ▼           ▼           ▼
+     边界逃逸    类型擦除    物理装不下
+     ① ④ ⑤      ②           ③
+
+     边界逃逸: 引用跑出函数 / goroutine / 闭包
+     类型擦除: interface 装箱后编译器看不清
+     物理装不下: 大小未知或超阈值,栈帧塞不下
+```
+
+---
+
+## 六、类型 × 栈/堆 速查表
+
+⚠️ **再强调一次**：没有"某类型必定在某处"的硬规则——最终都看引用是否逃逸。下面是**默认情况**和**何时变堆**。
+
+### 总表
+
+| 类型 | 默认在 | 何时变堆 | 备注 |
+|---|---|---|---|
+| `int` / `float` / `bool` / `byte` / `rune` | **栈** | 取地址 return / 装 interface | 值类型本体 |
+| `[N]T` 数组 | **栈** | 取地址 return / 太大（>~64KB） | 固定大小，值语义 |
+| `string` header | **栈** | header 流出函数 | header = (data ptr, len) |
+| `string` 底层字节 | **看来源** | 字面量在只读段；动态生成的看逃逸 | 不可变 |
+| `[]T` slice header | **栈** | header 流出 | header = (ptr, len, cap) |
+| `[]T` 底层数组 | **看 make 时机** | n 是变量 / return slice / 容量大 | 关键 |
+| `map[K]V` | **几乎总是堆** | 几乎不可能栈 | `make(map)` 内部 `runtime.makemap` 直接堆分配 |
+| `chan T` | **几乎总是堆** | 几乎不可能栈 | `make(chan)` 内部 `runtime.makechan` 直接堆分配 |
+| `func` 不带捕获 | **栈** | 函数指针流出 | 8 字节函数地址 |
+| `func` 带捕获（闭包） | **看流向** | 闭包 escape 时 | 闭包结构 + 捕获的变量都跟着走 |
+| `*T` 指针变量本身 | **栈**（8 字节） | 指针变量被取地址流出 | 指针指向的对象单独分析 |
+| `interface{}` / `any` header | **栈**（16 字节） | header 流出 | header = (type ptr, data ptr) |
+| `interface{}` 的 data 部分 | **几乎总是堆** | 几乎总是 | **装箱必然导致数据逃**（见根因 ②） |
+| `struct` | **栈** | 取地址 return / 装 interface / 太大 | 跟 int 一样的值语义 |
+| `goroutine 栈` | **特殊** | 一直是堆 | "栈"实际是从堆上申请的内存段 |
+
+### 详解几个关键类型
+
+#### slice：要拆成 header 和底层数组两部分看
+
+```go
+type sliceHeader struct {
+    data unsafe.Pointer  // 指向底层数组
+    len  int
+    cap  int
+}
+```
+
+| 写法 | header | 底层数组 |
+|---|---|---|
+| `s := make([]int, 4)` 不 return | 栈 | **栈**（常量大小+不流出） |
+| `return make([]int, 4)` | 栈→拷贝出去 | **堆**（随 s 流出） |
+| `s := make([]int, n)` | 栈 | **堆**（n 是变量） |
+| `s := []int{1,2,3,4}` 不 return | 栈 | **栈** |
+
+#### map / chan：内部结构本身就在堆
+
+```go
+m := make(map[string]int)
+ch := make(chan int, 10)
+```
+
+- map 变量 `m` 是 `*hmap`（一个指针，8 字节，在栈上）
+- chan 变量 `ch` 是 `*hchan`（同上）
+- **但它们指向的 hmap / hchan 数据结构 = 堆**
+
+原因：`runtime.makemap` 和 `runtime.makechan` 内部直接 `mallocgc`——这两个数据结构常常跨 goroutine 共享，必须在堆才能稳定存在。
+
+#### string：字面量在只读段（既不栈也不堆）
+
+```go
+s := "hello"
+```
+
+- `s` 是个 `stringHeader{data, len}`，**header 在栈**
+- `"hello"` 这串字节在**程序的只读数据段（rodata）**——整个程序生命周期共享，**既不是栈也不是堆**
+- 拼接 `a + b` 产生的新字符串 → **底层字节在堆**
+
+#### interface：header 在栈，data 几乎总在堆
+
+回顾根因 ② 的图：interface 是 `(type, data)` 二元组，data 是指针。装箱时 data 几乎必然指向堆。
+
+#### 闭包：捕获什么决定了一切
+
+```go
+// 不捕获 = 函数指针, 栈
+var f func() = sayHello
+
+// 捕获 + 流出 = 闭包结构 + 被捕获变量, 都堆
+func makeAdder(b int) func(int) int {
+    return func(x int) int { return b + x }  // ❌ 闭包逃, b 也逃
+}
+
+// 捕获但不流出 = 仍可能栈
+func use() {
+    x := 1
+    f := func() { use2(x) }
+    f()    // 当场用掉, 可能栈
+}
+```
+
+#### goroutine "栈" 是堆上的连续段
+
+```
+go work()  →  runtime 在堆上 malloc 一段 2KB 内存 → 这就是新 G 的"栈"
+              栈不够时翻倍扩容 (拷贝到新的堆段)
+```
+
+所以 goroutine 栈是"**堆上的栈**"——享受栈的快分配/快释放语义，但物理上从堆分配。
+
+---
+
+### 简化记忆口诀
+
+```
+基本类型 / 数组 / 小 struct / string header / slice header / interface header
+   ↓
+   默认在栈, 取地址 return 或装 interface 才逃
+
+map / chan
+   ↓
+   几乎一定在堆 (runtime 直接 mallocgc)
+
+slice 底层数组 / 闭包捕获变量
+   ↓
+   单独分析, 看引用流向
+
+interface 的 data 部分
+   ↓
+   几乎一定在堆 (装箱即逃)
+
+字符串字面量底层字节
+   ↓
+   只读数据段 (既不栈也不堆)
+
+goroutine 的栈
+   ↓
+   物理上在堆, 但用法像栈
+```
+
+---
+
+## 七、看逃逸：实战命令
+
+```bash
+go build -gcflags="-m" main.go        # 看每个变量是否逃逸
+go build -gcflags="-m -m" main.go     # 看详细推导路径(为什么逃)
+go build -gcflags="-m -l" main.go     # 禁用 inline,看更纯粹的逃逸结果
+```
+
+典型输出：
+
+```
+./main.go:10:9: &p escapes to heap          ← 显式说明逃逸
+./main.go:10:9:   from ~r0 (return) at ./main.go:10:2
+./main.go:9:6: moved to heap: p             ← p 被搬到堆
+./main.go:15:13: ... argument does not escape   ← 参数没逃
+```
+
+读输出关键词：
+
+| 关键词 | 含义 |
+|---|---|
+| `escapes to heap` | 这个变量/表达式逃到堆了 |
+| `moved to heap: x` | 局部变量 x 被搬到堆 |
+| `does not escape` | 没逃逸（参数/返回值仍在栈上） |
+| `leaking param: x` | 参数被"漏出"——可能让调用方变量逃逸 |
+
+---
+
+## 八、反直觉的几个例子
+
+### 例 1：返回**值类型**也可能逃逸
+
+```go
+// 不逃逸 (值返回, 拷贝)
+func a() Point { return Point{1, 2} }
+
+// 逃逸 (返回 interface, 装箱)
+func b() fmt.Stringer { return Point{1, 2} }   // ← Point 逃逸
+```
+
+### 例 2：传 `*T` 参数不一定让对象逃逸
+
+```go
+// p 不逃逸 — 编译器看到 use 不会保存 p
+func use(p *Point) { fmt.Println(p.x) }   // (但内部 p.x 装箱仍可能逃)
+
+func caller() {
+    p := Point{1, 2}
+    use(&p)        // ← &p 没让 p 逃! use 没存它
+}
+```
+
+但如果 `use` 把 `*p` 存起来或返回出去，`p` 才逃。
+
+### 例 3：slice 元素逃逸 ≠ slice header 逃逸
+
+```go
+func f() []int {
+    s := make([]int, 100)   // 底层数组 100 个 int, 可能栈分配
+    return s                 // 但 return 出去 → 底层数组逃逸
+}
+```
+
+---
+
+## 九、实战优化清单（按根因开药）
+
+| 根因 | 优化手段 |
+|---|---|
+| **① 引用越界** | 能用**值返回**就别返回指针；小 struct 拷贝比堆分配便宜 |
+| **② interface 装箱** | 热路径避免 `fmt.*` / `any` 参数；用泛型替代 interface |
+| **③ 大小未知/过大** | 容量已知时用常量大小 / 数组；大对象用 `sync.Pool` 复用 |
+| **④ 闭包捕获** | 性能敏感路径少用闭包；改用传参 |
+| **⑤ 跨 goroutine** | 跨 G 必须用指针/接口时，配合 `sync.Pool` 减少分配 |
+
+**通用法则**：
+
+- 写完用 `-gcflags="-m"` 看热点函数，确认没意外逃逸
+- 用 `go test -bench -benchmem` 看 `allocs/op`，**目标是 0 allocs/op**
+- 用 `pprof -alloc_space` 找累积分配最多的代码路径
+
+---
+
+## 十、一图总结
+
+```
+            逃逸分析的本质
+                  │
+                  ▼
+   编译期推断: 变量寿命 > 当前栈帧?
+                  │
+        ┌─────────┴─────────┐
+        ▼ 否                ▼ 是
+     栈分配 (免费)         堆分配 (mallocgc + GC)
+                            │
+                            ▼
+                       5 大根因
+   ┌──────────┬──────────┬──────────┬──────────┬──────────┐
+   │ ① 边界   │ ② 装箱   │ ③ 太大   │ ④ 闭包   │ ⑤ 跨 G   │
+   │ &x 流出  │ interface│ make(n)  │ 捕获变量 │ ch / go  │
+   └──────────┴──────────┴──────────┴──────────┴──────────┘
+                            │
+                            ▼
+                  实战工具
+        go build -gcflags="-m"   看每个变量逃没逃
+        go test  -benchmem       看 allocs/op
+        go tool pprof -alloc_space  找热点分配
+```
+
+**一句话**：逃逸 = "**变量的引用能不能在函数返回前完全消失**"，能 → 栈，不能 → 堆；5 大根因（边界 / 装箱 / 过大 / 闭包 / 跨 G）覆盖所有场景；优化 Go 性能很大程度就是用 `-gcflags="-m"` 找出**不必要的逃逸**并消除。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/escape-analysis" data-base="../../"></script>
+</body>
+</html>

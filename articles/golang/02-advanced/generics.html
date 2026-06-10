@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go 泛型（1.18+） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Go 泛型（1.18+）
+
+## 一、Go 为什么要泛型——动机
+
+Go 1.18 之前**没有泛型**——想写"通用容器/算法"只有两条路，都不好：
+
+```go
+// 路 1: interface{} (any) + 类型断言
+func Contains(slice []any, v any) bool {
+    for _, x := range slice {
+        if x == v { return true }
+    }
+    return false
+}
+// 问题: ① 失去类型安全 (any) ② 装箱开销 ③ 用前要 .(int) 断言
+
+// 路 2: reflect
+func Contains(slice any, v any) bool {
+    s := reflect.ValueOf(slice)
+    for i := 0; i < s.Len(); i++ {
+        if reflect.DeepEqual(s.Index(i).Interface(), v) {
+            return true
+        }
+    }
+    return false
+}
+// 问题: ① 慢 50× ② 类型错误只能运行时发现
+```
+
+**Go 1.18 引入泛型**之后：
+
+```go
+func Contains[T comparable](s []T, v T) bool {
+    for _, x := range s {
+        if x == v { return true }
+    }
+    return false
+}
+
+Contains([]int{1, 2, 3}, 2)       // ✓ 类型推导
+Contains([]string{"a"}, "a")       // ✓
+Contains([]int{1}, "x")            // ❌ 编译错: 类型不匹配
+```
+
+**三个好处**：
+
+1. **类型安全**——编译期检查，不会在运行时翻车
+2. **零开销**（对大多数场景）——和手写直接版本一样快
+3. **代码复用**——一份代码处理任何类型
+
+---
+
+## 二、基本语法
+
+### 类型参数
+
+```go
+//   ┌─ 类型参数列表
+//   │
+func Map[T, U any](s []T, f func(T) U) []U {
+    r := make([]U, len(s))
+    for i, v := range s {
+        r[i] = f(v)
+    }
+    return r
+}
+
+// 调用 (一般类型推导自动处理):
+doubled := Map([]int{1, 2, 3}, func(i int) int { return i * 2 })
+// 等价于显式: Map[int, int]([]int{1,2,3}, ...)
+```
+
+### 泛型类型
+
+```go
+// 泛型 struct
+type Stack[T any] struct {
+    items []T
+}
+
+func (s *Stack[T]) Push(v T)    { s.items = append(s.items, v) }
+func (s *Stack[T]) Pop() (T, bool) {
+    if len(s.items) == 0 {
+        var zero T
+        return zero, false
+    }
+    last := s.items[len(s.items)-1]
+    s.items = s.items[:len(s.items)-1]
+    return last, true
+}
+
+// 使用:
+s := Stack[int]{}
+s.Push(1)
+v, _ := s.Pop()
+```
+
+---
+
+## 三、类型约束（constraint）
+
+`any` 是最弱的约束（什么都行），但更常见的是**限制 T 必须满足某些操作**。
+
+### 内置约束
+
+```go
+T any           // 任何类型
+T comparable    // 支持 == / != (大部分类型, 不含 slice/map/func)
+```
+
+### 自定义约束 = interface
+
+```go
+type Number interface {
+    int | int64 | float32 | float64    // 联合类型
+}
+
+func Sum[T Number](s []T) T {
+    var r T
+    for _, v := range s {
+        r += v        // T 支持 + 因为 Number 都支持
+    }
+    return r
+}
+
+Sum([]int{1, 2, 3})           // ✓
+Sum([]float64{1.1, 2.2})       // ✓
+Sum([]string{"a"})             // ❌ string 不在 Number 里
+```
+
+> Go 1.18 之前，interface 只能列方法；现在 **interface 可以列"类型集"**——这是泛型的核心扩展。
+
+### `~` 操作符：包含底层类型
+
+```go
+type MyInt int
+
+type Integer interface {
+    int        // 只包括 int 本身
+}
+
+type IntegerLike interface {
+    ~int       // 包括 int 及其底层类型 = int 的所有类型 (如 MyInt)
+}
+
+var x MyInt = 5
+Sum[Integer]([]Integer{x})       // ❌ MyInt 不是 int
+Sum[IntegerLike]([]IntegerLike{x})  // ✓
+```
+
+→ `~T` 表示 "**底层类型是 T 的所有类型**"。
+
+### 标准库约束（`constraints` 包，Go 1.21 起进入 stdlib）
+
+```go
+import "cmp"   // Go 1.21+
+
+cmp.Ordered     // int / float / string 等可比大小的类型
+
+// 老的 golang.org/x/exp/constraints:
+constraints.Signed     // int / int8 / ...
+constraints.Unsigned   // uint / uint8 / ...
+constraints.Integer    // 上两个的并集
+constraints.Float      // float32 / float64
+constraints.Complex
+constraints.Ordered    // 可比大小
+```
+
+---
+
+## 四、Go 怎么实现泛型：GC Shape Stenciling
+
+这是 Go 泛型最有趣的部分——**和 C++ / Java 都不一样**。
+
+### 三种泛型实现策略
+
+| 策略 | 代表语言 | 怎么做 | 优缺点 |
+|---|---|---|---|
+| **完全特化** | C++ 模板 | 每个具体类型生成一份独立代码 | 性能最好，但**代码爆炸** |
+| **完全擦除** | Java 泛型 | 编译期擦掉类型信息，运行时全用 Object | 没代码爆炸，但**装箱开销 + 运行时类型丢失** |
+| **GC Shape Stenciling** | **Go 1.18+** | **同 GC shape 的类型共享一份代码** | 中间路线 |
+
+### 什么是 "GC shape"
+
+Go 的 GC shape ≈ **类型在 GC 看来的"样子"**：
+
+- 大小（多少字节）
+- 哪些位置是指针、哪些是非指针
+
+**关键 insight**：
+
+```
+类型 A、B 如果 GC shape 相同 → 它们在内存里布局一样
+                            → 可以共享同一份机器码
+                            → 只需要在运行时用 "字典" 传少量类型差异信息
+```
+
+### 具体怎么共享
+
+```go
+func Print[T any](v T) {
+    fmt.Println(v)
+}
+
+Print(1)         // T = int
+Print(2.5)       // T = float64
+Print("hello")   // T = string
+Print(&User{})   // T = *User
+Print([]int{})   // T = []int
+```
+
+编译器生成代码：
+
+- **所有非指针 8 字节类型**（int / int64 / float64 / uintptr）→ **一份代码**
+- **所有指针类型**（`*User` / `*Config` / ...）→ **另一份代码**
+- **所有字符串**（string）→ 一份代码（因为 string header 大小固定）
+- **不同 GC shape 的类型** → 各自一份
+
+### 用 dictionary 传类型差异
+
+```go
+// 伪代码: 编译器实际生成的样子
+func Print_ptrShape(dict *dictionary, v unsafe.Pointer) {
+    typ := dict.typ                     // 从字典拿 T 的类型描述符
+    fmt.Println(reflect.NewAt(typ, v).Elem().Interface())
+}
+```
+
+**字典里存什么**：
+
+- T 的类型描述符（给运行时反射 / 接口转换用）
+- 方法表（如果约束里有方法）
+- 其它跨类型需要的元数据
+
+---
+
+## 五、性能：泛型 vs interface vs reflect
+
+```
+直接调用 (具体类型):    1×    (1 ns 量级)
+泛型 (GC shape 共享):   1×~1.3×  (几乎一样)
+interface 调用:        2×~5×   (装箱 + vtable)
+reflect 调用:         50~100× (运行时元数据查询)
+```
+
+→ 泛型**几乎和直接调用一样快**——这是它最大的卖点。
+
+### 为什么会有 1.3× 的小开销
+
+主要来自字典查找：
+
+```go
+// 泛型函数里:
+var x T = ...         // 需要从字典查 T 的类型信息分配
+x.Method()             // 如果是接口方法, 经过字典转换
+```
+
+**简单类型操作（+/-/比较）零开销**；涉及反射、接口、内存分配时有小开销。
+
+---
+
+## 六、限制：泛型做不到的事
+
+### ① 不支持泛型方法
+
+```go
+type Stack[T any] struct { ... }
+
+// ❌ 方法不能引入新的类型参数
+func (s *Stack[T]) MapTo[U any](f func(T) U) *Stack[U] { ... }
+// 编译错: method must have no type parameters
+```
+
+**修法**：写成函数
+
+```go
+func Map[T, U any](s *Stack[T], f func(T) U) *Stack[U] { ... }
+```
+
+为什么不支持？**实现复杂**——会让 GC shape stenciling 变得指数级膨胀。Go 团队选择不要这个 feature。
+
+### ② 类型参数不能做 map key（受限）
+
+```go
+// ❌ 不能直接这样
+type Set[T any] map[T]struct{}
+
+// ✓ T 必须 comparable
+type Set[T comparable] map[T]struct{}
+```
+
+### ③ 不能 type switch 类型参数
+
+```go
+func F[T any](v T) {
+    switch v.(type) {     // ❌ T 不是 interface
+    case int: ...
+    }
+}
+
+// 修法: 转 any
+switch any(v).(type) {
+case int: ...
+}
+```
+
+### ④ 不能在运行时检查 T
+
+```go
+func F[T any]() {
+    if T == int { ... }   // ❌ 编译期不知道 T 是啥
+}
+```
+
+→ 泛型是**编译期**机制，运行时拿不到 T 信息（除非自己用 reflect 取）。
+
+---
+
+## 七、标准库的泛型工具（Go 1.21+ 进入 stdlib）
+
+```go
+import (
+    "slices"
+    "maps"
+    "cmp"
+)
+
+// slices 包
+slices.Sort([]int{3, 1, 2})              // 排序
+slices.Contains([]int{1, 2, 3}, 2)        // 包含
+slices.Index([]int{1, 2, 3}, 2)           // 找索引
+slices.Reverse(s)                          // 反转
+slices.Equal(a, b)                         // 比较两个 slice
+slices.Clone(s)                            // 深拷贝
+slices.Concat(a, b, c)                     // 拼接
+slices.Min(s) / slices.Max(s)              // 最大最小
+
+// maps 包
+maps.Keys(m)         // 返回 iter.Seq[K] (Go 1.23+)
+maps.Values(m)
+maps.Clone(m)
+
+// cmp 包
+cmp.Compare(a, b)    // a<b → -1, a==b → 0, a>b → 1
+cmp.Ordered          // 约束类型
+```
+
+→ **大量重复造的轮子终于在 stdlib 里了**。新代码优先用这些。
+
+---
+
+## 八、什么时候用 / 不用泛型
+
+### ✅ 适用
+
+| 场景 | 例子 |
+|---|---|
+| **通用容器** | `Stack[T]` / `Queue[T]` / `Set[T]` |
+| **通用算法** | `Map / Filter / Reduce` / 排序 / 二分 |
+| **通用工具** | `Min / Max / Contains / Equal` |
+| **可空类型** | `Optional[T]` |
+| **类型安全的回调** | `func(T) error` 比 `func(any) error` 强 |
+
+### ❌ 不适用
+
+| 场景 | 原因 |
+|---|---|
+| **业务代码** | 业务类型固定，泛型只是炫技 → 用具体类型 |
+| **类型只有一两个变体** | 写 2 个具体函数比 1 个泛型更清晰 |
+| **类型在运行时才知道** | 泛型是编译期的，用 reflect / any |
+| **复杂的类型约束推导** | 约束写起来比代码还长 |
+
+### 决策启发
+
+```
+我处理的是"任何 T 都适用的容器/算法"?     → 泛型
+我只为 2-3 种具体类型服务?                 → 写具体函数, 别泛型
+类型在编译期不知道?                        → reflect / any
+类型已知但要"统一接口"调用?                → interface (面向对象那种)
+```
+
+---
+
+## 九、跟 reflect 的对比（核心）
+
+| | 泛型 | reflect |
+|---|---|---|
+| **类型是否编译期知道** | 是 | 否 |
+| **类型安全** | ✅ 编译期检查 | ❌ 运行时 |
+| **性能** | ≈ 直接调用 | 50× 慢 |
+| **代码可读性** | 一般（[T any] 噪音） | 差（一堆类型断言） |
+| **可调用方法** | 受约束限制 | 任意（运行时查方法表） |
+| **典型场景** | 容器、算法 | JSON 编码、ORM |
+
+**核心结论**：
+
+> 编译期能确定的，用泛型——快、安全、可读。
+>
+> 运行时才确定的，只能 reflect——慢，但**唯一选择**。
+
+---
+
+## 十、一图总结
+
+```
+                  Go 泛型 (1.18+)
+                        │
+                        ▼
+              编译期类型参数化
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+     类型参数                        类型约束
+     [T any]                         interface 升级:
+     [T, U any]                       - 列类型集 (union)
+     [K comparable, V any]            - ~T 表示底层类型
+                                      - 约束 = 编译期检查
+
+   实现: GC Shape Stenciling
+   ┌──────────────────────────────────────────┐
+   │ 同 GC shape (大小+指针布局) 的类型共享代码 │
+   │ 用 dictionary 传类型差异                  │
+   │                                           │
+   │ vs C++ 完全特化:  代码不爆炸               │
+   │ vs Java 完全擦除: 性能不丢                 │
+   │                                           │
+   │ 性能 ≈ 直接调用 (~1.3×)                   │
+   └──────────────────────────────────────────┘
+
+   性能对比:
+     直接调用:     1×     (~1 ns)
+     泛型:        1~1.3× (几乎相同)
+     interface:   2~5×
+     reflect:    50~100×
+
+   标准库泛型工具 (Go 1.21+):
+     slices.Sort/Contains/Index/Equal/Clone
+     maps.Keys/Values/Clone
+     cmp.Compare / cmp.Ordered
+
+   限制:
+     × 不支持泛型方法 (method 不能引入新 T)
+     × 类型参数不能 type switch (要 any() 转)
+     × 运行时拿不到 T (除非自己 reflect)
+     × map key 必须 comparable
+
+   适用判断:
+     ✅ 容器 / 算法 / 工具函数 (任何 T 都适用)
+     ❌ 业务代码 (类型固定, 别炫技)
+     ❌ 运行时才知道类型 → reflect
+     ❌ 只服务 2-3 种类型 → 写具体函数更清晰
+```
+
+**一句话**：Go 1.18+ 用 **GC shape stenciling** 实现泛型——**同 shape 共享代码 + dictionary 传差异**，性能近似直接调用。**容器/算法/通用工具用泛型，业务代码别滥用**；编译期类型已知用泛型，运行时才知道仍只能用 reflect。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/generics" data-base="../../"></script>
+</body>
+</html>

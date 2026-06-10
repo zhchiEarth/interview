@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>存储与数据划分：分区 / 分桶 / Tablet · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 存储与数据划分：分区 / 分桶 / Tablet
+
+> 一句话：Apache Doris 一张表用**两级划分**组织数据——先按 **Partition（分区，range/list，常按时间）** 切成大块，便于**分区裁剪**与冷热/TTL 生命周期管理；分区内再按指定列 **hash 分桶（Bucket）**，每个桶就是一个 **Tablet（分片）**；Tablet 是**数据存储 + 多副本 + 负载调度的最小单位**，默认 **3 副本**分散在不同 BE 节点。Tablet 内部是**列式存储**（Segment 文件、按列编码 + 压缩）；每次导入产生一个 **Rowset（版本）**，后台 **Compaction** 把小 rowset 合并成大的以减少版本、提升读。查询时靠**分区裁剪 + 分桶裁剪**只扫必要的 tablet。
+
+> 本文以 **Apache Doris 2.x** 为基准。相关：[三种数据模型：Aggregate / Unique / Duplicate](data-model.html)、[索引机制](index.html)、[物化视图与 Rollup](materialized-view.html)。
+
+## 一、两级数据划分总览：Partition + Bucket
+
+Doris 把一张表的数据先后切两刀：**先分区（Partition），再分桶（Bucket）**。
+
+```text
+                         一张表（Table）
+                              │
+            ┌─────────────────┼─────────────────┐   ← ① Partition 分区
+            │                 │                 │     (range/list，常按时间)
+      p_2024_01          p_2024_02          p_2024_03
+            │                 │                 │
+   ┌────────┼────────┐        │        ┌────────┼────────┐  ← ② Bucket 分桶
+   ▼        ▼        ▼        ▼        ▼        ▼        ▼     (分区内 hash)
+ bucket0  bucket1  bucket2  ...      bucket0  bucket1  bucket2
+   │        │                                    │
+   = 一个 Tablet（分片）= 物理存储/副本/调度的最小单位
+   每个 Tablet 默认 3 副本，分散在不同 BE：
+        Tablet ──► replica @ BE1  /  replica @ BE2  /  replica @ BE3
+```
+
+- **第一级 Partition（逻辑+物理切大块）**：按某列（常是时间）划分，可单独管理（增删分区、设副本数、冷热）。
+- **第二级 Bucket（物理打散）**：在每个分区内，按 `DISTRIBUTED BY HASH(...)` 指定的分桶列做 hash，均匀打散到 N 个桶。
+- **桶 = Tablet**：每个 (分区, 桶) 组合对应一个 Tablet，它才是真正落盘、复制、调度的实体。
+
+> 记忆钩子：**分区是「按时间切的大抽屉」，分桶是「抽屉里再 hash 散开的小格子」，每个小格子就是一个 Tablet（还各带 3 份副本）。**
+
+## 二、Partition 分区：裁剪 + 生命周期
+
+分区按值把数据切成互不重叠的区间或枚举集，支持两种：
+
+| 类型 | 规则 | 典型用途 |
+|---|---|---|
+| **Range 分区** | 按列值的**范围**（常用时间，如按天/月） | 时序数据、按时间裁剪与淘汰 |
+| **List 分区** | 按列值的**枚举集合**（如地区、渠道） | 维度天然离散的分区 |
+
+```sql
+-- Range 按天分区 + 分区内 hash 分桶
+CREATE TABLE site_visit (
+    dt        DATE,
+    page_id   INT,
+    user_id   BIGINT,
+    cost_ms   INT
+)
+DUPLICATE KEY(dt, page_id)
+PARTITION BY RANGE(dt) (
+    PARTITION p20240101 VALUES LESS THAN ("2024-01-02"),
+    PARTITION p20240102 VALUES LESS THAN ("2024-01-03"),
+    PARTITION p20240103 VALUES LESS THAN ("2024-01-04")
+)
+DISTRIBUTED BY HASH(user_id) BUCKETS 10
+PROPERTIES ("replication_num" = "3");
+```
+
+分区带来两大好处：
+
+1. **分区裁剪（Partition Pruning）**：查询带分区列过滤（如 `WHERE dt >= '2024-01-02'`）时，规划器**只扫命中的分区**，跳过无关分区。
+2. **生命周期管理**：可按分区做**冷热分层 / TTL**——旧分区降冷（迁到对象存储/廉价介质）或整分区删除（`DROP PARTITION` 比 `DELETE` 高效得多）。
+
+> 提示：可用**动态分区**或 2.x 的 **Auto Partition（自动分区）** 让分区随导入自动按时间创建，避免手工维护。
+
+## 三、Bucket / Tablet：存储与调度的最小单位
+
+分区内按 `DISTRIBUTED BY HASH(列) BUCKETS N` 把数据 hash 打散成 N 个桶，**每个桶就是一个 Tablet（分片）**。
+
+```text
+分区 p20240102（按 HASH(user_id) BUCKETS 10）
+   user_id ──hash──► 落到 bucket0..bucket9 之一
+   每个 bucket = 一个 Tablet
+
+Tablet 是「三位一体」的最小单位：
+   ┌─ 存储：数据真正落盘的单元（内含若干 Rowset/Segment）
+   ├─ 副本：默认 3 副本，分散在不同 BE，挂一个不丢数据
+   └─ 调度：副本均衡、修复、迁移都以 Tablet 为粒度
+```
+
+- **默认 3 副本**（`replication_num=3`），分布在**不同 BE 节点**；某 BE 宕机，其它副本仍可服务，FE 会触发副本修复。
+- Tablet 是负载均衡与故障修复的粒度——FE 调度器以 Tablet 为单位在 BE 间搬迁/补副本。
+
+### 3.1 分桶数（BUCKETS）怎么定
+
+经验法则：**让单个 Tablet 的数据量落在大约 1~10GB 区间**，同时兼顾并行度。
+
+```text
+分桶数太少：
+   单 tablet 过大 → 并行度不足、Compaction/查询单点重、迁移慢
+分桶数太多：
+   单 tablet 过小 → 元数据膨胀、小文件多、调度/RPC 开销大
+
+定数思路：
+   桶数 ≈ (单分区预估数据量) / (目标单 tablet 1~10GB)
+   再结合 BE 数量与 CPU 核数，保证查询能并行铺满计算资源
+```
+
+> 经验值：单 Tablet 建议 **1~10GB**。分区列与分桶列要让数据**尽量均匀**——若分桶列严重倾斜（如大量 NULL 或热点值），会造成某些 Tablet 过大、热点 BE。2.x 也支持 **Auto Bucket（自动分桶）** 按分区数据量推算桶数。
+
+## 四、Tablet 内部：列式存储
+
+Tablet 内部是**列存**。数据组织层次：**Tablet → Rowset（版本）→ Segment（文件）→ 列数据**。
+
+```text
+Tablet
+ └─ Rowset_v2  Rowset_v3  ...        ← 每次导入产生一个 Rowset（一个数据版本）
+       └─ Segment 文件（.dat）
+             ├─ 列 A 数据（编码 + 压缩）
+             ├─ 列 B 数据（编码 + 压缩）
+             ├─ 短 key 前缀索引 / ZoneMap（min-max）/ ...
+             └─ ...
+```
+
+列式存储的两个关键手段：
+
+- **编码（Encoding）**：按列特征选择，如**字典编码（低基数列）**、**RLE 游程编码（连续重复值）**、**Delta 编码（递增/时间列）** 等——同列同类型数据相邻，编码效率高。
+- **压缩（Compression）**：在编码之上再压缩，常用 **LZ4（默认，快）** 或 **Zstd（压缩率更高）**。
+
+> 为什么列存适合分析：查询通常只读部分列，列存**只扫所需列**、且同列数据相似度高、编码压缩比好——比行存大幅减少 IO。明细查询的过滤还可借助 ZoneMap / 前缀索引等跳过数据块，见 [索引机制](index.html)。
+
+## 五、写入与 Compaction
+
+每次导入（INSERT / Stream Load / Broker Load 等）会在目标 Tablet 上生成一个新的 **Rowset**，它对应一个**数据版本**。
+
+```text
+持续导入 → 版本越来越多（小 rowset 一堆）
+   v2  v3  v4  v5  v6 ...   ← 版本多 = 读时要合并的文件多 = 查询变慢
+
+后台 Compaction 把小 rowset 合并成大的：
+   ┌ Cumulative Compaction：把最近的若干小增量 rowset 合并成一个较大的
+   └ Base    Compaction   ：把累积的增量再合进基线 base rowset
+   效果：减少版本数 / 减少小文件 / 提升读性能 / 回收被覆盖或删除的数据
+```
+
+- **Cumulative Compaction**：频繁、轻量，合并近期的小增量版本。
+- **Base Compaction**：较重、不频繁，把增量并入基线大 rowset。
+- 对 [Unique 模型的 MoW](data-model.html) 来说，Compaction 还会真正清理 delete bitmap 标记掉的旧行。
+
+> 高频坑：**导入太频繁、批次太小**会产生大量小 rowset，Compaction 跟不上就会**版本堆积**（报 `-235 / too many versions` 类错误）、查询变慢。对策：**攒批导入、控制导入频率**，必要时调 Compaction 并发与策略。
+
+## 六、查询加速：分区裁剪 + 分桶裁剪
+
+两级划分在查询期直接转化为「**少扫数据**」：
+
+```text
+SELECT ... FROM site_visit
+WHERE dt = '2024-01-02'        ← ① 分区裁剪：只命中分区 p20240102
+  AND user_id = 10086;         ← ② 分桶裁剪：user_id 是分桶键，
+                                    hash 后只落 1 个 tablet → 只扫那一个
+
+效果：从「全表所有 tablet」收敛到「1 个分区里的 1 个 tablet」
+```
+
+- **分区裁剪**：过滤命中分区列 → 跳过无关分区。
+- **分桶裁剪**：过滤是**分桶键的等值条件**（或 IN 少量值）→ hash 后只扫对应的少数 Tablet，不必扫整个分区的所有桶。
+
+> 因此**分桶键的选择很关键**：选高频等值过滤、且分布均匀的列做分桶键，既能均匀打散又能吃到分桶裁剪。若分桶键选得不好（很少出现在等值过滤里），查询往往要扫分区内全部 tablet。
+
+## 一句话总结
+
+> Doris 表用**两级划分**：先 **Partition（range/list，常按时间）** 切大块，享受**分区裁剪**与冷热/TTL 生命周期管理；分区内再 **HASH 分桶**，每个桶即一个 **Tablet**——它是**存储 + 默认 3 副本 + 调度修复的最小单位**，分桶数按「单 tablet 约 1~10GB + 并行度」来定。Tablet 内是**列式存储**（Rowset→Segment，按列做字典/RLE/Delta 编码再用 LZ4/Zstd 压缩）；每次导入产生一个 **Rowset 版本**，后台 **Cumulative + Base Compaction** 合并小 rowset、减少版本提升读（导入太碎会版本堆积报 too-many-versions）。查询靠**分区裁剪 + 分桶裁剪**只扫必要 tablet，所以分桶键要选高频等值过滤且分布均匀的列。延伸见 [三种数据模型：Aggregate / Unique / Duplicate](data-model.html)、[索引机制](index.html)、[物化视图与 Rollup](materialized-view.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/storage" data-base="../"></script>
+</body>
+</html>

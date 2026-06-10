@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>消息投递：Ack / Cursor / 重投 / 死信 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 消息投递：Ack / Cursor / 重投 / 死信
+
+> 一句话：Pulsar 的投递闭环是「permits 流控推送 → 消费 → Ack 推进游标 → 失败靠 nack / 超时重投 → 屡试不成进死信」，靠的是一个能记录**单条空洞**的服务端游标，比 Kafka 的单 offset 指针精细得多。
+
+## 一、全景：一条消息的投递闭环
+
+```text
+Broker ──(按 permits 推送)──► Consumer 接收队列 ──► 业务处理
+   ▲                                                  │
+   │                                  ┌─── 成功 ──────┤
+   │                          Ack（推进/标记游标）     │
+   │                                                  ├─── 失败 ──► nack / ackTimeout
+   └──────────── 重投（redeliver）◄───────────────────┘
+                                                      │
+                          超过 maxRedeliverCount ─────► 死信 Topic (DLQ)
+```
+
+默认语义是**至少一次（at-least-once）**：投出去不算数，Ack 了才算消费完。所以消费侧必须做幂等。
+
+## 二、流控：permits 推送，防压垮
+
+Pulsar 是 Broker **主动推**消息，不是 Consumer 拉。为避免把慢消费者打爆，用 **permits（许可）** 做背压：
+
+```text
+Consumer 启动 → 按 receiverQueueSize 给 Broker 发 permits（“我还能接 N 条”）
+Broker 在 permits 额度内推送，推一条扣一个
+Consumer 从本地接收队列取走消息处理 → 回补 permits
+permits 归零 → Broker 停推，直到回补
+```
+
+- `receiverQueueSize`：客户端接收队列大小，决定一次能预取多少、占多少内存。
+- 调大 → 吞吐高、内存占用大；调小 → 内存省、可能不够喂饱处理线程。Shared 模式下队列太大还会让消息「囤在某个 Consumer 手里」加剧不均。
+
+## 三、Ack 确认：单条 vs 累积
+
+| 类型 | 含义 | 适用模式 |
+|------|------|---------|
+| **单条 ack（individual）** | 只确认这一条 | 所有模式 |
+| **累积 ack（cumulative）** | 确认「到某位置之前的全部」 | **仅 Exclusive / Failover** |
+
+```text
+累积 ack（cumulative）：ack(m5) ⇒ m1..m5 全部确认
+   m1 m2 m3 m4 m5 m6 m7
+   └──────────┘ 一次推进游标到 m5
+
+单条 ack（individual）：在 Shared 下乱序完成
+   m1 [m2✗未ack] m3 m4   ← m2 是“空洞”，游标只能停在 m1 之前
+```
+
+为什么 Shared / Key_Shared 不能累积 ack？因为多 Consumer 并发、消息乱序完成，「m5 之前全部完成」这个前提根本不成立——只能逐条 ack。
+
+## 四、Cursor 游标：能记「空洞」的服务端进度
+
+每个 Subscription 有一个 **Cursor**，记录消费位置，**持久化在 BookKeeper**（见 [BookKeeper 存储原理](bookkeeper.html)），断连不丢。它由两部分组成：
+
+```text
+markDeletePosition ── 这之前的都连续确认了（一个指针）
+        +
+individuallyDeletedMessages ── 这之后零散单条 ack 的“空洞”，用 range/bitmap 记
+```
+
+```text
+游标视角：
+  m1 m2 m3 │ m4  m5✓  m6  m7✓  m8
+           ▲      └── 空洞：单独 ack 了，但前面 m4/m6 没 ack
+   markDeletePosition 卡在 m3（只能连续推进到这）
+   m5、m7 记在 individuallyDeletedMessages 里，重投时会跳过
+```
+
+这就是 Pulsar 比 Kafka 精细的地方：**支持选择性 ack 形成的空洞**，而不是只有一个「之前全算消费」的单指针。代价是游标状态更复杂、要持久化更多元信息。
+
+## 五、Negative Ack 与 Ack Timeout：主动 / 被动重投
+
+消费失败时让消息重新投递，两条路：
+
+- **Negative Ack（nack）**：业务发现处理失败，**主动调用 `negativeAcknowledge()`** 要求重投。可配 `negativeAckRedeliveryDelay` 延迟一段时间再投，避免立刻失败风暴。
+- **Ack Timeout**：配了 `ackTimeout` 后，**投出去超过时限仍没 ack，Broker 自动重投**——兜底「Consumer 卡死/崩了没 ack」。
+
+```text
+正常：投递 ─► 处理OK ─► ack ─► 游标推进
+nack：投递 ─► 处理失败 ─► negativeAcknowledge() ─► 延迟后重投
+超时：投递 ─► (ackTimeout 内无 ack) ─► Broker 自动重投
+```
+
+> 建议优先用 nack（精确、即时），ackTimeout 作为兜底。两者都开时注意别让同一条消息被双重计时重投。
+
+## 六、Backlog 积压与配额
+
+**Backlog（积压）**＝某个 Subscription 还没 ack 的消息堆积量。它直接关系到消息能不能被清理——只要还有订阅没消费完，消息就得留着。
+
+- 消费跟不上生产 → backlog 持续增长 → 占存储、抬延迟。
+- **Backlog Quota（积压配额）**：在 Namespace 上限制每个订阅的积压上限，超限按策略处理：
+  - `producer_request_hold`：阻塞生产者请求（hold）
+  - `producer_exception`：直接给生产者报错
+  - `consumer_backlog_eviction`：淘汰最旧的积压消息（丢老数据保命）
+
+## 七、重试队列 + 死信队列（DLQ）
+
+防「毒消息」无限重投拖垮订阅：
+
+```text
+消息处理失败 → 重投 → 失败 → 重投 …… 次数累加
+        ┌─────────────────────────────────────┐
+        │ 重投次数 ≤ maxRedeliverCount         │ → 继续重试（可经 Retry Topic 延迟重试）
+        │ 重投次数 > maxRedeliverCount         │ → 移入 死信 Topic (DLQ)，本订阅不再投
+        └─────────────────────────────────────┘
+```
+
+- `maxRedeliverCount`：重投上限，超过即进死信 Topic（默认名 `<topic>-<subscription>-DLQ`）。
+- **Retry Topic**：失败的消息先丢到重试 Topic、延迟后再消费，把「立即重投」变成「带退避的重试」。
+- **DLQ**：终点站，毒消息隔离到这里人工排查 / 旁路处理，主流程不被卡死。
+- 仅在能逐条 ack 的 **Shared / Key_Shared** 下最有意义（Exclusive/Failover 累积语义下毒消息会卡住整个游标）。
+
+## 八、对比 Kafka
+
+```text
+Kafka：单 offset 指针，提交 offset=N ⇒ “N 之前都算消费”
+        无法表达“第 5 条没处理完但第 6 条好了”
+        重试/死信靠业务或外部框架（如 Spring 重试 + DLT）自己搭
+
+Pulsar：游标 = markDeletePosition + 单条 ack 空洞集合
+        天然支持选择性 ack、nack、ackTimeout、Retry/DLQ（broker/client 内建）
+```
+
+| 维度 | Kafka | Pulsar |
+|------|-------|--------|
+| 进度表达 | 单 offset 指针 | 游标：连续位 + 单条空洞 |
+| 选择性 ack | 不支持（只能整体推进） | 原生支持单条 ack |
+| 失败重投 | 业务/框架自理 | 内建 nack / ackTimeout |
+| 死信 | 需自建（如 DLT） | 内建 Retry Topic + DLQ |
+| 语义 | 默认按 offset 顺序消费 | 队列式逐条确认更自然 |
+
+> 订阅模式见上一篇 [四种订阅模式](subscription.html)；整体地图见 [Pulsar 渐进式理解](deep-dive-overview.html)；与 Kafka 的系统级对比见 [Pulsar vs Kafka](vs-kafka.html)。
+
+## 一句话总结
+
+> Pulsar 投递闭环＝**permits 流控 + 单条/累积 Ack 推进能记空洞的游标 + nack/ackTimeout 重投 + maxRedeliverCount 超限进死信**；正因为游标能精确到单条 ack（而非 Kafka 的单 offset 指针），它天然支持选择性确认、内建重试与死信，但消费侧仍须做幂等（默认至少一次）。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/consumption" data-base="../"></script>
+</body>
+</html>

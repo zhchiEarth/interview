@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>可靠性：不丢 / 不重 / 有序 / 恰好一次 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 可靠性：不丢 / 不重 / 有序 / 恰好一次
+
+> 一句话：可靠性要**三端一起兜**——生产端 `acks=all` + 重试，Broker 端多副本 + `min.insync.replicas` + 禁 unclean 选举，消费端"先处理后手动提交 + 业务幂等"；四个目标里"恰好一次"靠幂等 + 事务 + `read_committed` 拼出来。
+
+## 一、消息丢失全场景（三段）
+
+丢消息从来不是单点问题，生产、Broker、消费三段都可能漏。
+
+```text
+ Producer ──①──▶  Broker(Leader)  ──②──▶  落盘 + 同步 Follower  ──③──▶  Consumer
+            写丢                  存丢                              消费丢
+```
+
+### 1.1 生产端丢
+
+- `acks=0`：发出去就不管，网络丢包 / Broker 拒绝都察觉不到。
+- `acks=1`：Leader 写入本地后就返回，若 Leader 在同步给 Follower 之前宕机，且新 Leader 没有这条消息 → 丢。
+- 不开重试（`retries=0`）：瞬时网络抖动直接失败。
+
+### 1.2 Broker 端丢
+
+- **副本不足**：单副本，Broker 磁盘坏即丢。
+- **刷盘前宕机**：Kafka 默认依赖 OS Page Cache，消息先在内存中，靠多副本冗余而非每条 fsync 来保证；若副本数不足且机器断电，Page Cache 中未落盘数据会丢。
+- **unclean 选举**：`unclean.leader.election.enable=true` 时，ISR 全挂后允许一个**落后的 OSR 副本**当 Leader，它缺失的那段消息就永久丢失。
+
+### 1.3 消费端丢
+
+- **先提交 offset 后处理**：自动提交（`enable.auto.commit=true`）会在拉到消息后、业务处理完成前就把 offset 推进；此时消费者崩溃，这批消息已被标记"已消费"却没真正处理 → 漏掉。
+
+```text
+错误顺序(会漏):  poll() ─▶ 自动提交 offset ─▶ 处理业务 ──崩溃──▶ 这批永远不会重投
+正确顺序(不漏):  poll() ─▶ 处理业务 ─▶ 处理成功后再手动提交 offset
+```
+
+## 二、不丢配置清单（三端对照）
+
+| 端 | 配置 | 说明 |
+|---|---|---|
+| Producer | `acks=all` | 等 ISR 全部确认 |
+| Producer | `retries` 足够大 + `delivery.timeout.ms` | 瞬时故障自动重试（开幂等才安全） |
+| Broker | 副本数 `replication.factor ≥ 3` | 容忍单点故障 |
+| Broker | `min.insync.replicas ≥ 2` | ISR 不足 2 个就拒绝写，宁可不写也不丢 |
+| Broker | `unclean.leader.election.enable=false` | 禁止落后副本上位，宁可不可用也不丢数据 |
+| Consumer | `enable.auto.commit=false` | 关闭自动提交 |
+| Consumer | 先处理业务、成功后再手动 `commitSync()` | 保证"处理过才算消费过" |
+
+```text
+口诀：副本=3 + acks=all + min.insync.replicas=2 + 禁 unclean + 手动提交
+      (任何一环退让，对应那一段就可能丢)
+```
+
+生产端各参数细节见 [Kafka 生产者原理](producer.html)。
+
+## 三、不重（防重复）
+
+"不丢"和"不重"是一对矛盾：要保证不丢就得重试 + 重投，而重试 / 重投天然会带来重复。重复要分两段治：
+
+| 重复来源 | 解决手段 |
+|---|---|
+| 生产端重复（重试导致同一条写多次） | **幂等 Producer**：`enable.idempotence=true`，Broker 用 PID + 分区 + 序列号去重（限单分区单会话） |
+| 消费端重复（at-least-once 下重投、Rebalance 重复分配） | **业务幂等**：唯一业务 ID + 去重表 / Redis 唯一键，处理前先查重 |
+
+```text
+消费端兜底(去重表):
+  收到消息 ─▶ 取业务唯一键(如 order_no)
+           ─▶ INSERT 去重表(唯一索引) ──冲突──▶ 已处理过, 直接 ack 跳过
+                                     ──成功──▶ 执行业务, 再 ack
+```
+
+> 现实工程里几乎都是 **at-least-once + 消费端业务幂等**，而不是去追求全链路 EOS——后者成本高、约束多。
+
+幂等 Producer 原理详见 [Kafka 生产者原理](producer.html)。
+
+## 四、三种投递语义
+
+```text
+At-Most-Once   最多一次:  acks=0 或 先提交后处理   → 可能丢、绝不重
+At-Least-Once  至少一次:  acks=all + 重试 + 先处理后提交(默认实践) → 绝不丢、可能重
+Exactly-Once   恰好一次:  幂等 + 事务 + read_committed → 不丢不重(有边界)
+```
+
+| 语义 | 丢 | 重 | 怎么得到 |
+|---|---|---|---|
+| At-most-once | 可能 | 不会 | 重投前就提交位点 / `acks=0` |
+| At-least-once | 不会 | 可能 | 处理成功后才提交位点 + 重试（最常用） |
+| Exactly-once | 不会 | 不会 | 幂等 Producer + 事务 + 消费端 `read_committed` |
+
+## 五、Exactly-Once（EOS）实现
+
+EOS 不是单个开关，而是三块拼出来的：
+
+1. **幂等 Producer**（`enable.idempotence=true`）：消除生产端重试导致的重复。
+2. **事务**（`transactional.id`）：把"消费 → 处理 → 生产"做成原子单元，并通过 `sendOffsetsToTransaction` 把消费位点与生产消息放进同一事务一起提交，避免"消息发了但位点没提交"或反之。
+3. **消费端 `isolation.level=read_committed`**：只读已提交事务的消息，看不到未提交 / 已回滚的数据。
+
+```text
+consume-transform-produce 原子闭环:
+  beginTransaction()
+    ├─ 读上游消息(处理)
+    ├─ send() 写下游(可跨分区/跨 topic)
+    └─ sendOffsetsToTransaction(上游位点, groupMetadata)
+  commitTransaction()   // 下游写入 + 上游位点 一起生效，要么全成要么全废
+```
+
+- **Kafka Streams 的 EOS**：设 `processing.guarantee=exactly_once_v2` 一键开启，框架自动管理事务与位点。
+- **端到端 EOS 的边界**：Kafka 的 EOS 只覆盖 **Kafka 内部**（Kafka → 处理 → Kafka）。一旦写到外部系统（MySQL、第三方接口），就**不在 Kafka 事务内**——此时仍需外部系统支持幂等写或自身事务，否则只能退回 at-least-once + 业务幂等。
+
+## 六、顺序消息
+
+Kafka 的顺序保证只有一个层级：**单分区内有序**，跨分区无全局顺序。
+
+```text
+Partition 0:  m1  m2  m3   (有序)        ┐
+Partition 1:  n1  n2       (有序)        ├─ 但 m / n 之间无全局先后
+Partition 2:  k1  k2  k3   (有序)        ┘
+```
+
+- **要全局有序** → 整个 topic 只用**单分区**（牺牲并发吞吐），或用同一个 key 把需要保序的消息路由到同一分区。
+- **重试导致的乱序**：`max.in.flight.requests.per.connection > 1` 时，前一批失败重试、后一批先成功，会在分区内乱序。
+  - 不开幂等：要严格有序就设 `max.in.flight.requests.per.connection=1`（牺牲吞吐）。
+  - **开启幂等**：Broker 按序列号校验，会拒收 / 纠正乱序的批次，因此即使 `max.in.flight ≤ 5` 也能在单分区内保持有序，不必降到 1。
+
+分区与 key 路由见 [Kafka 生产者原理](producer.html)。
+
+## 七、相关链接
+
+- [Kafka 生产者原理](producer.html)
+- [副本机制](replica.html)
+- [消费者与消费组 Rebalance](consumer.html)
+- [Kafka 知识地图](knowledge-graph.html)
+
+## 一句话总结
+
+可靠性是三端协作：**生产端 acks=all+重试、Broker 多副本+min.insync.replicas+禁 unclean、消费端先处理后手动提交+业务幂等**；顺序只保证单分区内有序（开幂等可避免重试乱序）；恰好一次靠"幂等 Producer + 事务 + read_committed"实现，且只对 Kafka 内部成立，跨外部系统仍需业务幂等兜底。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/reliability" data-base="../"></script>
+</body>
+</html>

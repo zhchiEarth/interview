@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.Pool 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.Pool 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> sync.Pool = **per-P 本地缓存 + 跨 P work-stealing + victim cache** 的本地对象缓存，**Get/Put 几乎无锁**（靠 `runtime_procPin` 钉住 P），但**两轮 GC 内必然清空**——只能缓存「用完即扔的短期小对象」，**不能管生命周期、不能当连接池**；铁律：**Get 后必 Reset · Put 用 defer · Pool 不能 copy**。
+
+记不全时，按这条**记忆主线：一套结构 + 两条路径 + 两轮 GC + 几个坑**展开（详细推演看[正文](sync-pool.html)）：
+
+---
+
+## 🏗 一套结构 —— local(private+shared) + victim + New
+
+```text
+local []poolLocal (每个 P 一份)
+  ┌ private  单槽, 本 P 独占, 一条 swap 指令      (最热, 99% 路径)
+  └ shared   双端队列, 本 P 队头无锁 / 他 P 队尾 CAS 偷
+victim []poolLocal  上一轮 GC 降级下来的, 再扛一轮做缓冲
+New func() any      全没有时兜底造一个
+```
+- 设计被一步步逼出来：全局锁(炸) → per-P 缓存(不均) → 拆 private/shared 让别 P 偷 → 绑 GC + 加 victim 平滑。private 是把最热的「Get 完马上 Put」配对路径压到一条指令。
+
+## 🔁 两条路径 —— Get 5 级查找 / Put 2 级
+
+```text
+Get(): ① 本 P private  ② 本 P shared 队头  ③ 偷他 P shared 队尾(steal)
+       ④ victim        ⑤ 都没→ New()
+Put(x): ① 本 P private 空? → 放进去   ② 满 → 推入本 P shared 队头
+```
+- 99% 在 Get ① / Put ① 命中，几纳秒。无锁靠 `pid := runtime_procPin()` 关抢占 → private 单线程独占，操作完 `runtime_procUnpin()`；偷队尾用 CAS。
+
+## 🗑 两轮 GC —— local→victim→清空
+
+```text
+poolCleanup 做的就是: victim = local; local = nil  (无条件整体搬迁)
+对象命运只看 GC 那刻它在哪层:
+  被 Get 出去没 Put → 不在池里, 搬迁碰不到, 用多久都行
+  躺 local          → 本轮降级到 victim
+  躺 victim         → 本轮被丢弃回收
+```
+- 对象在池里**最多活 2 个 GC 周期**；续命唯一办法：被丢弃前再次 Get+Put 塞回 local（时钟重置，不是「还活着」）。加 victim 是为 GC 后峰值不全走 New 而抖动。
+
+## ⚠️ 几个坑 —— 全来自「会被清 + 会被复用」
+
+```text
+① 不 Reset 就 Put     → 残留数据污染下次(敏感数据跨请求泄漏)
+② Put 后还持有其引用  → return buf.Bytes() 危险, 改 append([]byte(nil), ...)
+③ 当连接池用          → GC 全清空 / 无借用上限 / 无健康检查 → 用 sql.DB、go-redis
+④ 塞大对象(几十 MB)   → GC 扫描/释放反成压力源; Pool 宜几 KB~几 MB
+⑤ Get/Put 类型不一致  → 编译不报, 下次断言 panic; 大小悬殊分多 Pool 分桶
+⑥ Pool 当字段值传     → 不能 copy, 用 *sync.Pool 或包级变量
+```
+- 谁在用：`fmt`(pp)、`encoding/json`(encodeState)、`net/http`(bufio 2K/4K)、`regexp`(machine)；gin 复用 `gin.Context`、fasthttp 复用 `RequestCtx`、zap/zerolog 复用 buffer。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-pool-memo" data-base="../../"></script>
+</body>
+</html>

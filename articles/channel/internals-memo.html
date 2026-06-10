@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Channel 记忆法（怎么记住） · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Channel 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **Channel = 一锁 + 环形队列 + 收发队列**；收发都走「**对面有收发者 → 直接给 / 有缓冲 → 进 buf / 都不行 → 挂起**」；**close 是广播**，谁发谁关、不重复关。
+
+记不全时，按这条**记忆主线：一张图 + 三个动作 + 两条军规**展开（详细推演看[正文](internals.html)）：
+
+---
+
+## 🖼 一张图 —— 结构
+
+```text
+环形队列  buf [ _ | _ | _ ]   装数据：sendx 写 / recvx 读 / qcount 计数
+收发队列  sendq · recvq       装 goroutine：满了/空了就挂这睡
+锁        lock                一把锁，一次只一人
+```
+
+- **环形队列 = 装数据**（固定数组，两个游标转圈）；**收发队列 = 装等待的 goroutine**。
+- 收发队列类型是 `waitq`，本质是 **sudog 链表**（FIFO）——每个 sudog 就是一个排队等待的 goroutine。
+
+---
+
+## ⚙️ 三个动作 —— send / recv / close
+
+**① send 与 ② recv：对称的"三级跳"**
+
+```text
+send： ① recvq 有接收者 → 直接给(绕过 buf)   ② buf 没满 → 写入   ③ 满 → 挂起睡
+recv： ① sendq 有发送者 → 直接拿             ② buf 有货 → 取出   ③ 空 → 挂起睡
+```
+
+- **环形**：`sendx / recvx = (x+1) % cap` 走到头回绕；满还是空**只能看 qcount**（两游标会重合）。
+- **无缓冲**（cap=0）：没格子，发收必须碰头，**栈到栈直传**。
+
+**③ close = 广播**（不是关资源）
+
+```text
+关 nil  /  关两次  /  关了再发    →  panic（三连）
+关了再读                         →  剩货先取完，空了给 0,false（range 自动退出）
+```
+
+- 没有 `IsClosed()`，判断关没关用 `v, ok := <-ch`。
+
+---
+
+## 🛡 两条军规 —— 安全关闭
+
+> **军规一：接收方不准关。 军规二：多个发送方不准各自关。**
+> 合起来就是：**谁发谁关、只关一次、关了别再发**（推论：关闭权归唯一发送者）。
+
+```text
+1 个发      →  自己 defer close
+多发 1 收   →  不关 ch；close(done) 广播停止，发送方 select 听
+多发要关 ch →  WaitGroup 等齐，管事人统一关一次
+```
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="channel/internals-memo" data-base="../"></script>
+</body>
+</html>

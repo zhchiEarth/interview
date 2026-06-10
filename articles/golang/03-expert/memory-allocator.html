@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>内存分配器 mcache / mcentral / mheap · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 内存分配器 mcache / mcentral / mheap
+
+> 一句话：派生自 Google **TCMalloc** 的**三级分配器**——按固定 size class 切分，小对象走**每 P 一份的 mcache（无锁）**，不够再逐级向 mcentral（按类加锁）、mheap（全局大锁）回退，大对象直达 mheap。核心目标和 [GMP](gpm-scheduler.html) 一样：**把热路径做成无锁**。
+
+## 一、为什么要三级（设计动机）
+
+朴素做法：一个全局堆 + 一把锁，谁分配谁抢锁。多核下**锁竞争**就是瓶颈（和 Go 1.0 GM 模型全局队列一个病）。
+
+解法照搬 [GMP 的思路](gpm-scheduler.html)：**给每个 P 配一份本地缓存**，99% 的分配在本地无锁完成，只有本地空了才往上加锁取货。
+
+```text
+mcache   每 P 一份，缓存各 size class 的 span   ← 无锁，最快（热路径）
+   ↓ 本地没空闲对象了
+mcentral 全局，按 size class 分组管理 span      ← 每个 class 一把锁
+   ↓ 该 class 的 span 都用完了
+mheap    整个进程的堆，按"页"管理              ← 全局大锁
+   ↓ 堆也不够
+OS       mmap 向操作系统要内存（按 arena 批发） ← 系统调用
+```
+
+---
+
+## 二、先立一把尺子：内存的层级单位
+
+理解分配器，先记住这几个**从小到大**的单位：
+
+```text
+对象 object   你 new/make 出来的那个值（按 size class 定长）
+   └─在─► span (mspan)   一组连续的页，切成 N 个等大的对象槽
+            └─由─► page  8KB（运行时的最小管理粒度 _PageSize）
+                     └─属于─► arena  64MB（amd64，向 OS 批发的大块 heapArena）
+                                └─组成─► heap 整个堆
+```
+
+| 单位 | 大小 | 说明 |
+|---|---|---|
+| page | **8 KB** | runtime 管内存的最小页 |
+| span (mspan) | 1+ 个 page | 一个 span 只切一种 size class 的对象 |
+| arena | **64 MB**（amd64） | 向 OS mmap 的批发单位，含一段 bitmap 给 GC |
+
+---
+
+## 三、size class：定长切分，控制碎片
+
+Go 把对象大小**向上取整**到 **67 个预设档位**（再加 class 0，共 68 个）：
+
+```text
+8 / 16 / 24 / 32 / 48 / 64 / 80 / 96 / ... / 24576 / 32768(=32KB 上限)
+```
+
+- 每个 size class 用**专门的 span** 切成一堆**等大的槽**，分配就是「取一个空槽」，O(1)。
+- **内部碎片可控**：档位是精心设计的，向上取整最多浪费 **~12.5%**（如申请 17B → 给 24B 档）。
+- **再乘一个 noscan 位** → **spanClass = size class × 2 + (无指针?1:0)**，共 **136 个 spanClass**。
+
+> 为什么分 scan / noscan？**不含指针的对象（noscan）GC 根本不用扫**。把它们单独放一类 span，GC 标记时整段跳过，省大量扫描——这是分配器和 [GC](gc.html) 的关键配合。
+
+mcache 就是按这 136 个 spanClass、每类缓存**一个 span**。
+
+---
+
+## 四、三级结构各自干什么
+
+### ① mcache —— 每 P 一份，无锁
+
+```text
+type mcache struct {
+    alloc [136]*mspan   // 每个 spanClass 缓存一个 span
+    tiny  ...           // tiny allocator（见第五节）
+}
+```
+
+- 挂在 P 上，**同一时刻只有一个 M 持有这个 P** → 访问天然无锁。
+- 分配：算出 spanClass → 在 `alloc[spanClass]` 那个 span 里取一个空槽。**这是最快的热路径。**
+
+### ② mcentral —— 每个 spanClass 一个，加锁
+
+```text
+type mcentral struct {
+    partial [2]spanSet   // 还有空槽的 span
+    full    [2]spanSet   // 已满的 span      （[2] 按清扫代轮换）
+}
+```
+
+- mcache 的某个 span 空了 → 向对应 mcentral 要一个新 span（`cacheSpan`，**加这一类的锁**）。
+- mcache 不再用某 span → 还回 mcentral（`uncacheSpan`）。
+- 锁是**按 spanClass 分的**，不同大小的对象分配互不阻塞。
+
+### ③ mheap —— 全局堆，按页管理
+
+- mcentral 没有可用 span → 向 mheap 要：**切出 N 个连续 page 组成新 span**。
+- mheap 用 **pageAlloc 基数树（radix tree bitmap，Go 1.14+）** 快速找到「连续 N 个空闲页」。
+- mheap 也不够 → 向 OS **mmap 一个 64MB arena**。
+- 加**全局大锁**，但走到这一层的频率很低。
+
+---
+
+## 五、三类对象，三条路径
+
+```text
+                    要分配 size 字节
+                          │
+        ┌─────────────────┼──────────────────────┐
+        ▼                 ▼                        ▼
+  size < 16B            16B ≤ size ≤ 32KB        size > 32KB
+  且无指针(noscan)       (small)                  (large)
+        │                 │                        │
+   tiny allocator    算 size class →          直接找 mheap
+   合并进 16B 块      mcache→mcentral→mheap     切一个专属大 span
+        │                 │                        │
+        └──── 都尽量走无锁 mcache ────┘        (跳过 mcache/mcentral)
+```
+
+- **tiny（<16B 且 noscan）**：像单字节、小 `[]byte`、短临时值，**多个合并进同一个 16 字节块**，大幅减少碎片。tiny 块也缓存在 mcache 里。
+- **small（16B~32KB）**：主路径，走 size class + 三级缓存。
+- **large（>32KB）**：直接从 mheap 分配一个刚好够大的 span，不经 mcache/mcentral。
+
+---
+
+## 六、分配主流程（mallocgc）
+
+```text
+1. 算 size → 定 spanClass（含 scan/noscan）
+2. tiny？ → 试着塞进当前 tiny 块的剩余空间
+3. small？→ mcache.alloc[spanClass] 取空槽
+        └ span 空了 → mcentral 要新 span（加锁）
+              └ mcentral 没了 → mheap 切 span（全局锁）
+                    └ mheap 不够 → mmap 新 arena（syscall）
+4. large？→ 直接 mheap 分配大 span
+5. 标记对象的指针布局（供 GC 扫描）；GC 标记中则"分配为黑"
+6. 返回对象地址
+```
+
+> 第 5 步的「分配为黑」呼应 [GC](gc.html)：标记期间新生对象直接算存活，本轮不回收。
+
+---
+
+## 七、mspan 内部：怎么管一个 span 里的空闲槽
+
+```text
+一个 size class=32B、占 1 页(8KB) 的 span → 切成 256 个 32B 槽：
+
+ [槽0][槽1][槽2]...[槽255]
+   ▲freeindex（从这往后找下一个空槽）
+
+ allocBits   位图：每个槽 0=空 1=已用
+ allocCache  freeindex 附近的位图缓存，按位扫描快速找空槽
+ gcmarkBits  GC 标记位图：本轮哪些槽存活
+```
+
+- 分配：从 `freeindex` 用 `allocCache` 找下一个空槽，O(1) 摊销。
+- 清扫（sweep）：把 `gcmarkBits` 没标活的槽重新算空闲，整个 span 全空就还给 mheap。
+
+---
+
+## 八、回收：不急着还 OS
+
+对象被 GC 判死后：
+
+```text
+sweep（并发清扫）→ 槽标空闲，可被 mcache 再分配
+   span 全空    → 还给 mheap，但内存【先留着】不还 OS（留着复用，避免反复 syscall）
+   后台 scavenger → 定期把长期空闲的页 madvise 还给 OS
+```
+
+- **不立刻还 OS**：还了又要、要了又还，syscall 太贵。先在进程内复用。
+- **scavenger**：后台慢慢把空闲内存 `madvise(MADV_DONTNEED/FREE)` 交还 OS；`GOMEMLIMIT` 会让它更积极（防 OOM）。
+
+---
+
+## 九、和 GC 怎么配合
+
+- **scan / noscan 分类**：noscan 对象（无指针）GC 标记时**整类跳过**，省扫描。
+- **指针布局记录**：分配时记下对象哪些字（word）是指针（heap bitmap / span 元数据），[GC 三色标记](gc.html) 据此知道该追哪些引用。
+- **gcmarkBits**：标记阶段往里打存活标记，清扫阶段据此回收。
+- **size-class 控碎片**：Go GC **不移动对象**（非压缩），碎片完全靠这套定长 size class 体系压住。
+
+---
+
+## 十、锁层级 / 为什么快
+
+| 层 | 锁 | 命中频率 |
+|---|---|---|
+| **mcache** | **无锁**（per-P） | ~99%（热路径） |
+| **mcentral** | 每个 spanClass 一把锁 | 偶尔（本地 span 空了） |
+| **mheap** | 全局大锁 | 很少（mcentral 也空了） |
+| **OS mmap** | syscall | 极少（堆不够） |
+
+> 绝大多数分配在 mcache 无锁完成，所以 Go 的内存分配**又快又能多核扩展**。
+
+---
+
+## 十一、必记数字 + 一句话总结
+
+```text
+8KB 页   64MB arena   32KB 小对象上限   16B tiny 阈值
+67 个 size class(+class0=68)   ×scan/noscan = 136 spanClass
+三级：mcache(无锁) → mcentral(类锁) → mheap(全局锁) → OS
+```
+
+> 内存分配器 = **TCMalloc 式三级缓存 + size class 定长切分**。`mcache` per-P 无锁吃掉 99% 分配，`mcentral` 按类加锁补货，`mheap` 按页管理、向 OS 批发 arena；tiny 合并小对象、large 直走 heap；scan/noscan 分类 + 指针位图 + 不移动对象，全程为 [GC](gc.html) 服务。**热路径无锁是它快的根本。**
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/memory-allocator" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>空 interface &amp; 类型断言 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 空 interface & 类型断言
+
+## 一、空 interface `interface{}` / `any`
+
+空 interface **不要求任何方法**——所以**任何类型都满足它**：
+
+```go
+var x interface{} = 42       // int
+x = "hello"                   // string
+x = []int{1, 2, 3}           // slice
+x = struct{}{}                // 任何 struct
+
+// Go 1.18+ 推荐写 any
+var y any = 42                // any 是 interface{} 的别名
+```
+
+→ `any` 是 Go 里的"**装任何东西的盒子**"——但取出来时**必须断言成具体类型**才能用。
+
+### 典型场景
+
+| 场景 | 例子 |
+|---|---|
+| 通用容器 | `[]any` 装异构数据 |
+| 反射 / 序列化 | `json.Unmarshal` 收到 `any` |
+| 通用 API | `fmt.Println(...any)` |
+| 临时变量 | DI 框架的全局注册表 |
+
+---
+
+## 二、空 interface 的底层
+
+`any` 在内存里是 [eface 结构](interface.html)：
+
+```go
+type eface struct {
+    _type *_type          // 类型描述 (8 字节)
+    data  unsafe.Pointer  // 实际数据指针 (8 字节)
+}
+```
+
+```
+var x any = 42
+
+x 在内存里:
+  ┌──────────────────┐
+  │ _type → *int     │  ← 记录"我装的是 int"
+  ├──────────────────┤
+  │ data  → ●         │
+  └──────────────────┘
+                  ↓
+                 42  (堆上, 装箱了!)
+```
+
+⚠️ **装箱代价**：值类型放进 any **必然导致堆分配**——详见 [逃逸根因 ② interface 装箱](../02-advanced/escape-analysis.html)。
+
+---
+
+## 三、三种类型断言写法
+
+```go
+var x any = 42
+```
+
+### 写法 1：单返回（断言失败 panic）
+
+```go
+n := x.(int)        // n = 42
+s := x.(string)     // ❌ panic: interface conversion: interface{} is int, not string
+```
+
+**慎用**——除非你绝对确定类型，否则用写法 2。
+
+### 写法 2：双返回（带 ok，推荐）
+
+```go
+n, ok := x.(int)
+if !ok {
+    // 不是 int
+}
+// ok = true, n = 42
+
+s, ok := x.(string)
+// ok = false, s = "" (零值, 不 panic)
+```
+
+**标准做法**。失败返回零值 + `ok=false`，不 panic。
+
+### 写法 3：type switch（多分支）
+
+```go
+switch v := x.(type) {
+case int:
+    fmt.Println("int", v)        // v 是 int 类型
+case string:
+    fmt.Println("string", v)     // v 是 string 类型
+case []int:
+    fmt.Println("slice", v)
+case nil:
+    fmt.Println("nil interface")
+default:
+    fmt.Println("other:", v)
+}
+```
+
+**最优雅的多分支断言**——`v` 在每个 case 里自动转成对应类型。
+
+⚠️ 注意 `case nil`——**仅匹配真正的 nil interface**（type 和 data 都 nil），不匹配"装了 nil 指针的 interface"（见后面陷阱）。
+
+---
+
+## 四、断言底层做什么
+
+```go
+v, ok := x.(int)
+```
+
+底层步骤（参考 [Interface 底层](interface.html)）：
+
+```
+1. 拿 x._type 指针
+2. 和 *int 的 _type 指针比较
+3. 相等 → ok=true, v = x.data 转成 int (取出值)
+4. 不等 → ok=false, v = 0 (int 零值)
+```
+
+**核心是一次指针比较**——~1 ns，非常快。
+
+### 断言到接口（不是具体类型）
+
+```go
+var x any = file        // *os.File
+r, ok := x.(io.Reader)  // 断言成接口
+```
+
+要**重新构造 itab**：
+
+```
+1. 拿 x 的 *_type (具体类型)
+2. 在 itabTable 里查 (io.Reader, *_type)
+   命中 → 构造新 iface 返回
+   未命中 → 检查具体类型方法集是否满足 io.Reader
+            是 → 构造新 itab 并缓存
+            否 → ok=false
+```
+
+第一次稍慢（itab 构造），之后命中缓存很快。
+
+---
+
+## 五、type switch 的细节
+
+### 多类型同一分支
+
+```go
+switch v := x.(type) {
+case int, int64:           // 多类型, v 在分支里是 any!
+    fmt.Println(v)
+case string:
+    fmt.Println(v)         // v 是 string
+}
+```
+
+⚠️ **多类型 case 里 `v` 退化成 `any`**——拿不到具体类型。要分开写。
+
+### case nil
+
+```go
+var x any = nil
+switch x.(type) {
+case nil:
+    fmt.Println("nil")     // ✓ 命中
+}
+```
+
+但：
+
+```go
+var p *int = nil
+var x any = p              // 装了 nil 指针的 interface, x != nil!
+switch x.(type) {
+case nil:
+    fmt.Println("nil")     // ❌ 不命中
+case *int:
+    fmt.Println("*int")    // ✓ 命中 (类型是 *int)
+}
+```
+
+→ `case nil` 只匹配 **真正的 nil interface**——type 和 data 都 nil。
+
+---
+
+## 六、interface = nil 的经典坑
+
+Go 最常见的坑之一，**和断言密切相关**：
+
+```go
+func mayFail() error {
+    var p *MyErr   // nil
+    return p        // 返回 error 接口, 装了一个 nil 指针
+}
+
+err := mayFail()
+err == nil          // false!
+```
+
+**原因**：`err` 是 `(type, value)` = `(*MyErr, nil)`——**type 部分不为 nil**，所以 err 不等于 nil。
+
+```
+真正的 nil interface:
+  iface{type: nil, data: nil}
+
+装了 nil 指针的 interface:
+  iface{type: *MyErr, data: nil}
+                ↑
+            type 非 nil, 所以 != nil
+```
+
+详见 [Interface 底层](interface.html) 的"interface == nil 经典坑"。
+
+---
+
+## 七、断言的性能代价
+
+| 操作 | 开销 |
+|---|---|
+| 断言到具体类型 `x.(int)` | ~1 ns（一次指针比较） |
+| 断言到接口 `x.(io.Reader)`（首次） | ~50 ns（itab 构造 + 缓存） |
+| 断言到接口（后续命中缓存） | ~5 ns（itab 查表） |
+| type switch 每个 case | ~1-2 ns（线性扫描） |
+
+→ 普通业务无感，**hot path 上 type switch 把高频类型放前面**——线性扫描的优势。
+
+---
+
+## 八、什么时候用 / 不用空 interface
+
+### ✅ 适用
+
+- **通用容器**（早期 Go 没泛型时大量用）
+- **反射 / 序列化**（`json.Unmarshal` 必须用 any）
+- **DI 框架** / **插件系统**
+- **fmt 系列** `Print(...any)`
+
+### ❌ 不适用
+
+- **类型在编译期已知**（用泛型，1.18+）
+- **业务逻辑**（用具体类型）
+- **hot path**（装箱 + 断言开销）
+
+### Go 1.18+ 泛型替代
+
+```go
+// 老代码 (用 any):
+func Contains(slice []any, v any) bool {
+    for _, x := range slice {
+        if x == v { return true }
+    }
+    return false
+}
+
+// 用泛型 (推荐):
+func Contains[T comparable](s []T, v T) bool {
+    for _, x := range s {
+        if x == v { return true }
+    }
+    return false
+}
+```
+
+→ **类型已知优先用泛型**——快、安全、可读。
+
+---
+
+## 九、常见踩坑
+
+### ① 单返回断言导致 panic
+
+```go
+n := x.(int)   // ❌ x 不是 int 直接 panic
+n, ok := x.(int)   // ✓ 安全
+```
+
+### ② type switch 多类型 case 拿不到具体类型
+
+```go
+switch v := x.(type) {
+case int, int64:    // ❌ v 退化成 any, 没法当 int64 用
+    use(v + 1)       // 编译错: any 不能 + 1
+}
+```
+
+→ 分开写或用 `reflect`。
+
+### ③ 把所有东西都装 any 丧失类型安全
+
+```go
+// ❌ 反模式
+func process(args ...any) {
+    for _, a := range args {
+        switch v := a.(type) { ... }
+    }
+}
+process(1, "hello", []int{1,2})
+
+// ✓ 用泛型 / 具体类型
+```
+
+### ④ 装 nil 指针然后判 nil
+
+```go
+var p *MyType
+var x any = p
+x == nil    // ❌ false! (经典 nil 坑)
+```
+
+---
+
+## 十、一图总结
+
+```
+            空 interface (any / interface{})
+                    │
+              eface = (_type, data)
+              能装任何类型, 但底层装箱到堆
+                    │
+              拿出来必须断言
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+     三种写法                断言底层
+   ┌────────────────┐       ┌──────────────────┐
+   │ x.(T)          │       │ 比较 x._type 和 T │
+   │ 失败 panic     │       │ 一次指针比较      │
+   ├────────────────┤       │ ~1 ns            │
+   │ v, ok := x.(T) │       │                  │
+   │ 失败 ok=false   │       │ 断言到接口要构造  │
+   ├────────────────┤       │ 新 itab (首次慢) │
+   │ switch x.(type)│       │                  │
+   │ 多分支         │       └──────────────────┘
+   └────────────────┘
+
+   性能档位:
+     断言到具体类型:        ~1 ns
+     断言到接口 (首次):     ~50 ns
+     断言到接口 (缓存命中):  ~5 ns
+     type switch 每 case:  ~1-2 ns
+
+   ★ 经典坑 ★
+   ① 单返回 .(T) 失败 panic
+   ② 装 nil 指针的 interface != nil
+   ③ type switch 多类型 case 拿不到具体类型
+   ④ case nil 只匹配真 nil interface
+
+   什么时候用:
+     ✅ 反射 / 序列化 / 通用容器
+     ✅ DI 框架 / 插件
+     ❌ 类型已知 → 用泛型 (Go 1.18+)
+     ❌ hot path → 装箱+断言贵
+```
+
+**一句话**：`any` = "**任何类型容器**"——底层 eface 装箱到堆；取出来必须**类型断言**：单返回失败 panic，**`v, ok := x.(T)` 是标准写法**，多分支用 **`switch x.(type)`**。**类型已知场景用 Go 1.18+ 泛型替代**——快、安全；any 留给反射 / 序列化 / 通用容器这种"运行时才知类型"的场景。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/type-assertion" data-base="../../"></script>
+</body>
+</html>

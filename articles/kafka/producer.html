@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kafka 生产者原理 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Kafka 生产者原理
+
+> 一句话：生产者把消息**序列化 → 选分区 → 攒批进缓冲区 → 由后台 Sender 线程批量发往各分区 Leader**，acks 决定"写成功"的强度，幂等 / 事务决定"不重复 / 原子写"的边界。
+
+## 一、发送整体流程
+
+一条消息从 `send()` 到落到 Broker，要穿过主线程和 Sender 线程两段，中间隔着一个 `RecordAccumulator` 缓冲区。
+
+```text
+       主线程 (用户调 send)                          Sender 线程 (后台 IO)
+ ┌────────────────────────────────┐        ┌──────────────────────────────────┐
+ │ send(record)                   │        │  从 Accumulator 取就绪 Batch      │
+ │   ├─ 拦截器 Interceptor (可选) │        │   按 broker 聚合成请求            │
+ │   ├─ Serializer 序列化 K/V     │        │   (一个 broker 一个请求,           │
+ │   ├─ Partitioner 选分区        │  攒批  │    含发往它的多个分区的 Batch)    │
+ │   └─ 追加到 RecordAccumulator ─┼───────▶│   走 NetworkClient 发出           │
+ │       (按 <topic,分区> 分队列) │        │   等待 Broker 响应                │
+ └────────────────────────────────┘        │   ├─ 成功 → 触发 callback         │
+                                            │   └─ 失败 → 按 retries 重试       │
+ RecordAccumulator 内部:                    └──────────────────────────────────┘
+   TopicPartition-0 ─▶ [Batch][Batch]...   (双端队列 Deque<ProducerBatch>)
+   TopicPartition-1 ─▶ [Batch]...          每个 Batch 默认上限 batch.size
+   TopicPartition-2 ─▶ [Batch][Batch]
+```
+
+要点：
+
+- **RecordAccumulator** 按 `<topic, partition>` 维度各维护一个**双端队列**，消息追加到队尾的 `ProducerBatch`；写满（`batch.size`）或等待超时（`linger.ms`）就标记为"就绪"。
+- **Sender 线程**把发往同一个 Broker 的多个分区 Batch 打包成一个请求批量发送，这是 Kafka 高吞吐的关键之一。
+- 缓冲区总大小由 `buffer.memory` 控制；写满后 `send()` 会阻塞，最长等 `max.block.ms`，超时抛异常。
+
+## 二、三种发送模式
+
+| 模式 | 写法 | 拿不拿得到结果 | 吞吐 | 典型场景 |
+|---|---|---|---|---|
+| Fire-and-forget | `producer.send(record)` | 不管结果，丢了也不知道 | 最高 | 日志、埋点等可容忍丢失 |
+| 同步 | `producer.send(record).get()` | 阻塞拿结果，异常直接抛 | 最低 | 强确定性、必须确认落库 |
+| 异步回调 | `producer.send(record, callback)` | 由回调拿结果 | 高 | 通用首选，结果异步处理 |
+
+```java
+// 1. fire-and-forget：返回 Future，但不处理
+producer.send(record);
+
+// 2. 同步：阻塞等结果，常用于强一致场景
+RecordMetadata meta = producer.send(record).get(); // 异常会在这里抛出
+
+// 3. 异步回调：吞吐与确定性折中
+producer.send(record, (metadata, exception) -> {
+    if (exception != null) {
+        // 记录失败、告警、补偿
+    } else {
+        // metadata.partition() / metadata.offset()
+    }
+});
+```
+
+> 回调里**不要做重逻辑或阻塞**——它在 Sender 线程上执行，会拖慢整个发送。
+
+## 三、分区策略（消息落到哪个分区）
+
+| 情况 | 行为 | 效果 |
+|---|---|---|
+| 显式指定 partition | 直接用指定值 | 完全可控 |
+| 未指定 partition、有 key | 对 key 做 hash（murmur2）取模 | **同 key 必落同分区 → 单分区内保序** |
+| 未指定 partition、无 key | **粘性分区 Sticky（2.4+）** | 攒满一批 / linger 到期再换分区，降低小批延迟 |
+
+**粘性分区 Sticky**：2.4 之前无 key 时按轮询，导致每个分区都只攒一点点就发，小批次多、延迟高。Sticky 改为"先粘住一个分区把当前批次攒满，再切换到下一个分区"，整体仍然均衡，但批次更大、请求更少、延迟更低。
+
+自定义路由实现 `Partitioner` 接口即可：
+
+```java
+public class MyPartitioner implements Partitioner {
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+        int n = cluster.partitionsForTopic(topic).size();
+        // 例：VIP 订单固定走 0 号分区
+        return isVip(key) ? 0 : Math.abs(key.hashCode()) % n;
+    }
+}
+```
+
+## 四、acks：决定"写成功"的强度
+
+`acks` 控制生产者认为一条消息"写成功"需要多少副本确认。
+
+| acks | 含义 | 丢失风险 | 吞吐 |
+|---|---|---|---|
+| `0` | 发出去就算成功，不等任何确认 | 最高（网络丢包都不知道） | 最高 |
+| `1` | Leader 写入本地日志即返回 | Leader 落盘后、同步给 Follower 前宕机会丢 | 中 |
+| `all` / `-1` | ISR 中**全部**副本确认才返回 | 几乎不丢 | 最低 |
+
+`acks=all` 必须配合 Broker 端 **`min.insync.replicas`** 才有意义：它规定 ISR 至少要有几个副本在线才允许写入；若在线副本少于该值，生产者写入直接报 `NotEnoughReplicas` 而不是默默降级。
+
+```text
+经典不丢组合：副本数 = 3，acks = all，min.insync.replicas = 2
+  含义：必须至少 2 个副本（Leader + 1 Follower）确认才算写成功，
+        允许挂 1 个副本仍可写，挂 2 个则拒绝写入（宁可不写也不丢）。
+```
+
+详见 [可靠性：不丢 / 不重 / 有序 / 恰好一次](reliability.html)。
+
+## 五、幂等 Producer（解决单分区单会话重复）
+
+网络抖动时生产者重试，可能导致同一条消息在 Broker 上写了两次。开启幂等即可在 Broker 端去重。
+
+- 开关：`enable.idempotence=true`（**3.0+ 默认开启**）。
+- 原理：Broker 为每条消息维护 **PID（Producer ID）+ 分区 + 序列号（Sequence Number）** 三元组；同一 PID + 分区下，序列号必须严格递增，重复或乱序的序列号被丢弃 / 报错。
+
+```text
+PID=1001, 分区 P0, 序列号递增:  ... seq=5  seq=6  seq=7 ...
+   重试把 seq=6 又发一次  ─▶  Broker 发现 seq=6 已写过  ─▶  丢弃，返回成功(去重)
+```
+
+**局限**：
+
+- 只保证**单分区**去重（PID + 分区 + 序列号是按分区维护的）。
+- 只保证**单会话**：Producer 重启后 PID 会变，旧序列号失效，无法跨会话去重。
+- 开启幂等会自动要求 `acks=all`、`retries>0`、`max.in.flight.requests.per.connection ≤ 5`。
+
+跨分区 / 跨会话的去重与原子性，需要事务。
+
+## 六、事务 Producer（跨分区 / 跨会话原子写）
+
+事务在幂等之上，提供"要么全成功、要么全失败"的原子写，并能**把消费位点和生产消息放进同一个事务一起提交**——这是 Exactly-Once（EOS）的基础。
+
+- 开关：配置 **`transactional.id`**（必须全局唯一且稳定），它让 Broker 能跨会话识别同一个逻辑生产者，重启后能 fence 掉旧实例（基于 epoch）。
+
+```java
+props.put("transactional.id", "order-tx-1");
+props.put("enable.idempotence", true); // 事务隐含开启幂等
+producer.initTransactions();           // 启动时注册一次
+
+producer.beginTransaction();
+try {
+    producer.send(record1);            // 可跨多个分区 / 多个 topic
+    producer.send(record2);
+    // consume-transform-produce 模式下，把消费位点也纳入事务：
+    producer.sendOffsetsToTransaction(offsets, groupMetadata);
+    producer.commitTransaction();      // 原子提交
+} catch (KafkaException e) {
+    producer.abortTransaction();       // 整批回滚
+}
+```
+
+消费端配合 `isolation.level=read_committed`，就看不到未提交 / 已回滚的消息。EOS 全貌见 [可靠性：不丢 / 不重 / 有序 / 恰好一次](reliability.html)。
+
+## 七、关键参数速查
+
+| 参数 | 作用 | 调优方向 |
+|---|---|---|
+| `batch.size` | 单个 Batch 上限（字节，默认 16KB） | 调大 → 批更大、吞吐高、延迟略增 |
+| `linger.ms` | Batch 未满时最多等多久再发（默认 0） | 调大 → 攒更多、吞吐高、延迟增 |
+| `buffer.memory` | 缓冲区总大小（默认 32MB） | 满了 send 阻塞 `max.block.ms` |
+| `compression.type` | 压缩算法 none/gzip/snappy/lz4/zstd | snappy/lz4 性价比高，省带宽 |
+| `acks` | 写成功强度 0/1/all | 可靠性优先用 `all` |
+| `retries` / `delivery.timeout.ms` | 重试次数 / 端到端发送总时限 | 配幂等后可放心重试 |
+| `max.in.flight.requests.per.connection` | 单连接未确认请求数（默认 5） | 不开幂等且要严格有序时设 1 |
+| `enable.idempotence` | 幂等开关（3.0+ 默认 true） | 防生产端重复 |
+
+> `batch.size` 与 `linger.ms` 是吞吐 / 延迟权衡的两个旋钮：要吞吐就一起调大，要低延迟就调小 `linger.ms`。
+
+## 八、相关链接
+
+- [可靠性：不丢 / 不重 / 有序 / 恰好一次](reliability.html)
+- [副本机制](replica.html)
+- [消费者与消费组 Rebalance](consumer.html)
+- [Kafka 知识地图](knowledge-graph.html)
+
+## 一句话总结
+
+生产者的本质是"**序列化 → Partitioner 选分区 → RecordAccumulator 攒批 → Sender 批量发 Leader → 回调拿结果**"；可靠性由 `acks` + `min.insync.replicas` 决定，去重由幂等（PID+分区+序列号，限单分区单会话）和事务（跨分区跨会话 + 位点原子提交）决定。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/producer" data-base="../"></script>
+</body>
+</html>

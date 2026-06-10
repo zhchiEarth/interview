@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>atomic & CAS 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# atomic & CAS 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **atomic = CPU 一条指令做完"读-改-写"不被打断（x86 `lock xadd`/ARM LL-SC），还自带内存屏障管可见性**；**CAS = `if *p==old {*p=new}` 是乐观锁原语**，配 **for 自旋重试**拼 lock-free。坑：**ABA**（值变回来 CAS 仍成功）+ **高竞争自旋烧 CPU**。**单值用 atomic，多字段用 mutex**。
+
+记不全时，按这条**记忆主线：一条线 + 五个 API + 一段自旋 + 两个坑**展开（详细推演看[正文](atomic-cas.html)）：
+
+---
+
+## 🧵 一条线 —— 锁太重 → atomic → CAS → lock-free
+
+```text
+锁太重(一个int自增付几十ns)
+  → 硬件原子指令 atomic.Add        ← 一条 lock xadd 搞定读改写
+  → 基于旧值算新值 → 要带条件 → CAS
+  → CAS 失败就 for 自旋重试
+  → 拼出 lock-free 栈/队列
+  → 躲坑: ABA(正确性) + 自旋代价(性能)
+  → 顺带白拿: 内存可见性(happens-before)
+```
+- `mu.Lock()` 快路径就是一次 `lock cmpxchg` CAS，**mutex 是用 atomic 搭的**，不是并列关系。
+
+## 🔧 五个 API —— 类型化优先（Go 1.19+）
+
+```go
+var n atomic.Int64   // 还有 Bool / Pointer[T] / Value(any,要断言)
+n.Load()                    // 原子读
+n.Store(10)                 // 原子写
+n.Add(1)                    // 原子加
+n.Swap(new)                 // 换值, 返回旧值
+n.CompareAndSwap(old, new)  // CAS: 是 old 才改成 new, 返回是否成功
+```
+- `atomic.Pointer[T]` 配置热更新标准方案（整体替换指针）；`atomic.Value` 每次 Store 类型必须一致，否则 panic。
+
+## 🔁 一段自旋 —— CAS 失败就重读重算
+
+```go
+for {
+    old := n.Load()
+    if n.CompareAndSwap(old, old+1) { break }
+    // 失败 → 别人先改了 → 重试
+}
+```
+- lock-free 栈 Push：`n.next=old; CAS(head, old, n)`，失败重试。单例直接用 `sync.Once` 比 CAS 更稳。
+
+## ⚠️ 两个坑 —— ABA + 自旋代价
+
+```text
+① ABA(正确性): *p 经 A→X→A, CAS(A,B) 仍成功 → 栈里 use-after-free
+   解: 带版本号(DCAS) / Hazard Pointer / Epoch回收 / 直接加锁
+② 自旋代价(性能): 高竞争 N 核狂抢同一缓存行
+   → 忙等烧 CPU + 缓存行乒乓 + 可能饥饿(lock-free 非 wait-free)
+   解: 指数退避 / 分片打散热点 / 干脆 mutex 让 G 睡
+```
+- 低竞争 atomic 完胜(~5ns)，高竞争单点热值 mutex 反而更好；**"atomic 一定比 mutex 快"是错的**。
+- 内存语义：`Store` 是 release、`Load` 是 acquire，配对建立 happens-before；并发标志位必须用 atomic，不能用普通 bool。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/atomic-cas-memo" data-base="../../"></script>
+</body>
+</html>

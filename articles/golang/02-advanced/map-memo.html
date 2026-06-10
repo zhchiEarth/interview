@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Map 底层记忆法（怎么记住） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Map 底层记忆法（怎么记住）
+
+> 看过 [Map 底层是怎么实现的？](map.html) 后觉得信息密度太高记不住？这里是配套的"层次记忆法"，正面硬背一定崩，这个能搞定。
+
+## 一、先只背"骨架三件套"
+
+把整篇浓缩到 **3 句话**，背到能默写：
+
+> Go map = **链地址法哈希表** + **渐进式扩容** + **写检测 panic**。
+>
+> bucket 固定装 **8 个 kv**，tophash 存 hash 的**高 8 位**做快速过滤。
+>
+> 扩容时 oldbuckets 和 buckets **同时存在**，每次写顺手搬 1~2 个旧 bucket。
+
+这三句话覆盖了 80% 的面试问题。**先死记这三句**，其它都是从这里推出来的。
+
+---
+
+## 二、再背 "9 个关键数字/名词"
+
+| 记忆点 | 是什么 |
+|---|---|
+| **hmap** | map 的头 |
+| **bmap** | bucket 结构 |
+| **8** | 一个 bucket 装 8 个 kv |
+| **B** | bucket 数 = 2^B |
+| **tophash** | hash 高 8 位 |
+| **overflow** | 链地址法的"链" |
+| **6.5** | 装载因子上限（>6.5 翻倍扩容） |
+| **oldbuckets** | 扩容时旧数组 |
+| **hashWriting** | 并发写 panic 用的标志位 |
+
+每天看一遍 30 秒，一周就熟了。
+
+---
+
+## 三、用一个"故事"把它串起来
+
+记忆心理学的核心是 **建立联系**。死记知识点会忘，串成场景就忘不了。
+
+> **场景**：你要管理一万本书。
+>
+> 1. **链地址法**：你买了 16 个书架（`buckets`，B=4），每个架子能放 8 本（一个 bucket 8 槽）。**满了就加个边架挂在旁边**（overflow bucket）。
+>
+> 2. **tophash**：每本书有 ISBN（hash）。低 4 位决定放哪个书架，高 8 位写在书脊上（tophash）。要找书时先扫书脊上的数字，不对直接跳过，对了才打开看完整 ISBN。
+>
+> 3. **扩容**：书太多了（>6.5 本/架），你买了 **32 个新书架**（B+1）放在旁边，但**不一次搬完**——每次往新架放书时**顺手把旧架上一本搬过去**（渐进搬迁）。期间找书要**新旧两边都查**。
+>
+> 4. **写检测 panic**：你定了规矩——**任何时刻只能一个人在架子上写新书**。门口挂个"有人在写"的牌子（hashWriting 标志），第二个人来一看牌子还在，**直接撞翻你**（panic）。
+
+记住这个图书馆，前面所有细节都能复述出来。
+
+---
+
+## 四、用 "面试官提问 → 你答" 的方式自测
+
+不要再"读"了，**合上文档自己问自己**：
+
+```
+Q1: Go map 底层是什么？
+→ 链地址法哈希表 + 渐进扩容 + 写检测 panic
+
+Q2: 为什么 bucket 是 8 个槽？
+→ 8 个 tophash 正好塞满 1 个 cache line (64 字节)
+
+Q3: 怎么定位一个 key？
+→ hash 低 B 位定 bucket,高 8 位比 tophash,匹配的才比完整 key
+
+Q4: 扩容什么时候触发？
+→ 装载因子 > 6.5 (翻倍) 或 overflow 过多 (等量)
+
+Q5: 怎么扩容?
+→ 分配新数组挂到 buckets, 旧的挂 oldbuckets,
+  每次写顺手搬 1~2 个旧 bucket,搬完释放旧数组
+
+Q6: 为什么并发写会 panic？
+→ hmap.flags 里有 hashWriting 标志位,写前置位写后清,
+  发现别人已置位就 panic("concurrent map writes")
+
+Q7: 为什么 &m[k] 取地址会编译错?
+→ 扩容时 value 会被搬到新内存,地址会失效
+
+Q8: 为什么 map 迭代顺序随机？
+→ 故意的,防止代码依赖顺序;每次起始 bucket 和槽位随机
+```
+
+**能流畅答出这 8 题 = 这篇文章就过了**。
+
+---
+
+## 五、间隔重复（最有效）
+
+死记是没用的，**间隔复习才行**：
+
+| 时间 | 做什么 |
+|---|---|
+| 第 1 天 | 通读 + 默写三句话骨架 |
+| 第 2 天 | 自测 8 题 |
+| 第 4 天 | 再自测一次，错的回看 |
+| 第 7 天 | 默写图书馆故事 |
+| 第 14 天 | 再做一次 8 题 |
+| 一个月后 | 最后过一遍 |
+
+间隔时长可以用 Anki 等卡片软件自动安排，但其实**纸笔 + 日历也行**。
+
+---
+
+## 六、面试场景的简化版"30 秒答案"
+
+如果面试官直接问"说说 Go map 怎么实现的"，你只需要按这个顺序讲：
+
+```
+1. 数据结构: 链地址法的哈希表,
+   bucket 固定 8 个槽,tophash 存 hash 高 8 位做快速过滤,
+   bucket 满了挂 overflow 链
+
+2. 查找: 低 B 位定 bucket → 比 tophash → 比完整 key
+
+3. 扩容: 装载因子 > 6.5 或 overflow 多就扩;
+   关键是 *渐进搬迁* — 不一次性,每次写顺手搬一两个
+
+4. 并发: 不安全,但有 hashWriting 标志位主动 panic;
+   要并发用 sync.Map 或 mutex 包
+
+如果想深挖再补:
+   - tophash 还兼槽位状态标记
+   - key/value 分开存为了少 padding
+   - 翻倍扩容 vs 等量扩容
+   - hash0 随机种子防 DoS
+```
+
+按 1→2→3→4 顺序讲，**30 秒到 2 分钟自由伸缩**，覆盖 90% 的面试场景。
+
+---
+
+## 一句话总结
+
+> **别试图记住整篇文档**——背 3 句骨架 + 1 个图书馆故事，配合 8 题自测和间隔复习。**主动复述 >> 反复阅读**，这是记忆研究里最强的一条原则。
+
+---
+
+## 通用模板（套到其它文章上）
+
+这套方法不只对 map 有效，记任何技术细节都可以套：
+
+| 层 | 做什么 |
+|---|---|
+| **L1 骨架** | 把整篇浓缩成 2-3 句话，背到能默写 |
+| **L2 关键词卡** | 列 5-10 个关键数字/术语，每天扫一遍 |
+| **L3 故事化** | 找一个生活类比把所有概念串起来 |
+| **L4 自测** | 列 5-10 个面试官可能问的问题，合上文档默答 |
+| **L5 间隔重复** | 第 1 / 2 / 4 / 7 / 14 / 30 天各过一次 |
+| **L6 30 秒答案** | 给自己准备一个面试"主干答案"，可深可浅 |
+
+> **L4（自测）是最高 ROI 的一步**——多数人卡在反复读 L1-L3 而从不做 L4，所以"看了感觉懂了，一问就忘"。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/map-memo" data-base="../../"></script>
+</body>
+</html>

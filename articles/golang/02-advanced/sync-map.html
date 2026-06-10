@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.Map 实现与适用场景 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.Map 实现与适用场景
+
+## 一、sync.Map 是干嘛用的
+
+普通 `map` 不是并发安全的，并发写会 panic。最直接的修复是加锁：
+
+```go
+type SafeMap struct {
+    mu sync.RWMutex
+    m  map[string]int
+}
+```
+
+但这个方案有问题：**每次读都要 RLock**——即使 90% 都不会冲突。在**读极多、写极少**的场景（全局配置、长寿缓存），锁本身就是瓶颈。
+
+**sync.Map 的目标**：让**读路径完全无锁**，只在写时才用锁。
+
+适用场景（官方文档明确说的）：
+1. **key 写一次后只读**（长寿命缓存、注册表）
+2. **多个 goroutine 各自读写不重叠的 key 集合**（key 分片）
+
+其它场景（读写各半、key 集合频繁变化）反而比 `RWMutex + map` 慢——下面看完实现就知道为什么。
+
+---
+
+## 二、整体结构：双 map 分离
+
+sync.Map 用一个非常聪明的设计：**两个底层 map**，一只读一可写。
+
+```
+sync.Map 内部:
+
+┌─────────────────────────────────────────────────┐
+│  read   atomic.Pointer[readOnly]                │  ← 无锁读, 99% 走这里
+│         ┌────────────────────────────────────┐  │
+│         │ readOnly {                         │  │
+│         │   m:        map[any]*entry         │  │
+│         │   amended:  bool  ← dirty 是否有   │  │
+│         │ }                  read 没有的 key │  │
+│         └────────────────────────────────────┘  │
+├─────────────────────────────────────────────────┤
+│  dirty   map[any]*entry  (受 mu 保护)             │  ← 加锁读写
+│  misses  int             (受 mu 保护)             │
+│  mu      Mutex                                   │
+└─────────────────────────────────────────────────┘
+```
+
+| 字段 | 作用 |
+|---|---|
+| `read` | 只读 map 的**原子指针**，所有 goroutine 无锁并发读 |
+| `dirty` | 可读可写 map，只在加锁下访问 |
+| `misses` | 计数器：每次 read 没命中要查 dirty 时 +1 |
+| `amended` | bool：dirty 是否含有 read 没有的 key |
+| `mu` | Mutex，保护 dirty / misses / 升级过程 |
+
+下面三节解释**这个结构里两个不平凡的设计**：为什么 read 用原子指针？为什么 map 值用 `*entry` 而不是 `entry`？
+
+---
+
+## 三、设计精髓 ①：read 用 atomic.Pointer 包起来
+
+字段定义里 `read` 是 `atomic.Pointer[readOnly]`——**一个被原子指针包起来的 map**，不是普通指针。
+
+```go
+type Map struct {
+    read atomic.Pointer[readOnly]
+    ...
+}
+```
+
+这层"原子指针"是无锁读的根本。两件事在它身上发生：
+
+### 3.1 原子 Load/Store 替代普通赋值
+
+```go
+ptr := m.read.Load()             // 一条原子指令拿到指针
+m.read.Store(newReadOnly)        // 一条原子指令整体替换
+```
+
+对比**普通赋值**会出什么问题？两类故障——这就是大家常说的**"读到一半新一半旧"**：
+
+#### 故障 A：撕裂写（word tearing）
+
+某些 CPU 架构（典型 32 位 ARM）上，一次 64 位指针的写**实际是两次 32 位写**：
+
+```
+CPU 1 写指针 0x1234_5678_ABCD_EF01:
+   t1: 写低 32 位 → 0x????_????_ABCD_EF01  ← 高位还是旧的
+   t2: 写高 32 位 → 0x1234_5678_ABCD_EF01  ← 完成
+
+CPU 2 在 t1 和 t2 之间读:
+   读到 0x????_????_ABCD_EF01 ← 撕裂! 半新半旧
+   把它当指针 deref → 完全乱来 💥
+```
+
+> x86-64 上对齐的 8 字节写是原子的，但 Go 跨平台，编译器不能假设。
+
+#### 故障 B：发布竞态（publication race）
+
+即使指针本身不撕裂，**它指向的对象还没构造完**就被发布出去：
+
+```go
+new := &readOnly{
+    m: map[any]*entry{...},   // ①
+    amended: true,             // ②
+}
+p = new                       // ③ 普通赋值
+```
+
+编译器或 CPU 可能**重排序**为 ③→①→②：
+
+```
+CPU 1 实际乱序执行:
+   ③ 先发布 p = new      ← 此时 new 对象还没初始化!
+   ① 写 new.m
+   ② 写 new.amended
+
+CPU 2 同时读 p:
+   读到 new 指针 ✓
+   读 new.m → nil 💥
+```
+
+指针**本身**完整，但**它指向的对象内部**是半新半旧。
+
+### 3.2 原子操作给的两个保证
+
+`atomic.Store` / `atomic.Load` 解决以上两类问题：
+
+```
+保证 1 (不撕裂):    单一不可分割的指令完成读/写
+保证 2 (内存屏障):  Store 之前的所有写,
+                    在其它 CPU 看到 Store 之后必能看到
+```
+
+效果：
+
+```
+       构造 new.m
+       构造 new.amended
+       ══════════════════  ← 内存屏障
+       atomic.Store(&p, new)
+       ══════════════════  ← 内存屏障
+
+       别的 CPU 看到 p == new 时,
+       一定能看到内部已完整构造 ✓
+```
+
+### 3.3 read 这个 map 永不在原地修改
+
+有了原子指针包装，sync.Map 给 `read` 立了一条铁律：
+
+| 操作 | 允许? |
+|---|---|
+| 读 map 里的 key | ✅ |
+| **改 map 的 key 集合（加/删）** | ❌ **绝对禁止** |
+| **改 entry 内部的值** | ✅（通过 entry 的原子 CAS，见下节） |
+
+**要"更新" read？整个换一个新 readOnly 对象**，用 `atomic.Store` 替换指针——读者要么看到旧的、要么看到新的，**绝不撞中间态**。
+
+> 这就是为什么字段叫 `read`：从读者的角度看，它**完全只读**——读它时连锁都不用。
+
+---
+
+## 四、设计精髓 ②：map 值用 `*entry` 不是 `entry`
+
+字段定义里 map 是 `map[any]*entry`——存的是**指针**，不是 entry 值。这个细节非常关键。
+
+```go
+type readOnly struct {
+    m map[any]*entry  // ← 注意 *entry, 不是 entry
+}
+
+type entry struct {
+    p atomic.Pointer[any]  // 指向真实 value
+}
+```
+
+### 4.1 内存关系图
+
+```
+read.m  =  { "k1": ●,    "k2": ●,    "k3": ● }
+                │           │           │
+dirty   =  { "k1": ●──┐    │   ┌──● "k3": ● ,  "k4": ● }
+                      │    │   │           │           │
+                      ▼    ▼   ▼           ▼           ▼
+                   ┌─────┐ ┌─────┐ ┌─────┐         ┌─────┐
+                   │ e1  │ │ e2  │ │ e3  │         │ e4  │ ← 堆上的 entry 对象
+                   │ p:●─│ │ p:●─│ │ p:●─│         │ p:●─│
+                   └──┬──┘ └──┬──┘ └──┬──┘         └──┬──┘
+                      ▼       ▼       ▼               ▼
+                    "v1"    "v2"    "v3"            "v4"
+```
+
+**核心**：
+- `read.m["k1"]` 和 `dirty["k1"]` 是**同一个 `*entry` 指针**，指向同一个 e1 对象
+- e1 内部有原子指针 `p` 指向 value
+- "更新 k1 的值" = CAS 改 e1.p（不动 map）
+
+### 4.2 三大好处
+
+**好处 1：read 和 dirty 同步**
+
+```go
+m.Store("k1", "v_new")
+  → 找到 read.m["k1"] 指向 e1
+  → e1.p.Store("v_new")
+  → read 和 dirty 同时看到新值, 因为它们指向同一个 e1 ✓
+```
+
+**好处 2：改值不动 map 结构**
+
+read 本身是只读的不能改，但**改 entry 内部的 p 不算改 map**：
+
+```
+        read 这个 map: 不能动 (原地改会触发并发 panic)
+              │
+              ▼
+         key → *entry  ← 指针不变
+                  │
+                  ▼
+               entry.p  ← 这个原子指针可以被 CAS 改 ✓
+                  │
+                  ▼
+                value
+```
+
+有了"指针指向 entry"的**间接层**，就能在不动 map 本身的前提下更新值。
+
+**好处 3：让"软删除"可行**
+
+要从 read 删一个 key？删不了——read 不能动。但可以把 `entry.p` 改成 nil：
+
+```go
+Delete("k1"):
+  e := read.m["k1"]
+  e.p.Store(nil)   // 软删, map 结构没动 ✓
+
+Load("k1"):
+  e := read.m["k1"]     // 仍能找到 entry
+  v := e.p.Load()
+  if v == nil { return nil, false }  // p == nil → 已删
+```
+
+下一节的"三态机制"就建立在这个基础上。
+
+### 4.3 反例：如果存 `entry` 值会怎样
+
+```go
+m map[any]entry   // ❌ 假设值不是指针
+```
+
+- 改值要改 map → 必须加锁 → 无锁读路径不存在
+- read 和 dirty 各自一份 entry → 改一个另一个不变 → 数据不一致
+- 没法软删 → 三态机制不可能
+
+**结论**：`*entry` 这层间接是 sync.Map 整套机制的物理基础。
+
+---
+
+## 五、entry 的三态
+
+`entry.p` 有**三种状态**——这是 sync.Map 最难懂、但也最优雅的地方。
+
+```go
+type entry struct {
+    p atomic.Pointer[any]
+}
+```
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  状态 1: 正常值        p = *value     指向真实的 value        │
+│                                                              │
+│  状态 2: nil           p = nil        key 被 Delete 过,       │
+│                                       但 dirty 里还有这 entry │
+│                                                              │
+│  状态 3: expunged      p = &expunged  特殊 sentinel:          │
+│                                       dirty 里**没有**这个 key│
+│                                       (已被"硬删")            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+为什么要三个状态？看完六、七节的删除和升级流程就懂了。
+
+---
+
+## 六、读流程 (Load)：99% 走无锁快路径
+
+```go
+func (m *Map) Load(key any) (value any, ok bool) {
+    // ① 原子读 read (无锁)
+    read := m.read.Load()
+    e, ok := read.m[key]
+
+    // ② read 没命中 + dirty 有新 key → 加锁去 dirty 找
+    if !ok && read.amended {
+        m.mu.Lock()
+        read = m.read.Load()       // 双检
+        e, ok = read.m[key]
+        if !ok && read.amended {
+            e, ok = m.dirty[key]
+            m.missLocked()          // misses++, 可能触发升级
+        }
+        m.mu.Unlock()
+    }
+
+    if !ok { return nil, false }
+    return e.load()  // 读 entry.p
+}
+```
+
+时间线：
+
+```
+99% 路径 (read 命中):
+  Load("k")
+    → 原子 read.Load()    ← atomic.Pointer.Load(), 接近 0 开销
+    → 找到 entry
+    → entry.load() (atomic.Pointer.Load())
+    → 返回值
+
+  全程零锁,纯原子操作
+
+1% 路径 (read 没命中 + dirty 可能有):
+  Load("k")
+    → read 找不到
+    → mu.Lock()
+    → 再查 read (防止 ABA)
+    → 查 dirty
+    → misses++
+    → mu.Unlock()
+```
+
+**关键点**：**Load 路径上几乎不加锁**——这是 sync.Map 对 RWMutex+map 最大的优势。
+
+---
+
+## 七、写流程 (Store)：能 CAS 就 CAS，否则加锁
+
+```go
+func (m *Map) Store(key, value any) {
+    read := m.read.Load()
+    if e, ok := read.m[key]; ok {
+        // ① key 已在 read 里 → 尝试无锁 CAS 更新
+        if e.tryStore(&value) {
+            return                  // 99% 情况走这里
+        }
+    }
+
+    // ② key 不在 read,或 entry 被标记 expunged → 加锁
+    m.mu.Lock()
+    read = m.read.Load()
+    if e, ok := read.m[key]; ok {
+        if e.unexpungeLocked() {    // 从 expunged 恢复
+            m.dirty[key] = e         // 同步回 dirty
+        }
+        e.storeLocked(&value)
+    } else if e, ok := m.dirty[key]; ok {
+        // ③ 只在 dirty 里 → 直接更新
+        e.storeLocked(&value)
+    } else {
+        // ④ 全新 key → 加进 dirty
+        if !read.amended {
+            m.dirtyLocked()         // 第一次,要从 read 复制构造 dirty
+            m.read.Store(&readOnly{m: read.m, amended: true})
+        }
+        m.dirty[key] = newEntry(value)
+    }
+    m.mu.Unlock()
+}
+```
+
+四种情况：
+
+| 情况 | 路径 | 锁? |
+|---|---|---|
+| ① key 在 read，entry 正常 | **CAS 改 entry.p** | 无锁 ✓ |
+| ② key 在 read，entry 是 expunged | 加锁 + 复活到 dirty | 有锁 |
+| ③ key 只在 dirty | 加锁 + 更新 entry | 有锁 |
+| ④ 全新 key | 加锁 + 写 dirty + (可能) 构造 dirty | 有锁 |
+
+**关键洞察**：**已存在的 key 更新值 = 完全无锁**！这就是为什么 "key 写一次后只读 / 只更新值不增 key" 是 sync.Map 的甜区。
+
+---
+
+## 八、删除流程 (Delete)：软删两步走
+
+sync.Map 的删除分**两步**——这是三态机制存在的真正原因。
+
+### 第一步：Delete 时把 entry.p 设为 nil（软删）
+
+```go
+func (m *Map) Delete(key any) {
+    read := m.read.Load()
+    e, ok := read.m[key]
+    if !ok && read.amended {
+        // ... 加锁删 dirty ...
+    }
+    if ok {
+        e.delete()   // 原子 CAS: entry.p → nil
+    }
+}
+```
+
+**注意**：read 这个 map 本身是不可变的——**不能从 read 里删 key**（那要重建整个 read）。所以"删除"只是把 entry.p 改成 nil：
+
+```
+Delete("k") 之后:
+  read.m  = { "k": entry{p: nil},  "a": entry{p: *valA} }
+                       ↑
+                  entry 还在,但 p=nil 表示"已删"
+  Load("k") 看到 e.p == nil → 返回 (nil, false)  ✓
+```
+
+### 第二步：dirty 升级时把 nil 变成 expunged（硬删）
+
+read 里有大量 `entry{p: nil}` 会占内存。**dirty 升级为新 read 的时候**，要把这些 nil 清掉：
+
+```go
+// dirtyLocked: 从 read 重建 dirty
+func (m *Map) dirtyLocked() {
+    if m.dirty != nil { return }
+    read := m.read.Load()
+    m.dirty = make(map[any]*entry, len(read.m))
+    for k, e := range read.m {
+        if !e.tryExpungeLocked() {  // 把 nil entry 标为 expunged
+            m.dirty[k] = e           // 正常 entry 复制到 dirty
+        }
+        // expunged 的 entry 不进 dirty
+    }
+}
+```
+
+`tryExpungeLocked()` 用 CAS 把 `entry.p` 从 `nil` 改成 `&expunged`（特殊指针）。
+
+为什么要这一步？
+
+```
+如果不标 expunged:
+  ┌─────────────────────────────────────────────────────────┐
+  │ 1. Delete("k")            → read 里 entry.p = nil      │
+  │ 2. 重建 dirty             → 跳过 nil entry,dirty 没 "k"│
+  │ 3. Store("k", v2)         → 看到 read 里有 "k",CAS 改回 │
+  │                             entry.p = &v2  (无锁)        │
+  │ 4. dirty 升级为 read 时    → dirty 没 "k",但新 read 没 v2 │
+  │                                                           │
+  │ → 数据丢了 💥                                            │
+  └─────────────────────────────────────────────────────────┘
+
+有 expunged 标记:
+  3 步变成: Store 看到 entry.p = &expunged
+           → 走慢路径加锁, 把 entry 同步回 dirty
+           → 数据安全 ✓
+```
+
+**三态机制就是为了这种竞态保护**——expunged 是个"warning sign"：**别走快路径，先恢复到 dirty 再说**。
+
+---
+
+## 九、dirty 升级：read 怎么换新
+
+`Load` 没命中 read 时 `misses++`，达到阈值就把 dirty 整个升级为新的 read：
+
+```go
+func (m *Map) missLocked() {
+    m.misses++
+    if m.misses < len(m.dirty) { return }
+
+    // dirty 升级为 read
+    m.read.Store(&readOnly{m: m.dirty})
+    m.dirty = nil
+    m.misses = 0
+}
+```
+
+时间线：
+
+```
+初始状态:
+  read  = { "a": &eA, "b": &eB }     amended = false
+  dirty = nil
+
+Store("c", vC):  ① 第一次写新 key
+  → dirty 是 nil, 先从 read 复制构造 dirty:
+    dirty = { "a": &eA, "b": &eB, "c": &eC }
+  → read.amended = true
+
+Load("c"):  ② read 没命中, 去 dirty 找到, misses++
+  misses = 1
+
+... 多次 Load("c"), misses 累计到 len(dirty) = 3 ...
+
+第 N 次 Load("c"):  ③ 升级!
+  → read 变成 { "a", "b", "c" }, amended = false
+  → dirty = nil
+  → 之后 Load("c") 走快路径,无锁
+```
+
+**升级的代价**：
+- 触发：misses ≥ len(dirty)（一般也就上百次）
+- 成本：一次 `map` 整体拷贝 + 一次 `atomic.Store`
+- **频繁触发升级 = sync.Map 性能崩溃的原因**——这就是为什么"key 集合频繁变动"场景下 sync.Map 反而慢
+
+---
+
+## 十、为什么读多写少快、读写各半慢
+
+### 读多写少 ✅
+
+- 99% Load 走 `read.Load()` + map 查找——**完全无锁**
+- 只在第一次 Load 一个新 key 时短暂加锁
+- 几乎没有 dirty 重建
+
+### 写多 / key 集合频繁变化 ❌
+
+每次 Store 一个全新 key 都触发：
+
+```
+1. 加锁
+2. 检查 dirty 是否需要构造 (复制整个 read)
+3. read.amended = true 后, 之后所有"读 read 没命中"的 Load 都 misses++
+4. 累计到阈值,触发 dirty → read 升级 (又一次整体复制)
+5. 重置 dirty = nil, 下一个新 key 又得复制 read 构造 dirty
+```
+
+**就是在反复拷贝整个 map**。RWMutex + map 一次加锁开销远小于这个。
+
+### 读写各半 ❌
+
+read 经常没命中（因为新 key 没升级前不在 read），导致：
+- Load 频繁走 slow path 加锁
+- dirty 频繁升级
+
+性能比 RWMutex + map 还差。
+
+---
+
+## 十一、适用场景 & 反模式
+
+### ✅ 适用
+
+| 场景 | 为什么 |
+|---|---|
+| **配置缓存**（全程只读，启动时填充） | 100% 走 read 快路径 |
+| **长寿命缓存**（key 写一次后只读） | 同上 |
+| **goroutine 各自访问独立的 key 子集** | 写不会破坏其它 goroutine 的 read |
+
+### ❌ 反模式
+
+| 场景 | 后果 |
+|---|---|
+| 读写各半 | dirty 反复升级，比 mutex 慢 |
+| 大量 Delete | nil entry 堆积，read 越来越胖 |
+| 频繁加新 key | 每次都加锁，且不停升级 |
+| 需要 `len()` | sync.Map 没提供——`Range` 也不准（不能反映未升级的 dirty） |
+| 值类型敏感 | 值是 `any`，每次访问要类型断言 |
+
+---
+
+## 十二、Go 1.24+ 的新实现 (HashTrieMap)
+
+⚠️ **Go 1.24（2025 年）开始，sync.Map 切换到了基于 HashTrieMap 的全新实现**——基于无锁 trie，写性能也大幅提升，部分缓解了"写多场景慢"的问题。
+
+但**API 没变 + 适用场景指导仍然成立**：长寿命缓存最优，频繁写仍不如分片锁。
+
+> 本文讲的是 Go 1.9 ~ 1.23 的经典 double-store 实现——也是最常见面试题考察的版本。
+
+---
+
+## 十三、一图总结
+
+```
+                    sync.Map 核心思想
+                          │
+                          ▼
+              用空间换时间: 双 map + 双层间接
+                          │
+        ┌─────────────────┴─────────────────┐
+        ▼                                   ▼
+     read (只读)                         dirty (可写)
+     atomic.Pointer                      Mutex 保护
+     99% 走这条快路径                    新 key / 复活 expunged 走这
+        │
+        ▼
+   两个关键设计 (无锁读的物理基础)
+   ┌────────────────────────────────────────────────────┐
+   │ ① read 用 atomic.Pointer 包起来                    │
+   │    - 原子 Load/Store: 防撕裂 + 内存屏障保证发布安全 │
+   │    - read 这个 map 永不在原地改, 要换就整体替换    │
+   │                                                     │
+   │ ② map 值用 *entry 不是 entry                       │
+   │    - read 和 dirty 共享同一组 entry 对象           │
+   │    - 改值 = CAS entry.p, map 结构不动              │
+   │    - 让"软删除"成为可能                            │
+   └────────────────────────────────────────────────────┘
+        │
+        ▼
+   entry.p 的三态
+   ┌─────────────────────────────────────────────────┐
+   │ 正常值:   指向 value                            │
+   │ nil:      被 Delete (软删, 等下次升级时清理)     │
+   │ expunged: 已被"硬删" (dirty 里没有这个 entry)    │
+   └─────────────────────────────────────────────────┘
+        │
+        ▼
+   两阶段删除 + 升级
+   ┌──────────────────────────────────────────────┐
+   │ 1. Delete: entry.p = nil      (无锁,软删)    │
+   │ 2. 升级时: nil → expunged + 不放进新 dirty   │
+   │    misses ≥ len(dirty) → dirty 替换 read     │
+   └──────────────────────────────────────────────┘
+
+   性能法则:
+     读多写少 / 一次写后只读 → sync.Map 胜
+     读写各半 / 频繁加 key  → RWMutex+map 胜
+     需要 Len() / 精确 Range → 自己加锁
+```
+
+**一句话**：sync.Map = **read 无锁 + dirty 加锁** 的双 map 设计。
+
+无锁读的物理基础是两层间接：
+- **read 用 `atomic.Pointer` 包起来**——读到的指针永远完整，指向的对象永远构造完毕，且 read 这个 map **永不被原地修改**
+- **map 值是 `*entry`**——让 read 和 dirty 共享 entry 对象，改值只动 entry 内部的原子指针 `p`，不动 map 结构
+
+在此基础上，`entry.p` 的**三态**（正常 / nil / expunged）解决"read 不能改 + 删除/复活"的竞态。**只在"读多 + key 集合稳定"时占优**——其它场景慢于 RWMutex+map。Go 1.24 已换成新的 HashTrieMap 实现。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-map" data-base="../../"></script>
+</body>
+</html>

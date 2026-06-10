@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>分层存储与 Pulsar Functions · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 分层存储与 Pulsar Functions
+
+> 一句话：Pulsar 在「存算分离」之上又长出一圈生态——**分层存储**把冷数据自动卸载到对象存储以近乎无限保留、**Functions** 内置轻量流计算、**IO Connectors** 对接外部系统、**Geo-replication** 跨地域复制，合起来把它从「消息队列」抬成「统一消息 + 流 + 轻计算平台」。
+
+## 一、为什么这些能力长在 Pulsar 上
+
+这些能力不是凭空加的，它们都建立在 [存算分离](storage-compute.html) 这个底座上：存储（BookKeeper）和计算（Broker）解耦后，存储层就可以再往下接一层「更冷更便宜」的介质，计算层也可以再叠一层「轻量函数」而不影响消息主链路。
+
+```text
+              ┌──────────────────────────────────┐
+              │   统一平台：消息 + 流 + 轻计算     │
+              └──────────────────────────────────┘
+   Pulsar Functions  ── 轻量流计算（过滤/转换/路由）
+   Pulsar IO         ── Source / Sink 连接外部系统
+   Geo-replication   ── 跨集群异步复制（namespace 级）
+   ───────────────────────────────────────────────
+   Tiered Storage    ── 冷数据卸载到对象存储
+   BookKeeper        ── 热数据多副本（存算分离的“存”）
+   Broker            ── 无状态服务层（存算分离的“算”）
+```
+
+## 二、Tiered Storage（分层存储）
+
+### 解决什么问题
+
+BookKeeper 用本地盘 + 多副本保存所有消息，**保留越久越贵**。但很多场景里老消息只是「偶尔回放 / 合规留存」，没必要一直占着昂贵的 Bookie 磁盘。
+
+### 怎么做：冷数据自动 offload 到对象存储
+
+一个 Topic 的数据由若干 **Ledger** 串成（见 [BookKeeper 存储原理](bookkeeper.html)）。已经写满、被封闭（closed/sealed）的老 Ledger 是冷数据；Pulsar 会按策略把它们**整段卸载（offload）到对象存储**，卸载完成后再从 BookKeeper 删除本地副本。
+
+```text
+   一条 Topic 的日志（从老到新）
+   [Ledger0] [Ledger1] [Ledger2] ... [LedgerN-1] [LedgerN 当前在写]
+       │         │         │
+       │ 已封闭、判定为冷    │
+       ▼         ▼         ▼
+   ┌───────────────────────────┐   ┌──────────────────────────┐
+   │     对象存储（冷）         │   │   BookKeeper（热）        │
+   │  S3 / GCS / HDFS / Azure   │   │  最近的 Ledger，多副本    │
+   └───────────────────────────┘   └──────────────────────────┘
+```
+
+### 触发策略
+
+- **按 backlog 大小**：BookKeeper 上积压超过阈值就把最老的 Ledger 卸载；
+- **按时间 / 手动**：也可按时间或运维手动触发卸载。
+
+### 对客户端透明
+
+关键点：**消费端不需要知道数据在哪一层**。Broker 读取时，热数据从 BookKeeper 取、老数据自动从对象存储取，客户端只管按位置消费：
+
+```text
+   Consumer 从很老的位置开始读
+        │
+        ▼
+   Broker 判断该位置属于哪个 Ledger
+        ├─ 仍在 BookKeeper  → 直接读 Bookie
+        └─ 已 offload       → 从对象存储读回（对客户端无感）
+```
+
+### 价值
+
+- **降存储成本**：冷数据落到单价低得多的对象存储，且无需 Bookie 多副本占盘；
+- **近乎无限的消息保留**：保留时长不再被本地磁盘容量卡住，可做长期回放 / 合规归档；
+- **透明**：业务代码不感知分层，照常按 offset / 时间消费。
+
+> 注意：对象存储读取延迟高于本地盘，所以分层存储面向「冷数据偶尔回放」，热路径仍走 BookKeeper。
+
+## 三、Pulsar Functions（内置轻量流计算）
+
+很多流处理需求其实很轻：**过滤、字段转换、打标签、路由分发**。为这点逻辑单独搭一套 Flink / Storm 集群既重又费运维。Pulsar Functions 把这类轻计算**内置进平台**：
+
+```text
+   Topic in ──► [ Function：订阅 → 处理 → 写出 ] ──► Topic out
+                   一段你写的函数逻辑
+                   （Java / Python / Go）
+```
+
+- 一个 Function 订阅一个/多个**输入 Topic**，对每条消息执行你的逻辑，把结果写到**输出 Topic**；
+- 部署模型灵活：可跑在 Broker 内（嵌入）、独立进程，或交给 Function Worker / K8s 运行；
+- 定位是**轻量级**：适合无状态或轻状态的过滤 / 转换 / 富化 / 路由，**不替代** Flink 这类做复杂窗口、大状态、精确一次的重型流处理。
+
+一句话：Functions 让「简单流处理」不必再引入外部计算引擎。
+
+## 四、Pulsar IO（Connectors）
+
+Pulsar IO 是基于 Functions 框架的**连接器**体系，分两类，作用类似 Kafka Connect：
+
+| 类型 | 方向 | 作用 | 例子 |
+|------|------|------|------|
+| **Source** | 外部系统 → Pulsar | 把外部数据拉进 Topic | DB CDC、文件、Kafka |
+| **Sink** | Pulsar → 外部系统 | 把 Topic 数据写到外部 | ES、JDBC 数据库、对象存储 |
+
+```text
+   [ 外部系统 ] ──Source──► Topic ──Sink──► [ 外部系统 ]
+     MySQL/Kafka...                          ES / DB ...
+```
+
+好处：**无需自己写消费/生产胶水代码**，配置即可把 Pulsar 接入现有数据生态。
+
+## 五、Geo-replication（跨地域复制）
+
+把消息**异步复制到多个集群 / 机房**，用于多活与容灾。它在 **Namespace 级**配置——给某个 Namespace 指定要复制到哪些集群即可，无需逐 Topic 设置（Namespace 是策略的最小单位，见 [Pulsar 渐进式理解](deep-dive-overview.html)）。
+
+```text
+   ┌── Cluster A (北京) ──┐        ┌── Cluster B (上海) ──┐
+   │  namespace: app/prod │◄──────►│  namespace: app/prod │
+   │  Topic X             │ 异步   │  Topic X（副本）     │
+   └──────────────────────┘ 双向   └──────────────────────┘
+              复制开关在 namespace 上配置
+```
+
+- **异步复制**：本地写入不被远端阻塞，跨地域延迟不影响本地吞吐；
+- **多活 / 容灾**：多个集群都可读写，单机房故障时业务可切到他处；
+- 配合 [四种订阅模式](subscription.html) 与各集群本地消费，实现就近读写。
+
+## 六、合起来：差异化定位
+
+把本篇能力与底座能力叠在一起，就是 Pulsar 相对 Kafka 的差异化卖点：
+
+```text
+   多租户（Tenant / Namespace 原生隔离）
+        +
+   存算分离（弹性扩容、故障不搬数据）
+        +
+   分层存储（冷数据上对象存储 → 近乎无限保留 + 降本）
+        +
+   Functions / IO（内置轻计算 + 连接器）
+        +
+   Geo-replication（跨地域多活 / 容灾）
+   ─────────────────────────────────────
+   = “统一消息 + 流 + 轻计算平台”
+```
+
+> 这套组合是 Pulsar 的产品叙事；至于是否真的优于 Kafka，要分场景权衡 → 见 [Pulsar vs Kafka 怎么选](vs-kafka.html)。
+
+## 七、相关阅读
+
+- 底座：[存算分离：Broker 无状态 + BookKeeper](storage-compute.html)
+- 存储细节：[BookKeeper 存储原理](bookkeeper.html)
+- 消费模型：[四种订阅模式](subscription.html)
+- 扩容：[分区 Topic 与无缝扩容](partitioned-topic.html)
+- 选型：[Pulsar vs Kafka 怎么选](vs-kafka.html)
+- 总览：[Pulsar 渐进式理解](deep-dive-overview.html)
+
+## 一句话总结
+
+> 分层存储把冷 Ledger 透明卸载到对象存储（降本 + 近乎无限保留），Functions 提供内置轻量流计算，IO 提供 Source/Sink 连接器，Geo-replication 在 namespace 级做跨地域复制——这些建立在存算分离与多租户之上，把 Pulsar 定位成「消息 + 流 + 轻计算」的统一平台。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/tiered-storage" data-base="../"></script>
+</body>
+</html>

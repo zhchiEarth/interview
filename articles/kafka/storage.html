@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kafka 存储机制与 offset 查找 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Kafka 存储机制与 offset 查找
+
+> 一句话：每个 partition 是一串日志分段（segment），每段配一份稀疏索引，靠"二分定位 segment → 段内二分索引 → 顺序扫 .log"三步把按 offset 查消息做到 O(log N)。
+
+读完这篇你能答清楚：消息在磁盘上长什么样？给一个 offset，Kafka 怎么快速把那条消息捞出来？日志怎么清理？
+
+相关阅读：[Kafka 为什么这么快](performance.html)、[Kafka 知识地图](knowledge-graph.html)。
+
+---
+
+## 一、日志分段（log segment）：partition 不是一个大文件
+
+一个 partition 在物理上是磁盘上的**一个目录**（如 `orders-0/`），目录里不是一个巨型文件，而是**一串 segment**。每滚动出一个新段，就生成一组三件套：
+
+```text
+orders-0/                          ← 一个 partition 一个目录
+├── 00000000000000000000.log       数据：真正的消息
+├── 00000000000000000000.index     offset 索引（稀疏，offset → 物理位置）
+├── 00000000000000000000.timeindex 时间索引（稀疏，时间戳 → offset）
+├── 00000000000000368769.log       下一个 segment（文件名 = baseOffset）
+├── 00000000000000368769.index
+├── 00000000000000368769.timeindex
+└── ...                            （leader-epoch-checkpoint 等元数据略）
+```
+
+| 文件 | 内容 | 作用 |
+|---|---|---|
+| `.log` | 一条条消息（RecordBatch） | 真正的数据，**顺序追加** |
+| `.index` | (相对 offset → 物理 position) | 按 **offset** 查消息用 |
+| `.timeindex` | (时间戳 → 相对 offset) | 按**时间**查（如基于时间的 retention / seek） |
+
+关键点：
+
+- **文件名就是 baseOffset**：segment 文件名是该段**第一条消息的 offset**，左补 0 到 20 位。比如 `00000000000000368769.log` 表示这段从 offset 368769 开始。这是后面二分查找的基础。
+- **只有最后一段是 active（活跃段）**，正在被追加写；其余都是只读的已封存段。
+- **段满即滚动**：当 active 段达到 `log.segment.bytes`（默认 1GB）或到达 `log.roll.ms / log.roll.hours`（默认 7 天）时，封存当前段、新建下一段。
+- **索引内的 offset 是"相对 offset"**：`.index` 里存的是相对该段 baseOffset 的偏移（4 字节），而非完整 offset，省空间。
+
+---
+
+## 二、稀疏索引：不是每条都记
+
+如果每条消息都记一条索引，索引会大到离谱。Kafka 用**稀疏索引**：每**写入约 `log.index.interval.bytes`（默认 4KB）**的数据，才往 `.index` 里追加一条索引项。
+
+```text
+.log（数据，顺序追加）           .index（稀疏，只在每 ~4KB 处打一个点）
+┌─────────────────────────┐     ┌──────────────────────────────┐
+│ offset 0  @ pos 0        │ ◄── │ (相对offset 0)   → position 0  │
+│ offset 1  @ pos 120      │     │                                │
+│ ...（约 4KB 数据）...     │     │                                │
+│ offset 37 @ pos 4096     │ ◄── │ (相对offset 37)  → position 4096│
+│ offset 38 @ pos 4210     │     │                                │
+│ ...                      │     │ (相对offset 75)  → position 8192│ ◄──
+└─────────────────────────┘     └──────────────────────────────┘
+```
+
+- **索引项格式**：`(相对 offset 4 字节, 物理 position 4 字节)`，每条仅 8 字节，极省空间。
+- **稀疏的代价很小**：查找时索引只把你"送到附近"，最后一小段（最多约 4KB）靠**顺序扫 `.log`** 走完——而顺序读本就是 Kafka 最擅长的（见 [为什么这么快](performance.html)）。
+- **索引文件用 mmap**：`.index` 通过内存映射访问，二分查找几乎全在内存里完成。
+- `.timeindex` 同理稀疏，存 `(时间戳, 相对 offset)`，按时间定位时先用它找到 offset，再走下面的 offset 查找流程。
+
+---
+
+## 三、按 offset 查消息：O(log N) 三步走（重点）
+
+给定要查的目标 offset（例如 **368776**），Kafka 这样定位：
+
+```text
+目标 offset = 368776
+
+第①步：在"段文件名（baseOffset）"上二分，定位到所在 segment
+   段列表（baseOffset）: [0]  [368769]  [737913] ...
+                              └── 368769 ≤ 368776 < 737913
+                                  → 落在 00000000000000368769 这一段
+                                       O(log 段数)
+
+第②步：算相对 offset，在该段 .index 里二分，找 ≤ 目标的最近索引项
+   相对 offset = 368776 - 368769 = 7
+   .index: (0→pos0) (4→pos300) (7→pos640) (11→pos980) ...
+                                  └── 找到 ≤ 7 的最大项：(7 → pos 640)
+                                       O(log 索引项数)
+
+第③步：从该物理 position 在 .log 里顺序扫到目标 offset
+   .log 从 pos 640 开始往后读：offset 7 → 8 → ... 直到命中 368776
+                                       顺序读，最多扫 ~一个索引间隔（约 4KB）
+```
+
+三步合起来：
+
+| 步骤 | 操作 | 复杂度 |
+|---|---|---|
+| ① 定位 segment | 在 segment 的 baseOffset 上二分 | O(log 段数) |
+| ② 段内定位 | 在该段 `.index` 里二分，找 **≤ 目标** 的最近项 | O(log 索引项数) |
+| ③ 顺序扫 | 从索引给的 position 在 `.log` 顺序扫到目标 | O(1)，常数级（~一个索引间隔） |
+
+> 整体 **O(log N)**。两次二分（选段 + 段内选索引项）是对数级，最后一步是常数级顺序扫。这正是"稀疏索引 + 顺序读"的精妙之处：索引小、定位快，剩下的交给 Kafka 最擅长的顺序读补完。
+
+---
+
+## 四、顺序写 + Page Cache + 零拷贝：呼应"为什么这么快"
+
+存储这套设计和性能是一体两面，这里只点一下，详见 [Kafka 为什么这么快](performance.html)：
+
+- **顺序写**：`.log` 永远追加到 active 段末尾 → 随机 IO 变顺序 IO。
+- **Page Cache**：读写都走操作系统页缓存，不在 JVM 堆里管数据，免 GC、重启不丢缓存。
+- **零拷贝（sendfile）**：消费时数据从 Page Cache 经 DMA 直达网卡，不进用户态。
+- **稀疏索引用 mmap**：索引内存映射，二分查找几乎不碰磁盘。
+
+---
+
+## 五、日志清理两策略：delete 与 compact
+
+磁盘不能无限涨，Kafka 用后台 LogCleaner / 清理线程清理旧数据。由 `log.cleanup.policy` 决定策略，可取 `delete`、`compact`，或二者并用。
+
+```text
+log.cleanup.policy = delete    （按时间/大小保留，整段删）
+log.cleanup.policy = compact   （同 key 只留最新值）
+log.cleanup.policy = compact,delete  （两者并用）
+```
+
+### 5.1 delete：按 retention 保留
+
+到期或超量的**整段 segment 直接删除**（不会删半个段）。常用参数：
+
+| 参数 | 含义 |
+|---|---|
+| `log.retention.hours`（默认 168h = 7 天） | 按**时间**保留 |
+| `log.retention.bytes` | 按**总大小**保留（单 partition） |
+| `log.segment.bytes` | 段大小，决定删除粒度 |
+
+> 适合大多数业务流水/事件流：我只关心近期数据，旧的直接丢。
+
+### 5.2 compact：log compaction，同 key 只留最新值
+
+不按时间删，而是**保证每个 key 至少保留其最新一条 value**；同一 key 的旧值会被清理掉。删除某 key 用**墓碑消息（tombstone，value=null）**标记，过一段时间后连墓碑一起清掉。
+
+```text
+压缩前（同 key 多个版本）        压缩后（同 key 只留最新）
+k1=v1                            k1=v3
+k2=va           ──compact──►     k2=vb
+k1=v2                            k3=null（墓碑，待清理后彻底消失）
+k1=v3
+k2=vb
+k3=v9
+k3=null  ← 删除标记
+```
+
+- **适合 changelog / 状态类**数据：你只关心"每个 key 的当前值"，不关心历史变更过程。
+- **`__consumer_offsets` 就用 compact**：消费位点是"每个 (group, topic, partition) 的最新 offset"，天然是 key→最新值 的语义。Kafka Streams 的状态存储（changelog topic）也用它。
+
+| 维度 | delete | compact |
+|---|---|---|
+| 保留依据 | 时间 / 大小 | 每个 key 的最新值 |
+| 会丢历史吗 | 旧数据整段删 | 同 key 旧值删、最新值留 |
+| 典型场景 | 日志、事件流、监控数据 | changelog、状态、`__consumer_offsets` |
+
+---
+
+## 一句话总结
+
+> partition = 一串 **segment（.log + .index + .timeindex）**，段满（`log.segment.bytes`）就滚动；`.index` 是每 ~4KB 一条 `(相对offset → position)` 的**稀疏索引**。按 offset 查 = **段名二分选段 → 段内 .index 二分 → .log 顺序扫**，整体 **O(log N)**。清理两策略：`delete` 按时间/大小保留、`compact` 同 key 留最新（`__consumer_offsets` 即用它）。底层全程吃顺序写 + Page Cache + 零拷贝的红利。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/storage" data-base="../"></script>
+</body>
+</html>

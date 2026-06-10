@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>range 的几个坑 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# range 的几个坑
+
+## 一、range 是干嘛的
+
+Go 的 `for range` 是**遍历集合的语法糖**：
+
+```go
+for i, v := range collection {
+    // ...
+}
+```
+
+支持的集合类型：
+
+| 类型 | i 是什么 | v 是什么 |
+|---|---|---|
+| `array` / `slice` | index (int) | 元素的**拷贝** |
+| `string` | byte index (int) | rune (int32, 解码 UTF-8) |
+| `map` | key | value 的**拷贝** |
+| `chan` | （无）| 收到的值 |
+| `int`（Go 1.22+） | 0, 1, ..., n-1 | （无） |
+| `func`（Go 1.23+）| iter.Seq 返回的值 | |
+
+→ 看着简单，但每一种都有自己的坑——下面 7 个坑覆盖了 95% 的踩坑场景。
+
+---
+
+## 二、底层模型：range 怎么求值
+
+理解所有坑的关键：**range 在循环开始前就把表达式求值并保存了**。
+
+```go
+s := []int{1, 2, 3}
+for i, v := range s {  // ← 这里把 s 的 header 拷贝到内部隐藏变量
+    s = append(s, 99)  // 改 s 不影响这次循环!
+}
+// 输出: 0 1 / 1 2 / 2 3  (只遍历原始的 3 个)
+```
+
+伪代码展开：
+
+```go
+// for i, v := range s 等价于:
+{
+    _s := s               // 拷贝 s 的 header
+    _len := len(_s)
+    for _i := 0; _i < _len; _i++ {
+        i, v := _i, _s[_i]
+        // ... 循环体 ...
+    }
+}
+```
+
+**结论**：
+
+- 遍历**长度**和**header** 在开始时就定了
+- 但 `s[_i]` 还是按当前内存读——所以**修改元素值会被看到**
+- map / channel 没这种"固定长度"的概念，行为略有不同
+
+---
+
+## 三、7 个核心坑
+
+### 坑 1：range 是值拷贝，不是引用
+
+```go
+type Big struct {
+    data [1024]byte
+}
+arr := []Big{{}, {}, {}}
+
+// ❌ 每轮拷贝 1KB!
+for _, v := range arr {
+    process(&v)        // 拿到的是拷贝的地址, 不是原元素
+}
+
+// ✓ 用索引
+for i := range arr {
+    process(&arr[i])   // 拿到的是真实元素的地址
+}
+```
+
+**修元素值要用索引**：
+
+```go
+// ❌ 改不动
+for _, v := range arr {
+    v.field = 99       // 改的是拷贝
+}
+
+// ✓
+for i := range arr {
+    arr[i].field = 99
+}
+```
+
+性能影响：大 struct 时拷贝开销显著。**热路径上对大对象集合用 `for i := range`** 而不是 `for _, v := range`。
+
+### 坑 2：循环变量复用（Go 1.22 修复）
+
+```go
+// ❌ Go 1.21 及之前
+var ps []*int
+for _, v := range []int{1, 2, 3} {
+    ps = append(ps, &v)   // 三个指针都指向同一个 v!
+}
+// Go 1.21-: ps = [&v, &v, &v], 最后 v=3 → 都打印 3
+// Go 1.22+: 每轮独立 v → ps 是三个不同地址,打印 1 2 3
+```
+
+**Go 1.22 修复了这个坑**——`for range` 和 `for i := 0; ...` 都改为**每轮独立变量**。
+
+但有两个注意：
+
+- **依赖 1.22 的代码**：在 `go.mod` 里写 `go 1.22` 或更高
+- **老项目**：仍然踩坑，要么升级，要么显式拷贝：
+
+```go
+for _, v := range s {
+    v := v             // 显式重新声明, 任何 Go 版本都安全
+    go func() { use(&v) }()
+}
+```
+
+### 坑 3：map 遍历顺序随机
+
+```go
+m := map[string]int{"a": 1, "b": 2, "c": 3}
+for k, v := range m {
+    fmt.Println(k, v)   // 每次顺序不同!
+}
+```
+
+**Go runtime 故意打乱**——避免代码依赖遍历顺序导致扩容后行为变化。
+
+**需要稳定顺序**：
+
+```go
+keys := make([]string, 0, len(m))
+for k := range m {
+    keys = append(keys, k)
+}
+sort.Strings(keys)
+for _, k := range keys {
+    fmt.Println(k, m[k])
+}
+
+// 或者 Go 1.23+:
+for _, k := range slices.Sorted(maps.Keys(m)) {
+    fmt.Println(k, m[k])
+}
+```
+
+### 坑 4：边遍历边改 map
+
+```go
+for k := range m {
+    if cond(k) {
+        m[k+"new"] = ...    // ⚠️ Go spec: 未定义行为
+        delete(m, k)         // ⚠️ 也是
+    }
+}
+```
+
+行为：
+
+- **删除当前 key** → 合法，元素不会再被遍历到（spec 明确规定）
+- **新增 key** → spec **未定义**——可能这一轮被遍历到，可能不会
+- **修改 value** → 一般没事，但避免依赖此行为
+
+**安全模式**：
+
+```go
+// 先收集要改的 key, 遍历后批量改
+toAdd := map[string]int{}
+toDel := []string{}
+
+for k, v := range m {
+    if needAdd(k, v) { toAdd[k+"new"] = v }
+    if needDel(k)    { toDel = append(toDel, k) }
+}
+
+for k, v := range toAdd { m[k] = v }
+for _, k := range toDel { delete(m, k) }
+```
+
+### 坑 5：边遍历边改 slice
+
+```go
+s := []int{1, 2, 3}
+for i, v := range s {
+    s = append(s, v*10)   // ⚠️ 改的是 s, 但 range 用的是开始时拷贝的 header
+}
+// 循环只跑 3 次, 不会无限循环
+// 结束后 s = [1,2,3,10,20,30]
+```
+
+**range 内部用的是开始时的 header 拷贝**，所以 append 不影响这次循环——但要意识到。
+
+**真的想边遍历边修改长度**：用 `for i := 0; i < len(s); i++`（这种 `len(s)` 每轮求值）。
+
+### 坑 6：range channel 一直阻塞直到 close
+
+```go
+ch := make(chan int, 3)
+ch <- 1; ch <- 2; ch <- 3
+
+for v := range ch {
+    fmt.Println(v)     // 打印 1 2 3, 然后阻塞!
+}
+// 没人 close(ch) → 永远阻塞在这里
+```
+
+**`for range ch` 必须等 channel 被 close 才退出**——否则会永远阻塞。
+
+修法：发送方 `defer close(ch)`：
+
+```go
+go func() {
+    defer close(ch)
+    for _, v := range values {
+        ch <- v
+    }
+}()
+for v := range ch {   // close 后自动退出
+    use(v)
+}
+```
+
+详见 [Channel 底层实现与安全关闭](../../channel/internals.html)。
+
+### 坑 7：range string 解码 UTF-8
+
+```go
+s := "héllo"
+for i, r := range s {
+    fmt.Printf("%d: %c\n", i, r)
+}
+// 0: h
+// 1: é     ← 注意 i 是字节索引, 'é' 占 2 字节
+// 3: l     ← 跳到了 3, 不是 2
+// 4: l
+// 5: o
+```
+
+`for i, r := range s`：
+
+- `i` 是**字节索引**（不是字符索引）
+- `r` 是 **rune**（int32），自动解码 UTF-8
+
+**对比按字节遍历**：
+
+```go
+for i := 0; i < len(s); i++ {
+    b := s[i]    // byte (uint8), 不解码
+}
+// 0: h
+// 1: 0xc3   ← é 的第 1 字节
+// 2: 0xa9   ← é 的第 2 字节
+// 3: l
+// 4: l
+// 5: o
+```
+
+→ 要 rune 用 range，要 byte 用 `s[i]`。
+
+---
+
+## 四、Go 1.22 / 1.23 的 range 升级
+
+### Go 1.22：循环变量 + range int
+
+```go
+// ① 循环变量每轮独立 (修复坑 2)
+for _, v := range s {
+    go func() { use(v) }()   // 现在安全
+}
+
+// ② range over int (新)
+for i := range 5 {
+    fmt.Println(i)   // 0 1 2 3 4
+}
+// 等价于 for i := 0; i < 5; i++
+```
+
+### Go 1.23：range over function
+
+```go
+// ③ range over function (iter.Seq)
+import "iter"
+
+func Numbers() iter.Seq[int] {
+    return func(yield func(int) bool) {
+        for i := 1; i <= 5; i++ {
+            if !yield(i) { return }
+        }
+    }
+}
+
+for n := range Numbers() {
+    fmt.Println(n)   // 1 2 3 4 5
+}
+```
+
+这是 Go 把"迭代器"做成语言级原语——之前都靠 channel 模拟。
+
+---
+
+## 五、性能：range vs 普通 for
+
+```go
+// 1) for i := range s   (索引, 不取值)
+//    完全等价 for i := 0; i < len(s); i++
+
+// 2) for i, v := range s   (取值)
+//    每轮 v = s[i] (拷贝)
+//    大对象拷贝有开销
+
+// 3) for i := 0; i < len(s); i++
+//    每轮重新求 len(s) (但编译器一般能优化成常量)
+```
+
+**结论**：性能基本一致，对**大对象集合**用 `for i := range s` 避免拷贝。
+
+---
+
+## 六、实战 checklist
+
+写 range 时过一遍：
+
+```
+☐ 1. 修改元素值? → 用 for i := range, 改 s[i]
+☐ 2. 大对象集合? → 用 for i := range 避免拷贝
+☐ 3. 在 goroutine / 闭包里捕获循环变量? → Go 1.22+ 安全, 老版本要 v := v
+☐ 4. map 遍历? → 顺序随机, 需要稳定就抽 key 排序
+☐ 5. 边遍历边改 map? → 用收集 + 批量改
+☐ 6. range channel? → 确保发送方会 close, 否则永远阻塞
+☐ 7. range string? → i 是字节索引, r 是 rune
+```
+
+---
+
+## 七、一图总结
+
+```
+                  range 的本质
+                        │
+              "在循环开始时, 求值并保存表达式"
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+   slice/array:                    map:
+     拷贝 header                     无固定长度
+     长度循环开始时定                顺序随机 (故意打乱)
+     v 是元素拷贝                    边改 → 未定义行为
+
+   string:                         channel:
+     i 是字节索引                    阻塞等 close
+     r 是 rune (自动解码 UTF-8)      没 close → 死循环
+
+   int (1.22+):                    func (1.23+):
+     range 5 = 0..4                  iter.Seq 迭代器
+
+   7 个核心坑:
+   ────────────────────────────────────────
+   1. range 是拷贝 → 大对象用 for i := range
+   2. 循环变量复用 (Go 1.22 修复)
+   3. map 顺序随机 → 抽 key 排序
+   4. 边遍历边改 map → 收集 + 批量改
+   5. 边遍历边改 slice → range 用开始时的 header
+   6. range chan 等 close → 发送方必 close
+   7. range string i 是字节索引, r 是 rune
+
+   Go 1.22+ 升级:
+   ────────────────────────────────────────
+   循环变量每轮独立        (修复闭包捕获坑)
+   range 整数 (range 5)    (新语法)
+   1.23 加了 range 函数    (iter.Seq)
+```
+
+**一句话**：`range` 不是简单的"遍历"——它在**循环开始时拷贝表达式 header**，每轮的 v 也是**拷贝**；map 顺序随机、channel 阻塞等 close、string 按 rune 解码。**Go 1.22 修复了循环变量复用**这个最老的坑，但其它 6 个坑仍然存在——按 checklist 过一遍写 range 就稳了。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/range-gotchas" data-base="../../"></script>
+</body>
+</html>

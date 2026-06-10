@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cgo 的开销与坑 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# cgo 的开销与坑
+
+> 一句话：cgo 让 Go 调 C，但每次调用要切到 g0 栈、跨调度器边界，开销 ~50ns~200ns；高频路径上慎用。
+
+## 用法
+
+```go
+/*
+#include <stdio.h>
+void hello() { printf("hi\n"); }
+*/
+import "C"
+
+func main() {
+    C.hello()
+}
+```
+
+## 调用一次发生什么
+
+```text
+Go 函数
+  ↓
+cgo 包装函数
+  ↓ 切到 g0（系统栈）
+  ↓ 调度器把当前 G 标记 _Gsyscall（C 期间不让 GC 移栈）
+  ↓
+C 函数
+  ↓
+返回 → 切回 G 栈 → 检查抢占 → 继续
+```
+
+每次调用：**切栈 + 调度器登记 + 屏蔽 GC**。开销远大于普通函数（ns 级 → 几十 ns 级）。
+
+## 5 个坑
+
+1. **C 栈不会增长**：默认 8MB；C 内部递归深要小心
+2. **goroutine 不能在 C 里被抢占**：sysmon 看不到，长跑 C 影响 GC
+3. **指针传递要小心**：Go 指针传给 C 必须保证 C 调用期间不动；Go 1.6+ 有 cgocheck
+4. **C 函数不能持有 Go 指针超过返回**：否则 GC 后野指针
+5. **跨语言 panic / signal 处理混乱**：C 里 SIGSEGV 别指望 Go recover
+
+## 怎么减少开销
+
+- 批量调用：一次调 C 处理 1000 个，比调 1000 次便宜
+- 别在热路径上 cgo
+- 能用纯 Go 库（即使略慢）就别 cgo
+
+## 编译影响
+
+- 触发 cgo 的项目编译要 gcc/clang
+- 交叉编译变难
+- 二进制依赖 libc（不再是纯静态）
+
+## 一句话总结
+
+> cgo = 切栈 + 调度边界 + GC 屏蔽，开销几十 ns；批量化 + 避开热路径，能不用就别用。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/cgo" data-base="../../"></script>
+</body>
+</html>

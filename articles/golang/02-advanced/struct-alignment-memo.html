@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>struct 内存对齐 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# struct 内存对齐 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **CPU 按对齐边界批量读内存，编译器自动插 padding 保证「字段 offset = 对齐倍数 + struct 总大小 = 最大对齐倍数」**；字段**按对齐大小从大到小排**消掉中间 padding（例 24→16 字节，省 33%），`go vet -fieldalignment` 自动查；**高并发反过来：故意 padding 到 64 字节 cache line 防 false sharing**。
+
+记不全时，按这条**记忆主线：两条铁律 + 从大到小重排 + 两个反例外**展开（详细推演看[正文](struct-alignment.html)）：
+
+---
+
+## 📏 两条铁律 —— offset 与总大小
+
+```text
+① 每个字段 offset 必须是其对齐边界的整数倍
+② struct 总大小必须是「最大字段对齐」的整数倍
+```
+- 对齐边界：`int64`/指针/`string`(16B)/`slice`(24B)/`interface`(16B) → **8**；`int32`/`rune`/`float32` → 4；`int16` → 2；`bool`/`byte` → 1。
+- 嵌套 struct 当作「对齐=其最大字段对齐」的整块，不打散。
+
+## 🔽 从大到小重排 —— 消中间 padding
+
+```go
+// ❌ Bad: 24 字节         // ✓ Good: 16 字节
+type Bad struct {          type Good struct {
+    a bool   // 0,+7pad        b int64 // 0
+    b int64  // 8              a bool  // 8
+    c bool   // 16,+7pad       c bool  // 9, 末尾+6pad
+}                          }
+```
+- 把字段按对齐大小**从大到小**排 → **最多只浪费末尾 7 字节**，无中间 padding。
+- 看大小：`unsafe.Sizeof`（最常用）/ `Alignof` / `Offsetof`。
+- 工具直接给最优顺序：`go vet -fieldalignment ./...`。
+
+## ⚠️ 两个反例外 —— 该管时反着来
+
+```go
+// ① 防 false sharing: 故意撑满 64B cache line
+type PaddedCounter struct {
+    count uint64
+    _     [56]byte   // 凑齐 64 字节 = 1 cache line
+}
+// runtime.mutex / sync.Pool.local 都用此招
+
+// ② 32 位系统 64 位原子: 用 atomic.Int64 强制 8 字节对齐
+type Good struct {
+    flag  bool
+    count atomic.Int64   // 含 align64, 否则 AddInt64 可能 panic
+}
+```
+- 何时必管：**百万实例 struct**（每个省 8B = 省 8MB）、`vet` 提示 > 16 字节差异。
+- 何时不管：小数据 / 临时变量 / 可读性优先的业务 struct（按逻辑分组排即可）。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/struct-alignment-memo" data-base="../../"></script>
+</body>
+</html>

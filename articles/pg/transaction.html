@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>事务与隔离级别（含 SSI） · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 事务与隔离级别（含 SSI）
+
+> 一句话：PG 实际只实现 **3 个**隔离级别——**Read Committed（默认，每条语句一个快照）/ Repeatable Read（其实是快照隔离，整事务一个快照，连幻读都防住但有写偏序）/ Serializable（用 SSI 在快照隔离上追踪读写依赖、检测危险结构后回滚一方，得到真正可串行化）**；底层全靠 MVCC 快照。
+
+> 本文以 PostgreSQL **PG 16** 为基准（SSI 自 PG 9.1 起，机制至今稳定）。快照、xmin/xmax、版本如何在堆表里存放见 [MVCC 与 VACUUM](mvcc-vacuum.html)。
+
+## 一、ACID 一句话
+
+事务(Transaction)是一组"要么全成、要么全不成"的操作，四个特性：
+
+| 特性 | 一句话 | PG 靠什么 |
+|---|---|---|
+| **原子性** Atomicity | 全做或全不做，失败能回滚 | MVCC + 提交/回滚（回滚即让本事务产生的元组对所有人不可见） |
+| **一致性** Consistency | 把库从一个合法状态带到另一个合法状态 | 是**结果**，由 A/I/D + 约束(约束/触发器) 共同达成 |
+| **隔离性** Isolation | 并发事务互不干扰 | **MVCC 快照** + 必要时加锁 / SSI 依赖追踪 |
+| **持久性** Durability | 提交后永不丢，宕机可恢复 | **WAL（Write-Ahead Log，预写日志）** 先写日志再刷盘 |
+
+## 二、并发会出什么问题（三类经典异常）
+
+不做隔离，并发读写同一数据会出三类经典异常（账户 `balance` 初始 100）：
+
+### 2.1 脏读（Dirty Read）：读到别人**未提交**的数据
+
+```sql
+-- 事务A                                  -- 事务B
+                                          BEGIN;
+                                          UPDATE acc SET balance=200 WHERE id=1;
+BEGIN;
+SELECT balance FROM acc WHERE id=1;       -- 读到 200（B 还没提交！）
+                                          ROLLBACK;   -- 200 从未真正存在
+-- A 拿着一个幻影值做决策 → 脏读
+```
+
+### 2.2 不可重复读（Non-Repeatable Read）：同一行两次读不同
+
+```sql
+-- 事务A                                  -- 事务B
+BEGIN;
+SELECT balance FROM acc WHERE id=1;       -- 100
+                                          UPDATE acc SET balance=200 WHERE id=1;
+                                          COMMIT;
+SELECT balance FROM acc WHERE id=1;       -- 又读到 200，同一事务内不一致
+-- 针对"已存在行"被 UPDATE/DELETE 改 → 不可重复读
+```
+
+### 2.3 幻读（Phantom Read）：同一范围查询行数变了
+
+```sql
+-- 事务A                                  -- 事务B
+BEGIN;
+SELECT count(*) FROM acc WHERE balance>50;  -- 3 行
+                                          INSERT INTO acc VALUES(99, 80);
+                                          COMMIT;
+SELECT count(*) FROM acc WHERE balance>50;  -- 4 行，多出"幻影行"
+-- 针对范围内"行数变化"(INSERT/DELETE) → 幻读
+```
+
+### 2.4 预告：写偏序（Write Skew）——快照隔离也防不住
+
+还有一类更隐蔽的异常，它**不属于上面三种**，单靠快照隔离防不住：**写偏序(write skew)**。两个事务各自读了一份重叠的数据、基于这份读各自更新了**不同的行**，单看每个事务都合法，合起来却破坏了业务不变式。第五节用"两个医生同时请假"的经典例子展开——它正是 PG 需要 **SSI** 的根本原因。
+
+## 三、PG 实际只有 3 个隔离级别
+
+SQL 标准定义 4 个隔离级别，但 **PG 实际只实现 3 个**：
+
+| 隔离级别 | PG 是否独立实现 | 实现方式 | 脏读 | 不可重复读 | 幻读 | 写偏序 |
+|---|---|---|---|---|---|---|
+| Read Uncommitted | **❌ 不独立存在**，等同 RC | —— | ✅ 防住 | ❌ | ❌ | ❌ |
+| **Read Committed**（默认） | ✅ | **每条语句一个新快照** | ✅ | ❌ | ❌ | ❌ |
+| **Repeatable Read** | ✅ | **快照隔离(SI)**，整事务一个快照 | ✅ | ✅ | ✅**(防住)** | ❌ |
+| **Serializable** | ✅ | **SSI**（SI + 读写依赖追踪） | ✅ | ✅ | ✅ | ✅**(防住)** |
+
+> **PG 没有独立的 Read Uncommitted**：请求它会被静默当作 **Read Committed**。因为 PG 的 MVCC 从不读未提交版本，物理上就读不到脏数据，所以"最低也是 RC"。
+
+### 3.1 Read Committed（默认）：每条语句一个快照
+
+PG 默认级别。**每条 SQL 语句开始执行时都新建一个快照**，只看该时刻已提交的数据。后果：
+
+- 防住**脏读**（只读已提交）；
+- **挡不住不可重复读 / 幻读**：同一事务里两条语句之间，别的事务一提交，你下条语句就看到新值。
+
+```sql
+-- 事务A (Read Committed)               -- 事务B
+BEGIN;
+SELECT balance FROM acc WHERE id=1;     -- 100（语句①的快照）
+                                        UPDATE acc SET balance=200 WHERE id=1;
+                                        COMMIT;
+SELECT balance FROM acc WHERE id=1;     -- 200（语句②的新快照）→ 不可重复读
+COMMIT;
+```
+
+### 3.2 Repeatable Read：在 PG 里其实是"快照隔离(Snapshot Isolation)"
+
+PG 的 RR **不是** SQL 标准教科书里那个"只防不可重复读"的 RR，而是**快照隔离(SI)**：
+
+- **整个事务只在第一条语句时取一个快照，全程复用**（设置时机：第一次实际访问数据，使用 `SET TRANSACTION` 或 `BEGIN ... ISOLATION LEVEL REPEATABLE READ`）。
+- 因为整事务看的是同一个冻结的快照，所以**不可重复读和幻读都防住了**——别人后来提交的任何 INSERT/UPDATE/DELETE 都不在我的快照里。
+
+```sql
+-- 事务A (Repeatable Read)              -- 事务B
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM acc WHERE balance>50;  -- 3 行, 此刻冻结快照
+                                        INSERT INTO acc VALUES(99,80);
+                                        COMMIT;
+SELECT count(*) FROM acc WHERE balance>50;  -- 仍 3 行（复用快照）→ 幻读被防住
+COMMIT;
+```
+
+> 与 MySQL 的差异：MySQL InnoDB 默认就是 RR，靠 **MVCC（快照读）+ next-key lock（当前读）** 防幻读；PG 的 RR 是纯快照隔离，**快照层面**天然看不到幻影行，但代价是写写冲突时会直接报错(见下)。
+
+**RR 下的写写冲突 = serialization failure**：两个 RR 事务更新同一行，后提交者会撞到"无法在快照上序列化此更新"而报错回滚，应用需**重试**。
+
+```text
+   ERROR: could not serialize access due to concurrent update    -- RR 写写冲突
+   SQLSTATE 40001  → 应用层应捕获并重试整个事务
+```
+
+### 3.3 RR 防不住写偏序 → 需要 Serializable
+
+快照隔离能防三类经典异常，但**防不住写偏序**——这正是它和"真正可串行化"的差距。下一节展开。
+
+## 四、写偏序(Write Skew)：快照隔离的盲区（经典例子）
+
+**场景**：医院规定"任意时刻至少要有 1 名医生在岗(on call)"。当前 Alice、Bob 两人都在岗。两人**同时**各自发起请假事务：
+
+```sql
+-- 不变式: 在岗人数 >= 1
+-- 事务A (Alice 请假, RR)                  -- 事务B (Bob 请假, RR)
+BEGIN ISOLATION LEVEL REPEATABLE READ;     BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- 读: 在岗人数 = 2 (Alice,Bob)            -- 读: 在岗人数 = 2 (Alice,Bob)
+SELECT count(*) FROM doctors               SELECT count(*) FROM doctors
+  WHERE on_call=true;        -- 2           WHERE on_call=true;        -- 2
+-- "还有 Bob 在, 我能走"                    -- "还有 Alice 在, 我能走"
+UPDATE doctors SET on_call=false           UPDATE doctors SET on_call=false
+  WHERE name='Alice';                        WHERE name='Bob';
+COMMIT;                                    COMMIT;
+-- 结果: 两人都下班了, 在岗人数 = 0 ❌ 不变式被破坏!
+```
+
+```text
+   两个事务各读了同一份快照(在岗=2), 各更新了"不同的行"(A 改 Alice, B 改 Bob),
+   单独看每个事务都合法 → 不构成"更新同一行"的写写冲突 → SI 检测不到 → 都提交成功
+   合起来却违反了"至少 1 人在岗" → 这就是写偏序 write skew
+```
+
+- **为什么 RR(SI) 防不住**：两个事务没改同一行，没有直接写写冲突；它们的"冲突"藏在**一个读了对方将要改的数据**这种**读写依赖**里，而 SI 只看快照、不追踪这种跨事务的读写依赖。
+- **真正可串行化**要求结果等价于"两个事务依次执行"——那样第二个请假的人会读到在岗只剩 1 人而被业务逻辑拦下。PG 的 **Serializable** 就是为捕获这种异常而生。
+
+## 五、Serializable：SSI（可串行化快照隔离，重点）
+
+PG 的 Serializable 用 **SSI（Serializable Snapshot Isolation，可串行化快照隔离）**实现。它**不是**靠"把所有事务排队加锁串行执行"(那样并发极差)，而是在**快照隔离的基础上**做运行时检测：
+
+```text
+   SSI = 快照隔离(并发好, 读不加锁) + 运行时追踪事务间的"读写依赖" + 检测危险结构后回滚一方
+```
+
+### 5.1 SSI 怎么工作
+
+1. **照常用快照隔离跑**：读不加阻塞锁，并发性接近 RR。
+2. **追踪读写依赖(rw-dependency)**：用一种特殊的**谓词锁(predicate lock，SIREAD 锁，只记录"读过什么"，不阻塞别人)**记录每个事务读了哪些数据；当另一个事务写了你读过的数据，就形成一条 **rw 依赖边**(T1 读的东西被 T2 改了，等价于"在可串行化顺序里 T1 应排在 T2 前")。
+3. **检测危险结构**：理论证明，不可串行化的执行里**一定存在一个特定的"危险结构"**——同一个事务上同时存在**一进一出两条 rw 依赖边**（一个 pivot 事务，既有事务依赖它、它又依赖另一个事务），即读写依赖形成的**环**的征兆。
+4. **检测到就回滚其中一个事务**：报 serialization failure，让应用重试。没检测到危险结构的事务正常提交。
+
+```text
+   危险结构 (导致不可串行化的必要征兆):
+
+        rw          rw
+   T_in ───► T_pivot ───► T_out      ← T_pivot 同时是某条 rw 边的"入"和另一条的"出"
+                                        SSI 一旦发现这种结构, 回滚其中一个事务
+
+   回到写偏序例子: A 读了 Bob 的状态(被 B 改) , B 读了 Alice 的状态(被 A 改)
+   → A→B 和 B→A 两条 rw 边构成环 → SSI 检测到 → 回滚一方 → 不变式得救 ✅
+```
+
+### 5.2 好处与代价
+
+| | 说明 |
+|---|---|
+| **好处** | **不靠加阻塞锁就实现真正可串行化**——读不加锁、写不被读阻塞，并发远好于"靠 Serializable 锁串行"的传统做法；能防住**包括写偏序在内的所有**异常 |
+| **代价** | 可能产生 **serialization failure（SQLSTATE 40001）**——SSI 为安全宁可"误杀"(有少量假阳性回滚)；应用**必须实现重试逻辑**；高冲突场景重试率高、吞吐下降；谓词锁有内存开销 |
+
+```text
+   ERROR: could not serialize access due to read/write dependencies among transactions
+   SQLSTATE 40001  → 这是 Serializable 下的正常现象, 应用捕获后重试整个事务即可
+```
+
+> 实务建议：用 Serializable 时，**所有**会写的事务都应在该级别下运行（SSI 的保证依赖参与事务都被追踪），且业务侧务必包裹**自动重试**。
+
+## 六、对比 MySQL 的 RR：两种防幻读哲学
+
+```text
+   防幻读的两条路线
+   ─────────────────────────────────────────────
+   PostgreSQL RR (快照隔离)   :  整事务一个冻结快照, 幻影行不在快照里 → 天然看不到
+                                 写写冲突 → 直接 40001 报错, 应用重试
+   MySQL InnoDB RR (默认)      :  快照读靠 MVCC; 当前读(FOR UPDATE/UPDATE/DELETE)
+                                 靠 next-key lock(记录锁+间隙锁) 锁住范围, 阻止 INSERT
+   ─────────────────────────────────────────────
+   真正可串行化
+   PostgreSQL Serializable    :  SSI —— 乐观, 追踪读写依赖, 事后检测回滚, 能防写偏序
+   MySQL Serializable         :  悲观 —— 把普通 SELECT 隐式升级为加锁读(LOCK IN SHARE
+                                 MODE/FOR SHARE), 用锁串行化, 并发差、易锁等待
+```
+
+- PG 用**乐观**思路（先跑、事后查依赖、冲突就回滚重试），MySQL 用**悲观**思路（加锁阻塞）。
+- PG 的 Serializable 因为 SSI，能在**高并发下仍提供真正可串行化**且只在真冲突时回滚；这是 PG 在隔离级别上的招牌特性。
+- MySQL 的 MVCC / next-key lock 细节见 [MySQL 事务与隔离级别](../mysql/transaction.html)。
+
+## 七、快照实现靠 MVCC
+
+上面三种隔离级别本质都建立在 **MVCC 快照**之上——RC 是"每语句一快照"、RR/Serializable 是"整事务一快照"，快照决定了哪些元组版本对你可见。快照如何用 **xmin / xmax** + 活跃事务列表 + 提交日志(clog) 判断版本可见性、旧版本(死元组)如何在堆表里堆积并靠 VACUUM 回收，详见 [MVCC 与 VACUUM](mvcc-vacuum.html)。
+
+## 一句话总结
+
+> PG 实际只有 **3 个隔离级别**：**Read Committed（默认，每条语句新建快照，防脏读但有不可重复读/幻读）**、**Repeatable Read（实为快照隔离 SI，整事务一个冻结快照，连幻读都防住，但有写偏序 write skew；写写冲突报 40001 需重试）**、**Serializable（用 SSI）**。**SSI** 在快照隔离上**运行时追踪事务间读写依赖**，检测到会破坏可串行化的"危险结构(rw 依赖环的征兆)"就**回滚一方**——好处是不靠阻塞锁就实现真正可串行化、并发好、能防写偏序，代价是可能 serialization failure 需应用重试。对比 MySQL：InnoDB 的 RR 靠 next-key lock 防幻读、Serializable 靠加锁串行(悲观)，而 PG Serializable 靠 SSI 乐观检测。一切快照都建立在 MVCC 之上，见 [MVCC 与 VACUUM](mvcc-vacuum.html)。（基于 PG 16）
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/transaction" data-base="../"></script>
+</body>
+</html>

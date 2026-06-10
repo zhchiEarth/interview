@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.Mutex 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+<!-- [skill: go-team-standards · 技术文档] sync.Mutex 速记 memo -->
+# sync.Mutex 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **Mutex = 8 字节（`state` int32 + `sema` uint32），靠 `state` 位运算 + CAS + runtime 信号量做锁**；Lock 走 **Fast→Spin→Park→Wake** 四阶段，**正常模式追吞吐（新 G 自旋抢，缓存热常赢）、饥饿模式保公平（>1ms 切，新 G 不许抢、锁直接交付队首）**，1ms 阈值动态切换。
+
+记不全时，按这条**记忆主线：一个状态字 + 一条 Lock 流程 + 两种模式**展开（详细推演看[正文](sync-mutex.html)）：
+
+---
+
+## ⚙️ 一个状态字 —— `state` 把 4 件事塞进 32 bit
+
+```text
+高 29 bit                低 3 bit
+  waiter 等待者数        S  W  L
+                         │  │  └ Locked   (bit0) 1=被持有
+                         │  └─── Woken    (bit1) 1=有 G 被唤醒去抢(防惊群)
+                         └────── Starving (bit2) 1=饥饿模式
+```
+- 塞一起的理由：**一次 CAS 同时改多位**（抢到锁：Locked=1 + Woken 清零 + waiter-1），免去多次原子操作的中间不一致。
+- 另一字段 `sema uint32`：runtime 信号量，等待 G 挂这（不是 OS 信号量）。
+
+## 🔁 一条 Lock 流程 —— Fast → Spin → Park → Wake
+
+```text
+① Fast  CAS state 0→mutexLocked         ~20ns, 99% 走这
+② Spin  PAUSE 空转抢锁                    多核 + 自旋<4次 + 锁未放 + 非饥饿
+③ Park  waiter++ → runtime_SemacquireMutex 挂起, G→_Gwaiting, M 去跑别的
+④ Wake  醒后看等了多久: >1ms→Starving=1
+        饥饿→直接拿(已交付) / 正常→回①重抢
+```
+- 自旋哲学：**用几十 ns CPU 空转换掉一次几千 ns 上下文切换**（差 100~1000 倍）。
+- Unlock：`AddInt32(&state, -mutexLocked)`，`new==0` 直接返回；否则 `runtime_Semrelease`，`handoff=false` 正常唤醒去抢、`handoff=true` 饥饿直接交付队首。
+
+## 🚦 两种模式 —— 吞吐 vs 公平（1ms 阈值切换）
+
+| 模式 | 新到的 G | 队列里的 G | 偏向 |
+|---|---|---|---|
+| **正常** | 自旋抢锁（缓存热常赢） | 醒来跟新 G 抢 | 吞吐 |
+| **饥饿** | 不许抢，排队尾 | 队首直接拿不用抢 | 公平 |
+
+- 进饥饿：队首等待 **>1ms**（`starvationThresholdNs=1e6`）；退饥饿：队首等待 <1ms 或自己是队列最后一个。
+- 不切就会 **lock convoy**：CPU 上的新 G 总抢赢，老 G 饿死。
+
+## ⚠️ 几个坑 —— 三条铁律
+
+```text
+① 不可重入   持锁再 Lock 自己 → 死锁（Go 没 ReentrantLock）
+② 不能复制   值接收者/拷贝 → 两份 state 各更新, 锁失效（go vet 报）→ 用 *指针接收者
+③ 谁加谁解   语法允许跨 G 解锁, 但强烈建议同一 G 加解, 否则难推理
+```
+- 性能直觉：无竞争 ~20ns（CAS）/ 自旋成功 ~50ns / 挂起+唤醒 ~5000ns。临界区比 20ns 还短 → 改用原子操作 / lock-free。
+- `defer mu.Unlock()` 在 1.14+ 开放编码近零开销，正常用别为省那点而漏解锁。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-mutex-memo" data-base="../../"></script>
+</body>
+</html>

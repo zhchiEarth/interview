@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>查询执行：向量化 + MPP + Pipeline · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 查询执行：向量化 + MPP + Pipeline
+
+> 一句话：一条 SQL 进 **FE**（前端节点）先解析、再经**优化器**（老 planner 或 **2.0+** 的 **Nereids CBO**）生成**分布式执行计划**——计划被切成多个 **Fragment**，调度到多台 **BE**（后端节点）上**并行执行**（这就是 **MPP**），Fragment 之间按需 **shuffle 重分布**数据；每个 BE 内用**向量化引擎**按列「成批（Block）」处理数据（取代逐行的火山模型，对 CPU cache / SIMD 友好），并由 **Pipeline 执行引擎**（2.0 引入、2.1 默认 **PipelineX**）把算子拆成可调度的 pipeline task，解决旧模型「线程数爆炸 + 阻塞」的问题，吃满多核。
+
+> 本文以 **Apache Doris 2.x** 为基准；涉及版本差异处会显式标注。相关：[数据导入：Stream / Broker / Routine Load](data-load.html)、[三种数据模型](data-model.html)、[存储与数据划分](storage.html)。
+
+## 一、整体流程：从 SQL 到多 BE 并行
+
+```text
+        客户端 (MySQL 协议)
+             │ SQL
+             ▼
+   ┌──────────────────── FE（前端，Java）────────────────────┐
+   │  1) 解析 Parse  → AST                                     │
+   │  2) 分析/绑定   → 校验库表列、权限、类型                   │
+   │  3) 优化器 Optimize：                                      │
+   │       · 老 Planner（规则为主）                            │
+   │       · Nereids（2.0+ 新优化器，CBO 代价模型，2.1 默认）   │
+   │  4) 生成「分布式执行计划」→ 切成多个 Fragment             │
+   │  5) 调度 Coordinator：把 Fragment 分发到各 BE             │
+   └─────────────────────────┬────────────────────────────────┘
+                              │ 下发 Fragment 实例
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+    ┌────────┐            ┌────────┐            ┌────────┐
+    │  BE 1  │            │  BE 2  │            │  BE 3  │   ← MPP：多 BE 并行
+    │ 向量化  │  shuffle   │ 向量化  │  shuffle   │ 向量化  │
+    │ Pipeline│ ◄────────► │ Pipeline│ ◄────────► │ Pipeline│   ← 节点间按需重分布
+    └────────┘            └────────┘            └────────┘
+        └──────────── 结果汇聚回 FE Coordinator ──────────────┘
+                              │ 返回客户端
+```
+
+要点：**FE 只做「规划 + 调度 + 汇聚」，真正的算力在多台 BE 上并行**。
+
+## 二、优化器：老 Planner vs Nereids（2.0+）
+
+| | 老 Planner | **Nereids**（新优化器） |
+|---|---|---|
+| 引入 | 早期 | **2.0 引入，2.1 起默认** |
+| 思路 | 规则改写为主（RBO 偏多） | 现代 **CBO**：基于统计信息的代价模型 + 规则 |
+| 能力 | 复杂 SQL 优化有限 | join reorder、子查询展开、谓词下推等更强 |
+| 依赖 | 较少 | 依赖**统计信息**（`ANALYZE` 收集），代价估算才准 |
+
+> 面试点：Doris **2.x 用 Nereids（默认开启）**，它是 CBO，会用列统计做 **join 重排序**等优化；统计不准会导致计划变差，所以生产要做 `ANALYZE`/自动统计。
+
+## 三、MPP：Fragment 切分 + 节点间 shuffle
+
+**MPP（Massively Parallel Processing，大规模并行处理）**：把一个查询切成多个 **Fragment**，每个 Fragment 在多台 BE 上以多个**实例（instance）**并行跑；Fragment 之间通过 **Exchange** 做数据**重分布（shuffle）**。
+
+```text
+SELECT region, SUM(amount)
+FROM orders JOIN users ON orders.uid = users.id
+GROUP BY region;
+
+   Fragment 0 (顶层)        ← 汇总最终结果，返回 FE
+        ▲ Exchange(gather)
+   Fragment 1 (聚合)        ← 按 region 做 shuffle 后局部+全局聚合
+        ▲ Exchange(hash by region)   ← 节点间 shuffle 重分布
+   Fragment 2 (join)        ← 多 BE 并行做 join
+        ▲ scan orders / users        ← 各 BE 扫本地分桶数据
+```
+
+为什么要 shuffle：join / 聚合需要把**相同 key 的数据汇到同一个 BE**才能算对，所以按 key 做 hash 重分布——这也是后面 join 策略要解决的核心开销。
+
+## 四、向量化执行引擎（2.0 默认）
+
+数据按**列**组织、成批（**Block**，一批通常上千行）地流过算子，而不是「一次一行」。
+
+```text
+火山模型（Volcano，逐行）          向量化（Vectorized，成批/按列）
+─────────────────────────         ─────────────────────────────
+next() 一次拉一行                  一次处理一个 Block（多行多列）
+每行每算子一次虚函数调用           一次调用处理整批 → 摊薄函数开销
+按行存取，cache 不友好             按列连续存取，cache 命中高
+难以用 SIMD                        列内同类型连续 → 友好 SIMD 向量化
+```
+
+| 维度 | 火山模型（逐行） | 向量化（成批/按列） |
+|---|---|---|
+| 处理粒度 | 一次一行 | 一次一个 Block（批） |
+| 函数调用 | 每行多次虚函数调用，开销大 | 每批一次，开销摊薄 |
+| CPU cache | 行式访问，命中率低 | 列式连续，命中率高 |
+| SIMD | 难利用 | 同类型列连续，易做 SIMD |
+| Doris 状态 | 早期模型 | **2.0 起默认** |
+
+> 一句话记：**向量化 = 「成批 + 按列」处理，把虚函数开销摊薄、把 CPU cache 和 SIMD 用满**，是 OLAP 提速的根本手段之一。
+
+## 五、Pipeline 执行引擎（2.0+，2.1 默认 PipelineX）
+
+向量化解决「单算子怎么算快」，Pipeline 解决「一个 Fragment 内部怎么调度算子、怎么用满多核」。
+
+```text
+旧模型：一个 Fragment 实例 = 一个（或几个）线程，跑「volcano 式」的算子链
+  问题：
+    · 实例多 → 线程数随 实例数 × 算子 爆炸 → 大量线程上下文切换
+    · 某算子阻塞（等 IO / 等 shuffle 数据）→ 整个线程被卡住、CPU 空转
+
+Pipeline 模型：
+    · 把算子链按「会阻塞的边界」切成若干 pipeline，每段拆成 pipeline task
+    · task 放进固定大小的线程池调度（线程数 ≈ 核数，不随查询膨胀）
+    · 某 task 因等数据阻塞 → 让出线程，调度其它就绪 task（非阻塞、可抢占）
+  收益：线程数可控、避免阻塞空转、多核利用率与并发更高
+```
+
+| | 旧执行模型 | **Pipeline / PipelineX** |
+|---|---|---|
+| 线程模型 | 每实例占线程，数量随查询膨胀 | 固定线程池（≈核数），task 化调度 |
+| 阻塞处理 | 算子阻塞 → 线程被卡 | 阻塞即让出线程，调度其它就绪 task |
+| 多核利用 | 易不均衡 | 更充分 |
+| Doris 状态 | 旧 | Pipeline **2.0 引入**；**PipelineX 2.1 默认** |
+
+> 记忆钩子：**Pipeline = 把「一查询一堆线程跑到底」改成「少量线程 + 一堆可调度小任务」**，专治线程爆炸与阻塞空转。
+
+## 六、Join 策略（4 种，重点对比）
+
+join 的核心成本是 shuffle。Doris 据表大小 / 分桶情况选不同策略来**减少或消除 shuffle**。
+
+| 策略 | 做法 | 何时用 | shuffle 开销 |
+|---|---|---|---|
+| **Broadcast Join** | 把**小表广播**到每个含大表数据的 BE，本地 join | 一侧很小（如维表） | 小表全量发到各 BE，大表不动 |
+| **Shuffle Join**（Hash） | 两表都按 join key **hash 重分布**到对应 BE | 两表都大、无共同分桶 | 最大：双表都要 shuffle |
+| **Bucket Shuffle Join** | 仅按**左表的分桶**重分布右表（利用已有分桶） | join key 与左表分桶键相关 | 只 shuffle 一侧，较省 |
+| **Colocate Join** | 两表**同分桶（colocation group）**，对应桶在同 BE → **免 shuffle**本地直接 join | 两表分桶键/桶数一致且同组 | **几乎为零**（无网络重分布） |
+
+```text
+开销直觉：Colocate（免shuffle） < Broadcast（仅发小表）
+        < Bucket Shuffle（shuffle一侧） < Shuffle（双表都shuffle）
+```
+
+> 设计联动：**让经常 join 的大表用相同分桶键放进同一 Colocation Group**，即可走 Colocate Join 免 shuffle——这是建表期就要规划的（见 [存储与数据划分](storage.html)）。
+
+## 七、Runtime Filter：把过滤提前下推
+
+join 时，先算出右表（build 端）join key 的**过滤条件**（如 IN 集合 / Bloom Filter / min-max 区间），**下推**给左表（probe 端）的扫描，在扫描阶段就提前过滤掉不可能匹配的行。
+
+```text
+              build 端（右表，通常较小）
+                    │ 收集 join key 的 filter
+                    │ (IN / Bloom / min-max)
+                    ▼  运行时下推
+   左表 Scan ──────────────────► 扫描时即过滤，少读、少传、少 join
+   （probe 端，通常很大）
+
+收益：减少左表参与 join 的数据量 → 更少 IO / shuffle / 计算
+注意：右表太大时 filter 收益下降甚至关闭；类型有 IN、Bloom Filter、Min/Max
+```
+
+> 一句话：**Runtime Filter = 用「右表实际的值」在运行时给左表扫描加一道临时过滤网**，是大表 join 小表时的关键加速器。
+
+## 一句话总结
+
+> Doris 查询：**FE** 解析后由**优化器**（**2.0+ Nereids CBO，2.1 默认**）生成**分布式计划**，切成 **Fragment** 调度到多 **BE** 上**并行（MPP）**、节点间按需 **shuffle**；BE 内用**向量化引擎**（**2.0 默认**，按列成批处理、友好 cache/SIMD，取代逐行火山模型）配合 **Pipeline 引擎**（2.0 引入、**2.1 默认 PipelineX**，task 化调度治线程爆炸与阻塞）。join 按开销从低到高选 **Colocate（免 shuffle）/ Broadcast / Bucket Shuffle / Shuffle**，并用 **Runtime Filter** 把右表过滤条件下推到左表扫描提前过滤。延伸见 [三种数据模型](data-model.html)、[存储与数据划分](storage.html)、[数据导入：Stream / Broker / Routine Load](data-load.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/query" data-base="../"></script>
+</body>
+</html>

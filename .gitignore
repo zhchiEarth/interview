@@ -1,0 +1,10 @@
+# 构建产物 / 离线 PDF（体积大，不入库；需要时本地重新生成）
+dist/
+
+# macOS
+.DS_Store
+
+# 依赖
+node_modules/
+
+.claude

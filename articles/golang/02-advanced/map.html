@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Map 底层是怎么实现的？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Map 底层是怎么实现的？
+
+## 一、整体结构总览
+
+Go 的 map 在运行时是两个核心结构体：**`hmap`**（map 的头）和 **`bmap`**（bucket，桶）。
+
+```
+                    ┌─────────────────────────────────┐
+   map 变量 m  ───→  │           hmap (头部)            │
+                    │  count     = 元素总数            │
+                    │  flags     = 状态位 (写标志等)   │
+                    │  B         = 2^B 个 bucket       │
+                    │  noverflow = overflow bucket 数  │
+                    │  hash0     = 哈希种子 (防碰撞攻击)│
+                    │  buckets   ──┐                   │
+                    │  oldbuckets──┼─→ 扩容时用         │
+                    │  nevacuate   │                   │
+                    │  extra       │                   │
+                    └──────────────┼──────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │      buckets 数组 (2^B 个)       │
+                    │  ┌──────┬──────┬──────┬──────┐  │
+                    │  │bmap 0│bmap 1│bmap 2│ ...  │  │
+                    │  └──────┴──────┴──────┴──────┘  │
+                    └─────────────────────────────────┘
+```
+
+**关键字段**：
+- `B`：决定 bucket 数组大小，len(buckets) = 2 的 B 次方(2^B)。例如 B=4 就是 16 个 bucket
+  - **为什么用低 B 位做 bucket 索引**：B 位（bit）刚好能表示 2^B 种值，正好对应 2^B 个 bucket
+    - B = 3  → 8 个 bucket  → 编号 `000 ~ 111`         → 3 位可表示 2^3 = 8 种值
+    - B = 4  → 16 个 bucket → 编号 `0000 ~ 1111`       → 4 位可表示 2^4 = 16 种值
+    - B = 10 → 1024 个 bucket                          → 10 位可表示 2^10 = 1024 种值
+- `hash0`：随机哈希种子，每个 map 创建时随机生成，**防止哈希碰撞 DoS 攻击**
+- `oldbuckets`：扩容期间指向旧数组，平时是 `nil`
+
+---
+
+## 二、bucket（bmap）内部结构
+
+每个 bucket **固定装 8 个 key-value 对**。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    bmap (一个 bucket)                │
+├─────────────────────────────────────────────────────┤
+│  tophash [8]uint8   ← 8 个 key 哈希的高 8 位         │
+│  ┌──┬──┬──┬──┬──┬──┬──┬──┐                          │
+│  │h0│h1│h2│h3│h4│h5│h6│h7│   (8 字节,正好一个 word)  │
+│  └──┴──┴──┴──┴──┴──┴──┴──┘                          │
+├─────────────────────────────────────────────────────┤
+│  keys   [8]KeyType  ← 8 个 key 连续存放              │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┐          │
+│  │ k0 │ k1 │ k2 │ k3 │ k4 │ k5 │ k6 │ k7 │          │
+│  └────┴────┴────┴────┴────┴────┴────┴────┘          │
+├─────────────────────────────────────────────────────┤
+│  values [8]ValueType ← 8 个 value 连续存放           │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┐          │
+│  │ v0 │ v1 │ v2 │ v3 │ v4 │ v5 │ v6 │ v7 │          │
+│  └────┴────┴────┴────┴────┴────┴────┴────┘          │
+├─────────────────────────────────────────────────────┤
+│  overflow *bmap     ← 满了就挂下一个 bucket          │
+└─────────────────────────────────────────────────────┘
+```
+
+### 为什么 key 和 value 分开存？
+
+如果 key 和 value 交叉放（`k0,v0,k1,v1,...`），不同类型间会有**对齐 padding**：
+
+```
+按 K/V 交错（差）：              按 K 全部、V 全部（好）：
+┌────┬──────┬────┬──────┐      ┌────┬────┬──────┬──────┐
+│ k:1│ pad7 │ v:8│ ...  │      │ k:1│ k:1│ v:8  │ v:8  │
+└────┴──────┴────┴──────┘      └────┴────┴──────┴──────┘
+浪费很多 padding                key 紧凑、value 紧凑
+```
+
+例如 `map[int8]int64`：交叉存每对要浪费 7 字节对齐 padding；分开存只在两段之间对齐一次。
+
+### tophash 是什么？
+
+`tophash[i]` 存 `keys[i]` 哈希值的**高 8 位**。它有两个作用：
+
+1. **快速过滤**：查找时先比 1 字节的 tophash，不匹配直接跳过，匹配了才比完整 key
+2. **槽位状态标记**：低位的几个特殊值表示槽位状态
+
+```
+tophash 值的含义：
+  0 (emptyRest)     此槽位空,且后面所有槽位都空 → 查找可提前终止
+  1 (emptyOne)      此槽位空,但后面可能还有
+  2 (evacuatedX)    扩容已搬走到新数组前半部分
+  3 (evacuatedY)    扩容已搬走到新数组后半部分
+  4 (evacuatedEmpty) 扩容时发现是空的
+  5 (minTopHash)    真实 tophash 的最小值
+  5~255             真实哈希高 8 位 (< 5 的会被加上 minTopHash)
+```
+
+一个字段同时表达"哈希高位 + 槽位状态"，**省内存**。
+
+---
+
+## 三、写入流程：m[k] = v
+
+```
+                      key
+                       │
+                       ▼
+              ┌────────────────┐
+              │  hash(key, h0) │   ← 用随机种子算哈希
+              └────────┬───────┘
+                       │   64 位 hash
+                       ▼
+        ┌──────────────────────────────┐
+        │ 高 8 位 (tophash)            │
+        │ ┌────────┐                   │
+        │ │  h_top │                   │
+        │ └────────┘                   │
+        │                              │
+        │ 低 B 位 (bucket 索引)        │
+        │ ┌────────────────┐           │
+        │ │ idx = h & 2^B-1│           │
+        │ └────────────────┘           │
+        └──────────────────────────────┘
+                       │
+                       ▼
+              定位到 buckets[idx]
+                       │
+                       ▼
+        ┌──────────────────────────────────┐
+        │ 遍历这个 bucket 的 8 个槽位：     │
+        │  for i = 0..7:                   │
+        │    if tophash[i] == h_top:       │
+        │      if keys[i] == key:          │
+        │        覆盖 values[i] ✓          │
+        │    if tophash[i] == emptyOne:    │
+        │      记下这个空位                 │
+        │                                  │
+        │ 如果有 overflow,继续遍历          │
+        └──────────────────────────────────┘
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+        找到匹配 key       没找到,用空位
+        覆盖 value         写入新 key-value
+                                │
+                          全都满了？
+                                │
+                                ▼
+                       分配 overflow bucket
+                       挂到链尾
+```
+
+### 触发扩容的判断
+
+写入后会检查是否要扩容：
+
+```
+扩容条件 (满足任一即可)：
+  ① 装载因子过高:  count / (2^B) > 6.5    → 翻倍扩容 (B+1)
+  ② overflow 太多:  noverflow ≥ 2^B         → 等量扩容 (B 不变)
+```
+
+- **翻倍扩容**：元素真的多了，bucket 数组扩到 2 倍
+- **等量扩容**：元素不多但 overflow 链很长（频繁插入删除导致碎片），重新整理但不增容
+
+---
+
+## 四、查找流程：v := m[k]
+
+查找比写入简单一点，但要注意**扩容期间要查新旧两边**。
+
+```
+                key
+                 │
+                 ▼
+         hash(key, h0)  → idx (低 B 位), h_top (高 8 位)
+                 │
+                 ▼
+    ┌────────────────────────────┐
+    │  oldbuckets != nil ?       │
+    └────────────┬───────────────┘
+                 │
+        ┌────────┴────────┐
+        │ 在扩容          │ 没扩容
+        ▼                 ▼
+  先查 oldbuckets    直接查 buckets[idx]
+  (如果还没搬走)
+        │
+        ▼
+  没找到再查 buckets[idx]
+        │
+        ▼
+  ┌──────────────────────────────────────┐
+  │ 在 bucket 链上遍历每个 bucket:        │
+  │   for i = 0..7:                      │
+  │     if tophash[i] != h_top: continue │  ← 快速过滤
+  │     if keys[i] == key:               │
+  │       return values[i] ✓             │
+  │                                      │
+  │   bucket = bucket.overflow           │
+  │   (继续下一个)                        │
+  └──────────────────────────────────────┘
+                 │
+                 ▼
+          找不到 → 返回零值
+```
+
+**关键优化**：`tophash[i] != h_top` 时根本不用读 key（key 可能是大结构体），直接跳过。
+
+---
+
+## 五、扩容：渐进式搬迁
+
+这是 Go map 最精妙的设计。
+
+### Step 1：触发扩容
+
+```
+扩容前：
+  hmap:
+    B = 3            (8 个 bucket)
+    buckets    ─→ [b0][b1][b2][b3][b4][b5][b6][b7]
+    oldbuckets = nil
+
+  触发翻倍扩容！
+```
+
+### Step 2：分配新数组，旧数组挂到 oldbuckets
+
+```
+扩容后立刻：
+  hmap:
+    B = 4            (16 个 bucket,但还没搬)
+    buckets    ─→ [n0][n1][n2][n3]...[n15]   ← 新数组,全空
+    oldbuckets ─→ [b0][b1][b2][b3][b4][b5][b6][b7]  ← 旧数组,数据还在
+    nevacuate  = 0   ← 还没搬过任何一个旧 bucket
+```
+
+**注意**：这一步**不搬任何数据**，只是分配空间。
+
+### Step 3：每次写操作顺手搬 1~2 个旧 bucket
+
+```
+比如下次写入触发 evacuate(oldbuckets[0])：
+
+  旧 bucket b0 的 8 个 key 会按新的哈希位重新分配:
+  ┌──────────────────────────────┐
+  │  对每个 key 看 hash 的新高位:│
+  │   = 0 → 搬到新数组的 n0      │   (称为 X 部分)
+  │   = 1 → 搬到新数组的 n8      │   (称为 Y 部分)
+  │                              │
+  │  搬完后 b0 的 tophash 全部置 │
+  │  为 evacuatedX/Y/Empty       │
+  └──────────────────────────────┘
+
+  ┌─────────┐                ┌─────────┐
+  │ old b0  │ ──split──→     │ new n0  │
+  │ 8 keys  │                │ (X 部分)│
+  └─────────┘                └─────────┘
+                              │ new n8  │
+                              │ (Y 部分)│
+                              └─────────┘
+```
+
+为什么是 `n0` 和 `n8`？因为 B 从 3 变 4，新的低 4 位 = 旧的低 3 位 + 新增的那 1 位。多出的那一位 = 0 就还在原位（X），= 1 就到 +2^旧B 的位置（Y）。
+
+### Step 4：全部搬完后释放旧数组
+
+```
+当 nevacuate == 2^旧B 时，全部搬完：
+
+  hmap:
+    B = 4
+    buckets    ─→ [n0]...[n15]
+    oldbuckets = nil    ← 释放掉
+    nevacuate  = 0
+```
+
+### 扩容期间的查找
+
+```
+查找 key:
+  1. 算 idx (按新的 B,16 个 bucket)
+  2. 看 oldbuckets[idx % 旧B] 是否已搬走 (看 tophash 是否是 evacuatedX/Y)
+  3. 没搬走 → 查旧的
+     已搬走 → 查 buckets[idx]
+```
+
+所以**扩容期间查找略慢**（要判断状态），但**没有一次性大停顿**。
+
+---
+
+## 六、并发安全：写检测 panic
+
+```
+hmap.flags 里的位:
+  hashWriting   ← 正在写
+  iterator      ← 正在迭代旧 buckets
+  oldIterator   ← 正在迭代新 buckets
+  sameSizeGrow  ← 等量扩容
+
+写操作:
+  if flags & hashWriting != 0:
+      panic("concurrent map writes")  ← 直接挂
+
+  flags |= hashWriting
+  ... 执行写入 ...
+  flags &^= hashWriting
+```
+
+**注意**：
+- **只检测并发写**，不检测并发读写（读写也会出问题但不一定 panic）
+- 检测**不保证 100% 抓到**（不是用 mutex，只是状态位）；但常见的并发写场景大概率抓到
+- 这是**主动 panic 而非崩溃**，比 C++ 的 UB 强得多
+
+并发场景应使用：
+- `sync.RWMutex` 包一下
+- `sync.Map`（适合读多写少、key 集合相对稳定的场景）
+
+---
+
+## 七、链地址法 vs 开放寻址
+
+```
+开放寻址 (Python dict 等)：
+  buckets: [k0][k1][k2][__][k3][__][__][k4]
+  冲突时往后探测找空位
+
+  优点：内存连续,cache 友好
+  缺点：扩容必须一次性,删除要做墓碑标记
+
+
+链地址法 (Go map)：
+  buckets[0] ─→ [bmap 8 槽] ─→ [overflow 8 槽] ─→ ...
+  buckets[1] ─→ [bmap 8 槽]
+  buckets[2] ─→ [bmap 8 槽] ─→ [overflow 8 槽]
+
+  优点：扩容可渐进,删除直接清掉
+  缺点：overflow 链多了 cache 不友好 → 用等量扩容整理碎片
+```
+
+Go 选链地址法，因为它要支持**渐进式扩容**——开放寻址几乎做不到渐进。
+
+---
+
+## 八、内存模型小例子
+
+`map[string]int`，B=2（4 个 bucket）：
+
+```
+   m ──→ hmap
+            count = 5
+            B = 2
+            hash0 = 0x3a7c9f2e
+            buckets ─┐
+                     │
+                     ▼
+      ┌──────────────────────────────────────────┐
+      │ buckets[0]:                              │
+      │   tophash: [42,17, 0, 0, 0, 0, 0, 0]     │
+      │   keys:    ["apple","kiwi","","","",..]  │
+      │   values:  [1, 4, 0, 0, 0, 0, 0, 0]      │
+      │   overflow: nil                          │
+      ├──────────────────────────────────────────┤
+      │ buckets[1]:                              │
+      │   tophash: [99, 0, 0, 0, 0, 0, 0, 0]     │
+      │   keys:    ["pear","","","","","","",""] │
+      │   values:  [2, 0, 0, 0, 0, 0, 0, 0]      │
+      │   overflow: nil                          │
+      ├──────────────────────────────────────────┤
+      │ buckets[2]:                              │
+      │   ...(空)                                │
+      ├──────────────────────────────────────────┤
+      │ buckets[3]:                              │
+      │   tophash: [55, 88, 0, 0, 0, 0, 0, 0]    │
+      │   keys:    ["mango","grape","","",..]    │
+      │   values:  [3, 5, 0, 0, 0, 0, 0, 0]      │
+      │   overflow: nil                          │
+      └──────────────────────────────────────────┘
+```
+
+查 `m["kiwi"]`：
+1. `hash("kiwi", 0x3a7c9f2e)` 假设结果低 2 位 = `00`，高 8 位 = `17`
+2. 定位到 `buckets[0]`
+3. tophash 数组里找 `17` → 在第 1 槽
+4. 比较 `keys[1] == "kiwi"` ✓
+5. 返回 `values[1] = 4`
+
+---
+
+## 九、能从这些机制推出的性能特性
+
+| 特性 | 推导 |
+|---|---|
+| **迭代顺序随机** | 每次迭代起始 bucket 和槽位随机化（防止依赖顺序的 bug） |
+| **小 map 极快** | 元素 ≤ 8 时只有 1 个 bucket，几乎不算哈希 |
+| **查找 O(1) 摊销** | 单 bucket 8 槽 + tophash 过滤 + 链短 |
+| **删除不缩容** | 缩容要触发新一轮渐进搬迁，得不偿失 |
+| **写慢于读** | 写要算 hash + 找槽 + 可能搬迁 + 设标志位 |
+| **不能取地址 `&m[k]`** | 扩容时元素会被搬到新内存，地址会失效 |
+| **key 必须可哈希** | 链地址法本质就是哈希表，slice/map/func 不能当 key |
+| **大 map 删空后内存不释放** | bucket 数组还在，要 `m = nil` 或新建 map |
+| **并发写 panic** | `hashWriting` 标志位检测，主动 fail-fast |
+
+---
+
+## 十、一图总结
+
+```
+                    ┌──────────────────────────┐
+                    │       Go Map 全景图       │
+                    └──────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+    数据结构              扩容策略              并发模型
+    链地址法             渐进搬迁              写检测 panic
+        │                     │                     │
+        ▼                     ▼                     ▼
+   ┌─────────┐         ┌──────────┐          ┌──────────┐
+   │ hmap    │         │翻倍扩容  │          │hashWriting│
+   │ bmap    │         │等量扩容  │          │标志位    │
+   │ bucket  │         │evacuate  │          │           │
+   │  8 槽   │         │oldbuckets│          │fail-fast │
+   │ tophash │         │X/Y split │          │用 sync.Map│
+   │ overflow│         │          │          │或 mutex  │
+   └─────────┘         └──────────┘          └──────────┘
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              ▼
+                     抓住三大机制:
+                ① bucket 8 槽 (内存布局)
+                ② tophash 快速过滤 (查找性能)
+                ③ 渐进搬迁 (扩容平滑)
+
+                所有 map 行为都能自洽推出
+```
+
+**一句话总结**：Go map = 一个**链地址法哈希表**，用**渐进式搬迁**避免扩容停顿，用**写检测标志位**在并发写时主动 panic；理解 bucket 8 槽 + tophash + 渐进搬迁这三个机制，map 的迭代随机、查找快、不缩容、扩容不卡顿、并发写挂掉等一切特性就都顺理成章了。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/map" data-base="../../"></script>
+</body>
+</html>

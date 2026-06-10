@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AOF 和 RDB 是什么? AOF 持久化策略 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# AOF 和 RDB 是什么? AOF 持久化策略
+
+> 一句话：RDB 是"存结果"（某一刻的内存二进制快照），AOF 是"记过程"（一条条写命令的追加日志）；RDB 恢复快但可能丢一段数据，AOF 更安全但文件大、重放慢——选型的核心是你能接受丢多少数据。
+
+本篇是 **RDB vs AOF 深入 + AOF 策略细节**：把两种机制逐项对比，重点讲 AOF 的"写后日志"设计、`appendfsync` 三策略、以及重写（rewrite）的内部流程。机制总览、fork/COW 原理与生产调优，见 [持久化总览](persistence.html)。
+
+> 本文以 **Redis 7.x** 行为为基准，版本相关处会显式标注。
+
+## 一、RDB 详解：存"结果"
+
+RDB（Redis DataBase）是**某个时间点内存的全量二进制快照**，序列化进一个紧凑文件（默认 `dump.rdb`）。
+
+```text
+某一时刻的内存:  k1=v2  list=[a]  hash={f:1}
+        │  序列化(紧凑二进制)
+        ↓
+   dump.rdb   ←  不是命令,是"数据的最终样子"
+        │  重启时按格式直接还原内存
+        ↓
+   内存被一次性重建(无需重放命令)
+```
+
+优点：
+
+- **文件紧凑、体积小**——是数据的最终形态，没有冗余历史
+- **恢复快**——直接按二进制格式装载，不用逐条执行命令
+- 适合**全量备份**和主从全量同步的基线传输
+
+缺点：
+
+- 是时间点快照，**两次快照之间宕机会丢这段数据**——默认 `save` 配置下，最坏可能丢掉上次快照后的几分钟写入
+- 生成依赖 fork，大实例 fork 有成本（见 [持久化总览](persistence.html) 的 fork/COW 一节）
+
+## 二、AOF 详解：记"过程"，而且是"写后日志"
+
+AOF（Append Only File）记录**每一条修改数据的写命令**，按 Redis 协议追加到文件末尾；重启时**重放**这些命令重建内存。
+
+AOF 一个反直觉的设计：它是 **写后日志（write after logging）**——**先执行命令（改内存），再把命令写进 AOF**。这和数据库常见的 WAL（写前日志，先写日志再改数据）正好相反。
+
+```text
+       客户端: SET k1 v2
+                  │
+   ① 先在内存里执行命令(改数据)
+                  │
+   ② 命令执行成功后,再把这条命令追加进 AOF
+                  ↓
+        aof: ... / SET k1 v2
+```
+
+### 2.1 为什么"写后"
+
+| 好处 | 说明 |
+|---|---|
+| 不阻塞当前写 | 命令先执行,记日志在执行之后,记日志的开销不挡在请求关键路径最前面 |
+| 不会记录错误命令 | 只有**真正执行成功**的命令才进 AOF（语法错/类型错的命令在执行阶段就被拒，根本不会被记），重放时不会因为日志里有非法命令而出错 |
+
+### 2.2 代价
+
+写后日志的代价是：**命令已经执行了，但还没来得及写进 AOF（或还没 fsync 落盘）时宕机，这条命令就丢了**。丢多少取决于下面的 `appendfsync`。
+
+> 另外 AOF 是主线程负责把命令写入文件缓冲的，如果磁盘压力大、fsync 慢，也可能反过来拖慢主线程——所以 `appendfsync` 的选择很关键。
+
+## 三、appendfsync：AOF 落盘的三种策略
+
+"写进 AOF"分两步：先 `write()` 进**内核缓冲区**，再 `fsync()` 真正刷到**磁盘**。`appendfsync` 控制 **多久 fsync 一次**——这是 AOF 数据安全性的关键旋钮。
+
+```text
+   命令 ──write()──→ 内核缓冲区(page cache) ──fsync()──→ 磁盘
+                         ↑ 还在内存,断电会丢        ↑ 落盘了才真正安全
+                         appendfsync 决定 fsync 的频率
+```
+
+| 策略 | fsync 时机 | 宕机最多丢 | 性能 | 安全性 |
+|---|---|---|---|---|
+| `always` | **每条**写命令都 fsync | 几乎不丢（最多正在处理的那条） | 最慢（每条都等磁盘） | 最高 |
+| `everysec`（默认） | 每 **1 秒** fsync 一次 | 最多约 **1 秒** 的数据 | 折中 | 中 |
+| `no` | 不主动 fsync，**交给 OS** | 取决于 OS 刷盘节奏（可能丢较多） | 最快 | 最低 |
+
+```text
+安全 ←──────────────────────────────────→ 快
+   always          everysec            no
+  (每条落盘)      (每秒落盘,推荐)     (听天由命)
+```
+
+- **always**：钱包级数据可考虑，但要接受吞吐下降，且对磁盘性能极敏感
+- **everysec**：绝大多数生产环境的推荐档，安全和性能平衡得最好
+- **no**：几乎只在"丢了也无所谓"的场景才用
+
+## 四、AOF 重写（rewrite）：把日志瘦身
+
+AOF 是命令流，会越积越大，且包含大量冗余（同一个 key 被改 100 次就有 100 条命令）。**重写**扫描**当前内存的实际数据**，直接生成一份能重建出相同状态的**最小命令集**，替换旧文件。
+
+```text
+重写前 AOF(历史命令,冗余):
+   SET k1 v1
+   SET k1 v2
+   SET k1 v3
+   LPUSH list a
+   LPUSH list b
+
+重写后 AOF(按内存现状生成,最小):
+   SET k1 v3
+   RPUSH list a b      ← 直接是"现在的样子",不含中间过程
+```
+
+### 4.1 流程：bgrewriteaof + 重写缓冲
+
+重写靠 **fork 子进程**完成，避免阻塞主线程。但 fork 之后主线程还在接收新的写命令——这些新命令子进程看不到，怎么不丢？靠 **AOF 重写缓冲区（aof_rewrite_buf）**：
+
+```text
+   主线程触发 BGREWRITEAOF
+        │ fork
+        ├──────────────→ 子进程: 扫描 fork 那刻的数据 → 写"新 AOF"
+        │
+        │ 重写期间,主线程对每条新写命令做两件事:
+        │   ① 照常写入"当前 AOF"(保证宕机也不丢)
+        │   ② 同时写一份到"AOF 重写缓冲区"(aof_rewrite_buf)
+        │
+        ↓ 子进程写完新 AOF,通知主线程
+   主线程把"重写缓冲区"里这段增量追加到新 AOF 末尾
+        │
+        ↓
+   用新 AOF 原子替换旧 AOF
+```
+
+> 关键：重写期间新来的写命令被额外缓存到重写缓冲区，等子进程的"基线"写完后再补到新文件末尾，这样新 AOF 既最小又不漏掉重写期间的增量。
+
+> 在 **Redis 7.0 的 Multi-Part AOF** 下，这个流程更干净：子进程生成新的 **base 文件**，重写期间的增量直接写进 **incr 文件**，最后只需更新 **manifest** 指向新的 base/incr，不再需要把增量"合并回"主文件。详见 [持久化总览](persistence.html) 的 Multi-Part AOF 一节。
+
+### 4.2 触发条件
+
+```text
+auto-aof-rewrite-percentage 100   # 当前 AOF 比"上次重写后的大小"增长 ≥ 100%
+auto-aof-rewrite-min-size  64mb   # 且当前 AOF 至少要 ≥ 64mb
+```
+
+两个条件**同时满足**才自动重写（避免小文件频繁触发）。也可手动执行 `BGREWRITEAOF`。
+
+## 五、RDB vs AOF 逐项对比
+
+| 维度 | RDB | AOF |
+|---|---|---|
+| 存什么 | 时间点的内存二进制快照（结果） | 写命令日志（过程） |
+| 数据安全性 | 较低，两次快照间宕机丢一段 | 较高，`everysec` 最多丢约 1 秒、`always` 几乎不丢 |
+| 文件体积 | 小（紧凑二进制） | 大（命令文本，重写后变小） |
+| 恢复速度 | 快（直接装载） | 慢（逐条重放命令） |
+| 对性能影响 | BGSAVE 时 fork + COW 开销 | 每次写都要 write，按策略 fsync；重写时 fork |
+| 适用场景 | 全量备份、主从同步基线、能容忍丢数据 | 要尽量少丢数据、对一致性要求高 |
+
+> 两者都依赖 fork/COW，相关原理和调优在 [持久化总览](persistence.html)。
+
+## 六、怎么选 + 混合持久化
+
+按"能接受丢多少数据"来选：
+
+```text
+纯缓存,数据丢了能从 MySQL 回源
+        → 可以只开 RDB,甚至关掉持久化
+
+要快速恢复,但能容忍丢几分钟
+        → 只开 RDB(恢复最快)
+
+不能丢太多数据(准存储)
+        → 开 AOF, appendfsync everysec
+
+既要少丢数据,又要恢复快
+        → AOF + 混合持久化  ← 生产推荐
+```
+
+### 6.1 混合持久化（4.0+，推荐）
+
+纯 AOF 的痛点是重放慢、文件大；纯 RDB 的痛点是丢数据。**混合持久化**（`aof-use-rdb-preamble yes`，4.0 后默认开）在 **AOF 重写**时把两者结合：
+
+```text
+混合持久化的 AOF 文件:
+   ┌──────────────────────┬───────────────────────┐
+   │  RDB 格式全量快照(头) │  增量写命令(AOF 文本)  │
+   └──────────────────────┴───────────────────────┘
+       恢复:RDB 加载这段(快)    再重放这段增量(补最后那点)
+```
+
+这样兼得 **RDB 的恢复速度** 和 **AOF 的低丢失**，是当前生产最推荐的方案。注意它仍属 AOF 体系（需 `appendonly yes`）。机制与调优细节见 [持久化总览](persistence.html)。
+
+## 一句话总结
+
+> **RDB 存结果（紧凑快照、恢复快、可能丢一段数据），AOF 记过程（写命令日志、更安全、文件大、重放慢）**。AOF 采用**写后日志**——先执行再记录，所以不挡关键路径、不记错误命令，代价是没落盘时宕机会丢；落盘强度由 `appendfsync` 控制：**always 最安全最慢、everysec 折中（默认推荐）、no 最快最不安全**。AOF 靠 **fork 子进程 + 重写缓冲区** 完成瘦身重写。选型看"能接受丢多少数据"，生产首选 **AOF + 混合持久化（4.0+）**。原理与调优见 [持久化总览](persistence.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="redis/aof-rdb" data-base="../"></script>
+</body>
+</html>

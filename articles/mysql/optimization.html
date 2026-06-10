@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL 优化与慢查询 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# SQL 优化与慢查询
+
+> 一句话：优化 SQL 的套路是**先定位再分析最后改写**——用**慢查询日志**揪出慢 SQL，用 **`EXPLAIN`** 看它怎么走（重点 `type` / `key` / `rows` / `Extra`），再从**索引（覆盖/最左前缀/避免失效）、深分页（延迟关联 + 游标）、排序（避免 filesort）、join（小表驱动 + 被驱动表走索引）、count** 等角度对症下药，核心目标始终是**少扫行、少回表、少排序、少回随机 IO**。
+
+> 本文默认讨论 **MySQL InnoDB 存储引擎**（默认引擎），涉及其它引擎或版本差异处会显式标注。相关：[MySQL 索引原理](index.html)、[事务与隔离级别](transaction.html)。
+
+## 一、先定位：怎么揪出慢 SQL
+
+优化的前提是**先找到**慢在哪条 SQL，而不是凭感觉乱加索引。靠的是**慢查询日志**。
+
+**慢查询日志（slow query log）**：记录执行时间超过阈值的 SQL。
+
+```sql
+-- 看当前状态
+SHOW VARIABLES LIKE 'slow_query_log';        -- 是否开启
+SHOW VARIABLES LIKE 'slow_query_log_file';   -- 日志文件路径
+SHOW VARIABLES LIKE 'long_query_time';       -- 慢的阈值,单位秒,默认 10s
+
+-- 运行时开启(重启失效;持久化要写 my.cnf)
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;              -- 超过 1s 记为慢查询
+
+-- 把「没用到索引」的语句也记进来(排查全表扫描很有用)
+SET GLOBAL log_queries_not_using_indexes = ON;
+```
+
+注意：`long_query_time` 对**当前已建立的连接不生效**，要新开会话才看到新阈值；`= 0` 表示记录所有 SQL（仅排查时短暂用）。日志写文件还是表由 `log_output` 控制（`FILE` / `TABLE`）。
+
+**分析工具**：日志原始内容是一条条 SQL，量大时要聚合统计：
+
+| 工具 | 来源 | 特点 |
+|---|---|---|
+| `mysqldumpslow` | MySQL 自带 | 把相似 SQL 归并（参数抽象成 `N`/`'S'`），按次数 / 平均耗时 / 总耗时排序，开箱即用 |
+| `pt-query-digest` | Percona Toolkit | 功能强得多：耗时分布、占比、采样、还能直接分析 `tcpdump` 抓的流量与 binlog，生产排查首选 |
+
+```bash
+# 出现次数最多的 10 条
+mysqldumpslow -s c -t 10 /var/log/mysql/slow.log
+# 平均耗时最长的 10 条(-s t 按时间)
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
+
+# pt-query-digest 生成聚合报告
+pt-query-digest /var/log/mysql/slow.log > report.txt
+```
+
+补充：实时看「此刻在跑什么」用 `SHOW PROCESSLIST`（或 `SHOW FULL PROCESSLIST` 看完整 SQL）、`information_schema.PROCESSLIST`；`SHOW PROFILE`（已废弃，8.0 用 `performance_schema` 替代）可看单条 SQL 各阶段耗时。
+
+## 二、再分析：EXPLAIN 怎么看
+
+定位到慢 SQL 后，用 `EXPLAIN` 看执行计划。索引原理与各列的完整释义见 [MySQL 索引原理](index.html) 第十一节，这里聚焦**优化视角下重点盯哪几列**。
+
+```sql
+EXPLAIN SELECT id, name FROM user WHERE name = 'tom';
+```
+
+**`type`（访问类型，性能从好到差）**——优化的第一眼，目标是别停在 `ALL`：
+
+```text
+system > const > eq_ref > ref > range > index > ALL
+  ▲最好                                            ▲最差(全表扫描)
+```
+
+| type | 含义 | 优化提示 |
+|---|---|---|
+| `const`/`system` | 主键 / 唯一索引等值，最多一行 | 最优，无需动 |
+| `eq_ref` | join 时对每个外层行用主键/唯一索引精确匹配一行 | join 的理想状态 |
+| `ref` | 普通（非唯一）索引等值匹配，可能多行 | 大多数走索引查询的正常状态 |
+| `range` | 索引范围扫描（`>`、`BETWEEN`、`IN`） | 正常，但留意扫描区间是否过大 |
+| `index` | 全**索引**扫描（扫整棵索引树） | 比 ALL 略好；常见于覆盖索引扫描，否则也偏慢 |
+| `ALL` | 全**表**扫描 | **重点优化对象**，通常是没用上索引 |
+
+**其它关键列**：
+
+- **`key`**：实际用的索引（`NULL` = 没走索引）。`possible_keys` 只是候选，要看 `key` 真用了没。
+- **`rows`**：优化器**估算**要扫描的行数，越小越好。它是估算值，不是精确值。
+- **`filtered`**：按条件过滤后**剩余行的百分比**。`rows × filtered%` ≈ 真正参与后续步骤（如 join）的行数；`filtered` 很低说明扫了一堆却没几行有用。
+- **`Extra`**：附加信息，**优化时最该盯的一列**：
+
+```text
+Using index            → 覆盖索引,免回表          (好,追求的状态)
+Using where            → Server 层用 WHERE 过滤    (常见,可能伴随回表)
+Using index condition  → 索引下推 ICP(5.6+),回表更少 (好)
+Using filesort         → 排序没走索引,需额外排序    (⚠ 警惕,见第五节)
+Using temporary        → 用了临时表(GROUP BY/去重/某些排序) (⚠ 警惕,开销大)
+```
+
+排查口诀：**`type` 是不是 `ALL` / `key` 是不是 `NULL` → 看 `Extra` 有没有 `Using filesort` / `Using temporary` → 看 `rows` 和 `filtered` 估算扫多少、有用多少**。
+
+## 三、索引层面优化
+
+最常见、性价比最高的优化方向。原理见 [MySQL 索引原理](index.html)，这里给优化清单：
+
+- **覆盖索引免回表**：让查询所需列全部落在索引里，`Extra` 出现 `Using index`，省掉回聚簇索引取整行的一轮 IO。这也是不要 `SELECT *` 的核心原因——`SELECT *` 几乎必然回表。
+- **最左前缀原则**：联合索引 `(a,b,c)` 必须从最左列开始、连续使用；`WHERE b=2`（缺 a）用不上。等值列放左、范围列放右，因为**范围列之后的列在索引里失效**。
+- **避免索引失效**（高频考点）：
+
+```sql
+-- 1) 函数/运算包裹索引列 → 失效
+SELECT * FROM t WHERE YEAR(create_time) = 2024;        -- 失效
+SELECT * FROM t WHERE create_time >= '2024-01-01'
+                  AND create_time <  '2025-01-01';      -- ✅ 改成范围,可用索引
+
+-- 2) 隐式类型转换 → 等价于在列上套了 CAST 函数
+SELECT * FROM t WHERE phone = 13800000000;             -- phone 是 varchar → 失效
+SELECT * FROM t WHERE phone = '13800000000';           -- ✅
+
+-- 3) 前导 % 模糊匹配 → 无法利用前缀有序
+SELECT * FROM t WHERE name LIKE '%tom';                -- 失效
+SELECT * FROM t WHERE name LIKE 'tom%';                -- ✅ 最左前缀可用
+```
+
+是否「失效」很多时候由**优化器基于成本估算**决定（要扫的行占比太大时，优化器会主动放弃索引走全表）——以 `EXPLAIN` 实测为准。
+
+## 四、深分页优化（高频）
+
+`LIMIT offset, n` 的语义是「**取出前 offset+n 行，再丢掉前 offset 行**」。所以 offset 越大越慢，慢在白扫了一大堆又扔掉。
+
+```sql
+-- 慢: 要先定位并扫描 100 万 + 10 行,再把前 100 万行全部丢弃
+SELECT * FROM order_t ORDER BY id LIMIT 1000000, 10;
+```
+
+```text
+LIMIT 1000000, 10 在干嘛:
+   聚簇索引上从头扫 → [丢] [丢] ... [丢] ×1000000 → [取][取]...×10
+                       └────── 100 万行白扫且每行回表取整行 ──────┘
+```
+
+**方案一：延迟关联 / 子查询（覆盖索引取主键，再回表）**
+
+先只在**索引**上分页拿到 10 个主键（覆盖索引扫描很轻），再用这 10 个主键回表取整行——把「100 万行的回表」变成「只回 10 行」。
+
+```sql
+-- 子查询先用主键索引把分页定位到 10 个 id(走覆盖索引,不取整行)
+SELECT * FROM order_t
+JOIN ( SELECT id FROM order_t ORDER BY id LIMIT 1000000, 10 ) AS t
+  USING (id);
+
+-- 等价写法
+SELECT * FROM order_t
+WHERE id IN ( SELECT id FROM order_t ORDER BY id LIMIT 1000000, 10 );
+```
+
+> 仍要扫描 100 万个索引项，但**叶子只含主键、不取整行、不回表**，比直接 `SELECT *` 分页快得多。这是**通用**方案，对「跳到任意页」也成立。
+
+**方案二：游标 / 书签（记住上次最大 id，最优但有前提）**
+
+不用 offset，而是记住上一页的「位置」，下一页直接从该位置之后取。
+
+```sql
+-- 第一页
+SELECT * FROM order_t WHERE id > 0       ORDER BY id LIMIT 10;
+-- 下一页: 把上一页最后一行的 id(如 100)带过来
+SELECT * FROM order_t WHERE id > 100     ORDER BY id LIMIT 10;
+```
+
+```text
+书签翻页: 直接用索引定位到 id>100 的起点 → 顺着叶子链表取 10 行
+   不再有「白扫 100 万再丢弃」,offset 多大都是同样的代价  ✅ 最优
+```
+
+> **代价/前提**：要求按一个**有序且唯一**的列（通常主键 / 自增 id）翻页，且**只能上一页/下一页、不能随机跳页**。适合「下拉加载更多」「无限滚动」这类场景。若排序列有重复值，需用 `(sort_col, id)` 复合游标保证不漏不重。
+
+| 方案 | 原理 | 优点 | 限制 |
+|---|---|---|---|
+| 直接 `LIMIT offset,n` | 扫 offset+n 行再丢 | 写法简单、可跳页 | offset 大时极慢 |
+| 延迟关联 / 子查询 | 覆盖索引取主键再回表 | 通用、支持跳页、回表只 n 行 | 仍要扫 offset 个索引项 |
+| 游标 / 书签 | `WHERE id > 上次最大值` | 最快、与 offset 无关 | 需有序唯一列、不能跳页 |
+
+## 五、order by 优化（避免 filesort）
+
+排序有两条路：**利用索引天然有序直接读出**，或**额外排一遍（filesort）**。`EXPLAIN` 的 `Extra` 出现 **`Using filesort`** 就是后者，是优化信号。
+
+**filesort 怎么排**：用 `sort_buffer`（连接级内存，`sort_buffer_size`）排序；数据量超过 buffer 就要**借助磁盘临时文件做外部归并排序**，明显变慢。
+
+**利用索引避免排序**：联合索引 `(a,b)` 本身就是先按 a、a 相同再按 b 排好的，所以下面这条无需排序：
+
+```sql
+-- 索引 (a, b): where a=? 后,结果天然按 b 有序 → 直接读出,无 filesort
+SELECT * FROM t WHERE a = 1 ORDER BY b;          -- ✅ 不排序
+```
+
+```text
+联合索引 (a,b) 的物理顺序: (1,1)(1,2)(1,5)(2,1)(2,3)...
+   WHERE a=1 锁定一段 → 这段里 b 已经是升序 → 顺着读就是 ORDER BY b 的结果
+```
+
+容易踩坑、退化成 filesort 的情况：
+
+```sql
+-- 1) 排序列不在索引(或断了最左前缀)
+SELECT * FROM t WHERE a = 1 ORDER BY c;          -- c 不在(a,b) → filesort
+
+-- 2) ASC/DESC 混用,与索引方向不一致(8.0 前;8.0 支持降序索引可缓解)
+SELECT * FROM t ORDER BY a ASC, b DESC;          -- 与同向索引不匹配 → filesort
+
+-- 3) 排序列用了函数 / 表达式
+SELECT * FROM t ORDER BY ABS(a);                 -- filesort
+
+-- 4) 用了不同索引做 where 和 order by(只能用一个 B+ 树的有序性)
+SELECT * FROM t WHERE a = 1 ORDER BY b;          -- a、b 各自单列索引 → 仍可能 filesort
+```
+
+实践：让 `WHERE 等值列 + ORDER BY 列`组成联合索引（等值列在前、排序列在后、方向一致），把排序交给索引完成。无法避免时，适当调大 `sort_buffer_size`、只 `SELECT` 必要列（减少单行体积，让更多行能在内存里排）。
+
+## 六、join 优化
+
+InnoDB 的 join 默认是**嵌套循环**家族：外层表（驱动表）每取一行，去内层表（被驱动表）匹配。
+
+**核心原则：小表驱动大表 + 被驱动表的关联列要有索引。**
+
+| 算法 | 触发条件 | 机制 | 性能 |
+|---|---|---|---|
+| **NLJ**（Index Nested-Loop Join） | 被驱动表关联列**有索引** | 驱动表每行，用索引去被驱动表精确查（`type` 多为 `ref`/`eq_ref`） | 好 |
+| **BNL**（Block Nested-Loop） | 被驱动表关联列**无索引** | 把驱动表一批行放进 `join_buffer`，再扫一遍被驱动表逐行比对，减少被驱动表的重复全扫 | 差，应补索引 |
+| **Hash Join**（8.0.18+） | 等值 join 且**无可用索引** | 对小表建内存哈希表，大表探测；取代了很多原本走 BNL 的场景 | 比 BNL 好很多 |
+
+```text
+NLJ(被驱动表有索引): 驱动表(小)每行 ──用索引──→ 被驱动表(大) 精确命中
+   驱动表 R 行 → 总成本 ≈ R 次索引查找          ✅
+
+BNL(被驱动表无索引): 驱动表攒一批进 join_buffer → 整表扫被驱动表逐行比
+   被驱动表被反复扫,join_buffer 装不下还要分多批 → 慢
+
+Hash Join(8.0.18+, 无索引等值连接):
+   小表 → 内存哈希表;大表逐行 hash 探测命中,只需各扫一遍   ✅(优于 BNL)
+```
+
+为什么「小表驱动大表」：嵌套循环里**驱动表的行数决定了循环次数**（即对被驱动表发起多少次查找）。驱动表越小，循环越少。注意「小表」指的是**最终参与 join 的结果集**（经过 `WHERE` 过滤后的行数），不只看物理表大小——优化器通常会自己挑，但写 SQL 时心里要有数。
+
+实践要点：
+
+- 给被驱动表的**关联列建索引**，让 join 走 NLJ（`EXPLAIN` 里被驱动表 `type` 到 `ref`/`eq_ref`、`Extra` 别出现 `Using join buffer (Block Nested Loop)`）。
+- 关联列**类型/字符集/排序规则要一致**，否则隐式转换导致索引失效退回 BNL。
+- 实在没索引、又是 8.0，靠 Hash Join 兜底；老版本则务必补索引。
+
+## 七、count 优化
+
+`count` 的语义先厘清，再谈优化：
+
+| 写法 | 语义 | 是否统计 NULL |
+|---|---|---|
+| `COUNT(*)` | 统计**行数** | — （不取列值，专门优化过） |
+| `COUNT(1)` | 统计行数（常量恒非空） | — |
+| `COUNT(主键 id)` | 统计 id 非 NULL 的行数 | 否（主键非空，结果同上） |
+| `COUNT(普通字段)` | 统计该**字段非 NULL** 的行数 | **否**（NULL 不计入） |
+
+- **`COUNT(*)` vs `COUNT(1)`**：语义都是「数行」，InnoDB 对 `COUNT(*)` 有专门优化，二者**性能基本一致**，无需纠结。`COUNT(字段)` 还要逐行判断该字段是否为 NULL，且语义不同（会漏掉 NULL 行）。
+- **走二级索引更省**：InnoDB 数 `COUNT(*)` 需要遍历，优化器会**挑一个最小的索引**来扫——二级索引叶子只存「索引列 + 主键」，比聚簇索引（叶子是整行）**每页能放更多记录、扫描的页更少**，所以有合适二级索引时 `COUNT(*)` 走它更快。
+
+```text
+聚簇索引叶子: [整行: id,name,age,addr,...] → 每页装的记录少 → 扫的页多
+二级索引叶子: [索引列 + 主键]              → 每页装的记录多 → 扫的页少 ✅
+   ∴ COUNT(*) 优化器优先选最小的那棵索引来扫
+```
+
+**引擎差异**：InnoDB **不缓存总行数**，因为 MVCC 下不同事务可见的行数不同，只能实时统计；而 **MyISAM** 把表总行数**单独存了一个值**，`COUNT(*)`（无 WHERE）直接返回 O(1)——代价是不支持事务、行级锁（详见 [存储引擎对比](engines.html)，MyISAM 维护行数的来龙去脉）。
+
+**海量数据要精确总数的实战**：InnoDB 全表 `COUNT(*)` 在亿级表上很慢，常见做法是**维护一张计数表 / 用 Redis 计数器**，写入时增减；对**估算值**可接受时直接用 `EXPLAIN SELECT ...` 里的 `rows`，或 `SHOW TABLE STATUS` 的 `Rows`（注意这俩都是**估算**，不精确）。
+
+## 八、其它实战清单
+
+- **避免 `SELECT *`**：多余列增大网络传输与单行体积；更关键的是**破坏覆盖索引**（少了哪怕一列不在索引里就得回表）。明确列出需要的字段。
+- **避免大事务**：长事务长时间持有锁、撑大 undo log、阻塞 purge、复制延迟；拆小、控制单次影响行数、别在事务里夹 RPC/外部调用。详见 [事务与隔离级别](transaction.html)。
+- **批量写代替单条循环**：`INSERT ... VALUES (...),(...),(...)` 一条顶多条，减少网络往返与事务提交开销；批量 `UPDATE/DELETE` 大表时分批（每批几千行）避免大事务与长锁。
+- **`IN` 列表别太长**、用 `JOIN` 或临时表替代超长 `IN`；`OR` 跨列且某列无索引易全表，可拆成 `UNION`。
+- **`EXPLAIN ANALYZE`（8.0.18+）**：不止给「预估」计划，而是**真正执行**并给出**实际耗时、实际行数、循环次数**，能直接对比优化器估算（`rows`/`filtered`）与现实的偏差，定位估算失真导致的坏计划。
+
+```sql
+-- 8.0.18+: 实际执行并输出真实耗时/行数(注意它会真的跑这条 SQL)
+EXPLAIN ANALYZE SELECT * FROM order_t WHERE user_id = 42 ORDER BY created_at;
+```
+
+## 一句话总结
+
+> SQL 优化是**「定位 → 分析 → 改写」**的闭环：**慢查询日志**（`slow_query_log` / `long_query_time`，配 `mysqldumpslow` / `pt-query-digest`）揪出慢 SQL；**`EXPLAIN`** 看怎么走，盯 `type`（别停在 `ALL`）、`key`（别 `NULL`）、`rows`/`filtered`、尤其 **`Extra`**（追求 `Using index` 覆盖索引、警惕 `Using filesort` / `Using temporary`、`Using index condition` 是 ICP）。改写手段：**索引**（覆盖免回表、最左前缀、避开函数包裹/隐式转换/前导 `%`）；**深分页**用**延迟关联**（覆盖索引取主键再回表）或更优的**游标书签**（`WHERE id > 上次最大值`，需有序列、不可跳页）；**排序**用联合索引天然有序避开 filesort；**join** 小表驱动大表、被驱动表关联列建索引走 **NLJ**，无索引则退化 **BNL**（8.0 有 **Hash Join** 兜底）；**count** 里 `COUNT(*)`≈`COUNT(1)` 且优化器优先扫最小的二级索引（InnoDB 不缓存行数，MyISAM 缓存）。再加上**不 `SELECT *`、不开大事务、批量写、`EXPLAIN ANALYZE`（8.0）看真实执行**。核心永远是：**少扫行、少回表、少排序、少随机 IO**。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="mysql/optimization" data-base="../"></script>
+</body>
+</html>

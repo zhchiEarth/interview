@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>timer / ticker 底层实现 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# timer / ticker 底层实现
+
+## 一、timer / ticker 是干嘛的
+
+让一段代码**等一段时间再跑**，或者**周期性触发**：
+
+```go
+// Timer: 一次性, N 秒后触发
+t := time.NewTimer(2 * time.Second)
+<-t.C   // 阻塞 2 秒, 然后返回
+
+// Ticker: 周期性, 每 N 秒触发一次
+tk := time.NewTicker(1 * time.Second)
+defer tk.Stop()
+for range tk.C {
+    doWork()    // 每 1 秒跑一次
+}
+
+// AfterFunc: N 秒后调用一个函数 (不阻塞)
+time.AfterFunc(5*time.Second, func() {
+    log.Println("5s 后跑")
+})
+```
+
+| 用途 | API |
+|---|---|
+| 等一段时间继续 | `time.NewTimer` / `<-time.After(d)` |
+| 周期性触发 | `time.NewTicker` |
+| 延时回调（不阻塞） | `time.AfterFunc` |
+| 一次性 sleep | `time.Sleep` |
+
+→ 看着简单的 API，底层是 Go runtime 里**最大的并发原语之一**——支撑了几乎所有"超时 / 定时 / 重试"的实现。
+
+---
+
+## 二、设计推导：从"全局锁堆"到 per-P 四叉堆
+
+> Timer 是 Go runtime 里**优化次数最多的子系统之一**——`context.WithTimeout`、RPC 超时、心跳……一个并发服务每秒可能创建/销毁上百万个 timer。这套 per-P 四叉堆不是一开始就有的，是被性能**一步步逼出来**的。顺着走一遍，后面的数据结构和触发机制就都有了来由。
+
+### 起点 · 定时这件事难在哪
+
+- **海量**：每个超时控制、每个 Ticker 都是一个 timer，并发服务里同时存活几十万个很常见。
+- **高频增删**：大量 timer **还没触发就被取消**（请求提前返回、context cancel）→ 删的次数甚至比触发还多。
+- **要秒级知道"下一个该触发谁"**：不能挨个遍历。
+- **多核并发**：N 个核同时创建/取消 timer。
+
+> "快速取最早 + O(log n) 增删" → **小顶堆**是天然选择。真正的难点全在**并发**怎么扛——下面三版都在解决这个。
+
+### 第 1 版 · 全局单堆 + 全局锁（Go 1.9 前）
+
+一个全局小顶堆 + 一把全局锁，外加一个专门的 `timerproc` goroutine 守着堆顶、到点触发。
+
+✗ **两个瓶颈**：
+- 每次 add/del/触发都抢**同一把全局锁** → N 核全部串行，核越多越堵。
+- 多一个**常驻 goroutine**，触发要跨线程唤醒，调度开销大。
+
+### 第 2 版 · 64 个分片堆（Go 1.10 ~ 1.13）
+
+按 timer 地址 hash 分到 64 个堆，每堆各有各的锁 → 锁竞争降到 ~1/64。
+
+✗ 但**还是有锁**；而且 timer 和"哪个 P 在跑它"无关，触发时要跨片找、跨线程唤醒，和调度器**耦合差**。
+
+### 第 3 版 · per-P 四叉堆 + 和调度器合体（Go 1.14+）★ 性能跃迁
+
+核心 insight：**把 timer 从"独立子系统"塞进 GMP 调度器**。
+
+- **每个 P 一个自己的堆** → 自己的 timer 自己管，**99% 操作无锁**（P 内单线程访问）。
+- **干掉 timerproc**：调度器 `findRunnable` 每轮**顺手看一眼**本 P 堆顶过期没——不需要常驻检查线程（详见"触发机制"一节）。
+- **没活干要睡时靠 netpoll 兜底**：睡到"最早 timer 时刻"，顺便还等着 IO，一举两得。
+- **堆用四叉不用二叉**：因为 Push 远多于 Pop（见下节）。
+
+```text
+   旧 (≤1.13): 全局堆 + 全局锁         新 (1.14+): 每个 P 一个四叉堆, 各管各的
+   ┌──────────────────────┐          ┌─────────┐ ┌─────────┐ ┌─────────┐
+   │   global timer heap   │          │   P0    │ │   P1    │ │   P2    │ ...
+   │   ┌────────────────┐  │          │ 四叉堆   │ │ 四叉堆   │ │ 四叉堆   │
+   │   │ 改它要抢全局锁  │  │          │ [堆顶]  │ │ [堆顶]  │ │ [堆顶]  │
+   │   └────────────────┘  │          └────┬────┘ └────┬────┘ └────┬────┘
+   │   timerproc 常驻 G     │               │           │           │
+   │   专门守着它           │            findRunnable 每轮顺手 check 本 P 堆顶
+   └──────────────────────┘               (无锁, 也没有 timerproc 了)
+         N 核串行抢锁                         各 P 并行, 99% 无锁
+```
+
+性能：从"每个 timer 操作几百 ns 抢锁" → **几十 ns 无锁**。
+
+### 第 4 版 · 提前 GC + 免手动 drain（Go 1.23+）
+
+补两个老毛病：
+- `time.After` 创建的 timer 以前**必须等触发才能 GC**，循环里疯狂堆积 → 1.23 起 channel 不再被引用时**可提前 GC**。
+- Stop/Reset 的**手动 drain 心智负担** → 1.23 改了 channel 语义，**不用再手动 drain**（详见"Stop / Reset"一节）。
+
+### 演化速查表
+
+| 版本 | 实现 | 核心问题 / 改进 |
+|---|---|---|
+| **≤ 1.9** | 全局单堆 + 全局锁 + timerproc | 全局锁串行、常驻 goroutine 开销 |
+| **1.10–1.13** | 64 个分片堆 | 锁竞争 ÷64，但仍有锁、调度耦合差 |
+| **1.14+** | **per-P 四叉堆 + 调度耦合** | ★ 99% 无锁，干掉 timerproc |
+| **1.23+** | timer 提前 GC + channel 同步语义 | 修 `time.After` 堆积 + 免手动 drain |
+
+> **终点结构**：`per-P 四叉小顶堆 + 调度器 findRunnable 顺手 check + netpoll 兜底唤醒`。后面几节就是把这张图拆细——**数据结构**讲堆、**触发机制**讲 check 与 netpoll、**Stop/Reset**讲 channel 语义。
+
+---
+
+## 三、Timer vs Ticker：一次 vs 周期
+
+```go
+type Timer struct {
+    C <-chan Time
+    // 内部还有 timer 结构
+}
+
+type Ticker struct {
+    C <-chan Time
+    // 内部还有 timer 结构, period > 0
+}
+```
+
+唯一的实现差异：**`period` 字段**。
+
+| | period |
+|---|---|
+| Timer | 0（触发一次后从堆上移除） |
+| Ticker | > 0（触发后 `when += period` 重新入堆） |
+
+底层用**同一个 `timer` 结构**。
+
+---
+
+## 四、底层数据结构
+
+### timer struct（runtime 内部）
+
+```go
+type timer struct {
+    when     int64                  // 触发时间 (绝对纳秒)
+    period   int64                  // 周期 (Ticker 用, Timer = 0)
+    f        func(arg any, seq uintptr, delay int64)  // 触发时调的函数
+    arg      any                    // 传给 f 的参数 (一般是 *Timer.C)
+    seq      uintptr
+    status   atomic.Uint32          // 状态机
+    pp       puintptr               // 当前挂在哪个 P 上
+}
+```
+
+### per-P 四叉堆
+
+Go 1.14+ 用 **per-P 四叉小顶堆** 管理 timer：
+
+```
+每个 P (调度器的逻辑 CPU):
+   ┌──────────────────────────┐
+   │  P0:                      │
+   │   timers []*timer         │  ← 这就是堆
+   │   minWhen int64           │  ← 堆顶最早触发时间, 加速 check
+   │   numTimers atomic.Int32  │
+   │   ...                     │
+   └──────────────────────────┘
+
+   P1: 自己的 timer 堆
+   P2: 自己的 timer 堆
+   ...
+```
+
+**关键性质**：
+
+- **每个 timer 只属于一个 P**——P 之间互不干扰
+- **四叉堆**（不是二叉堆）：每个父节点最多 4 个子节点
+- **小顶堆**：堆顶永远是"最早要触发的"timer
+
+### 为什么是四叉堆，不是二叉堆
+
+先看两者的形状差别（堆都用一个**扁平数组**存，靠下标算父子，不拉指针建树）：
+
+```text
+   二叉堆 (每节点 2 个孩子)          四叉堆 (每节点 4 个孩子)
+
+           [0]                              [0]
+          /   \                     /    /     \     \
+        [1]   [2]                 [1]   [2]   [3]   [4]
+        / \   / \                /|\ \
+      [3][4][5][6]            [5][6][7][8] ...
+
+   下标关系:                        下标关系:
+     孩子 = 2i+1, 2i+2               孩子 = 4i+1 ~ 4i+4
+     父   = (i-1)/2                  父   = (i-1)/4
+
+   树高 = log₂N                     树高 = log₄N = ½ log₂N (矮一半)
+   小顶堆: [0] 永远是 when 最早的 → 调度器 O(1) 看堆顶就知道谁该触发
+```
+
+> **上滤(插入)**只沿着"跟父节点比"往上爬一条路 → 树矮一半，比较次数省一半。
+> **下滤(弹出)**每层要在"4 个孩子里挑最小"，比较次数和二叉堆打平。
+> 加上同层 4 个孩子在数组里**紧挨着**(一个缓存行能装下)，所以对"插入多、弹出少"的 timer 负载，四叉堆更划算。
+
+| | 二叉堆 | 四叉堆 |
+|---|---|---|
+| 高度 | log₂(N) | log₄(N) = ½ log₂(N) |
+| 上滤（Push）比较次数 | log₂(N) | log₄(N) ≈ 0.5 × log₂(N) |
+| 下滤（Pop）比较次数 | 2 × log₂(N) | 4 × log₄(N) = 2 × log₂(N) |
+| **cache 友好度** | 一般 | **更好**——同一层 4 个兄弟在内存上更紧凑 |
+
+Push 比 Pop 更频繁（很多 timer 加进去就被 Stop 掉了，Pop 不到一次），所以**优化 Push 的四叉堆赢**。
+
+---
+
+## 五、Timer 怎么被触发：调度器顺手 check
+
+这是 Go 1.14+ 设计的**精髓**——**没有独立的 timer 检查线程**，全靠调度器顺手做。
+
+### 调度循环里的 check
+
+```go
+// runtime.findRunnable (简化伪代码)
+func findRunnable() *g {
+    for {
+        // ① 先看本 P 的 timer 堆顶
+        if checkTimers(pp) {
+            // 有过期 timer → 触发它的回调 (一般是给 channel 写值)
+            // 触发对应的 G 变成 runnable
+        }
+
+        // ② 找可运行的 G
+        if g := pp.runq.get(); g != nil {
+            return g
+        }
+        // ③ 偷别人的 G ...
+        // ④ 没活干 → sleep
+    }
+}
+```
+
+**关键**：每次调度器准备找下一个 G 跑时，**先看一眼当前 P 的 timer 堆顶有没有过期**。
+
+```
+执行流:
+  findRunnable() → checkTimers (顺手) → 取下一个 G → 跑 G → ... → findRunnable() 再 check
+                       │
+                       └─ 堆顶 timer 过期? → 触发回调
+                                              触发的 G 进入 runnable 队列
+```
+
+### timer 触发做了什么
+
+```go
+// timer.f 一般是 sendTime, 触发时:
+func sendTime(c any, seq uintptr) {
+    select {
+    case c.(chan Time) <- time.Now():
+        // 给 Timer.C 写一个值 → <-t.C 阻塞的 G 被唤醒
+    default:
+        // channel 满了, 丢弃 (Ticker 设计成"丢弃不阻塞")
+    }
+}
+```
+
+→ 触发本质上就是**给 channel 写一个值**，等的 G 收到值就跑。
+
+### 没活干时怎么知道有 timer 要触发
+
+如果所有 P 都空闲（M 都准备 sleep），需要保证 **timer 到了能唤醒**：
+
+```go
+// findRunnable 末尾:
+if 没活干 {
+    // 算出"最早过期的 timer" 离现在多久
+    pollUntil := minWhen(所有 P)
+
+    // sleep 到那个时刻 (用 nanosleep + epoll_wait 超时)
+    netpoll(pollUntil - now())
+
+    // 醒来再 check timer
+}
+```
+
+`netpoll` 同时**等 IO + 等 timer**——一举两得。
+
+### M 睡着后，新来的 timer 怎么把它叫醒
+
+上面 M 是"睡到最早 timer 时刻"。但万一它睡下后，**有人又往某个 P 塞了一个更早的 timer**（比如刚发起一个 10ms 超时），总不能等它按老时刻睡醒。
+
+→ 添加 timer 时，runtime 会拿新 timer 的 `when` 跟当前的休眠截止点比；如果**更早**，就调 `wakeNetPoller` **把睡在 netpoll 里的 M 戳醒**，让它重新算最近的触发时刻再睡。**保证最早的 timer 不会被睡过头。**
+
+```text
+M 算出最早 timer 在 t=50ms, 睡进 netpoll(50ms)
+        │
+        │  t=5ms 时, 另一个 G 加了个 when=10ms 的 timer
+        ▼
+   新 when(10) < 休眠截止(50)?  是
+        │
+        ▼
+   wakeNetPoller() 戳醒 M → M 重算 → 改睡 netpoll(10-5=5ms)
+```
+
+### per-P 堆会不会让 timer 饿死？——偷 timer
+
+per-P 有个隐患：timer 挂在 P0，可 P0 的 M 正好**陷入系统调用或被 park**，没人跑它的 `checkTimers`，timer 不就拖了？
+
+Go 把 timer 也纳入 **work-stealing**：
+
+- `findRunnable` 找不到本地 G 要去**偷别的 P**时，偷之前**先 `checkTimers(其它 P)`**——顺手把别的 P 上过期的 timer 跑掉。
+- 即 timer **归属某个 P，但不被那个 P 独占执行**——任何空闲的 M 都能帮忙触发过期 timer。
+
+> **per-P 是为了"管理无锁"，触发却是"全局协作"**——所以单个 P 卡住，不会让它的 timer 饿死。
+
+### 精度问题
+
+Timer **不是硬实时**——精度受**调度延迟**影响：
+
+```
+理想: timer 在 t=1.000s 触发
+实际: t=1.000s 时 timer 在堆里过期了
+     但调度器要在 t=1.003s 才轮到 check
+     此时才触发回调
+     被唤醒的 G 进入 runnable 队列
+     真正跑可能要等到 t=1.005s
+```
+
+**实测延迟**：毫秒级（一般 < 5ms）。**需要纳秒级精度的硬实时场景，Go 不合适**。
+
+---
+
+## 六、Stop / Reset 的正确姿势
+
+Timer 的 API 很容易写错——主要因为它和 channel 的交互有微妙的 race。
+
+### Stop 返回值的含义
+
+```go
+stopped := t.Stop()
+```
+
+- `stopped == true` → 调用 Stop 时 timer 还没触发，**成功阻止了触发**
+- `stopped == false` → timer 已经触发（或者本来就没在跑）
+
+**注意**：`stopped == false` 不代表 channel 里没数据——可能 timer 触发后 channel 写了值但还没人读。
+
+### 经典坑：Reset 前没 drain
+
+```go
+// ❌ 错的
+t := time.NewTimer(time.Second)
+time.Sleep(2 * time.Second)   // timer 已触发, t.C 里有数据
+t.Reset(time.Second)
+<-t.C                          // 立刻取到上次的旧值, 而不是等 1 秒
+```
+
+### Go 1.23 前的标准模式
+
+```go
+// ✓ Go 1.23 前的安全 Reset
+if !t.Stop() {
+    select {
+    case <-t.C:   // drain 残留值
+    default:
+    }
+}
+t.Reset(d)
+```
+
+### Go 1.23+ 的改进：channel 改成同步语义
+
+Go 1.23 重写了 `NewTimer`/`NewTicker` 的 channel 实现，从根上消掉了 drain 问题。关键不是"自动帮你 drain"，而是**让旧值根本不会留下来**：
+
+- **以前**：`t.C` 是**带 1 个缓冲**的 channel。timer 一触发就往缓冲塞个值；没人及时读，值就留着 → Stop 之后缓冲里仍可能有**旧值**，所以必须手动 drain。
+- **1.23 起**：`t.C` 变成**无缓冲（同步）**channel，且 runtime 保证——**`Stop` / `Reset` 返回后，绝不会再收到"本次调用之前"该触发的值**（在途的发送会被一并作废）。
+
+所以 1.23+ 直接：
+
+```go
+t.Reset(d)   // 不用先 Stop + drain, 之后也不会读到旧值
+```
+
+两个注意点：
+
+1. 只有 `NewTimer` / `NewTicker` 返回的 timer 适用——`time.AfterFunc` 没 channel，本就没这问题。
+2. 因为 channel 改成无缓冲，`len(t.C)` / `cap(t.C)` 那些老技巧不再有意义。
+
+---
+
+## 七、典型陷阱
+
+### ① time.After 在循环里（Go 1.23 前堆积 timer）
+
+```go
+// ❌ Go 1.23 前堆积 timer
+for {
+    select {
+    case <-time.After(time.Second):
+        ...
+    case <-quit:
+        return
+    }
+}
+```
+
+每次循环都创建新 timer，**旧 timer 要等到触发才能释放**——高频循环里堆积大量 timer。
+
+**修法（任何 Go 版本都适用）**：
+
+```go
+t := time.NewTimer(time.Second)
+defer t.Stop()
+for {
+    select {
+    case <-t.C:
+        ...
+        t.Reset(time.Second)
+    case <-quit:
+        return
+    }
+}
+```
+
+> Go 1.23+ `time.After` 的 timer 可以在 channel 引用消失时被 GC——泄漏问题大幅缓解。但 NewTimer + Reset **仍然更省内存**。
+
+### ② Ticker 忘了 Stop
+
+```go
+// ❌ 永远不退出 → ticker timer 永远活着
+tk := time.NewTicker(time.Second)
+for range tk.C {
+    if done { break }   // break 出去后 ticker 还在堆上!
+}
+```
+
+**修法**：
+
+```go
+tk := time.NewTicker(time.Second)
+defer tk.Stop()   // ⚠️ 必须!
+```
+
+Ticker **永远不会自己消失**——必须显式 `Stop()` 才能从堆上摘除。
+
+### ③ Reset 时序错乱
+
+```go
+// ❌ Race
+go func() {
+    if !t.Stop() {
+        <-t.C   // 阻塞等? 可能永远等不到!
+    }
+    t.Reset(d)
+}()
+```
+
+Stop 返回 false 不一定意味着**channel 里有值**——可能 timer 已经触发但回调还没跑，或者根本就是个已经被 drain 过的 timer。盲目 `<-t.C` 可能死锁。
+
+**修法**：用 `select + default`（如上 Go 1.23 前模式）。
+
+### ④ `time.AfterFunc` 在 f 里 Reset 自己
+
+```go
+var t *time.Timer
+t = time.AfterFunc(time.Second, func() {
+    doWork()
+    t.Reset(time.Second)   // 在自己的回调里 Reset
+})
+```
+
+这其实是**合法的**——AfterFunc 不依赖 channel，回调里 Reset 自己等价于"周期任务"。但有个坑：如果 `doWork` 很慢，**周期会被推迟**（不像 Ticker 是按固定节拍的）。
+
+---
+
+## 八、性能 & 实战建议
+
+### 性能直觉（Go 1.14+）
+
+```
+NewTimer 创建:       ~50 ns
+Stop / Reset:        ~30 ns (操作 per-P 堆)
+Timer 触发延迟:      毫秒级 (受调度影响, 一般 < 5ms)
+```
+
+### 实战建议
+
+- **超时控制**：用 `context.WithTimeout`，不直接用 Timer
+- **限流 / 周期任务**：用 `NewTicker + defer Stop`
+- **一次性延时回调**：用 `AfterFunc`（避免开 goroutine 等 channel）
+- **高频循环里的超时**：用 `NewTimer + Reset`，不要 `time.After`
+- **需要硬实时**：Go 不合适，考虑 C/Rust + 实时内核
+
+### 不要这么用
+
+```go
+// ❌ 把 timer 当精确闹钟
+t := time.NewTimer(time.Second)
+<-t.C
+// 期望恰好 1.000s, 实际可能 1.003s
+// 累积起来精度漂移
+```
+
+**周期性任务用 Ticker**（自动按固定节拍），不要 `NewTimer + Reset` 循环（容易精度漂移）。
+
+---
+
+## 九、一图总结
+
+```
+                  Timer / Ticker
+                        │
+                        ▼
+              底层都是 timer struct
+              区别只在 period 字段
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+     Timer (period=0)              Ticker (period>0)
+     触发一次后从堆移除             触发后 when += period 重新入堆
+
+   per-P 四叉小顶堆 (Go 1.14+):
+   ┌──────────────────────────────────┐
+   │ P0:  [t1, t2, t3, ...]            │
+   │      ↑ 堆顶是最早触发的            │
+   │                                    │
+   │ P1:  [...]   P2:  [...]            │
+   │                                    │
+   │ 每个 timer 只挂一个 P             │
+   │ 各 P 之间互不干扰 → 99% 无锁       │
+   └──────────────────────────────────┘
+
+   四代实现:
+   ┌──────────────────────────────────┐
+   │ ≤1.9    : 全局单堆 + 全局锁         │
+   │ 1.10-13 : 64 个分片堆               │
+   │ 1.14+   : per-P 四叉堆 + 调度耦合   │ ★ 性能跃迁
+   │ 1.23+   : time.After timer 提前 GC  │
+   └──────────────────────────────────┘
+
+   触发机制 (Go 1.14+):
+     调度器 findRunnable 每次先 check 本 P 的 timer 堆顶
+     过期 → 调 timer.f (一般是给 channel 写值)
+     等的 G 被唤醒变 runnable
+     → 不需要独立的 timer 检查线程
+     空闲 M 偷别 P 时顺手 checkTimers → timer 不会因某 P 卡住而饿死
+     新来更早的 timer → wakeNetPoller 戳醒睡着的 M
+
+   精度: 毫秒级 (受调度延迟影响, 不是硬实时)
+
+   Stop / Reset (Go 1.23 前):
+     if !t.Stop() {
+       select { case <-t.C: default: }   // drain
+     }
+     t.Reset(d)
+
+   Stop / Reset (Go 1.23+):
+     t.Reset(d)   // channel 改无缓冲同步语义, 之后不会再读到旧值
+
+   常见陷阱:
+     time.After 循环里堆积 timer → NewTimer + Reset
+     Ticker 忘 Stop → 内存泄漏
+     Reset 时序错乱 → race, 用 select+default
+     当精确闹钟 → 周期任务用 Ticker 不是 NewTimer
+```
+
+**一句话**：timer / ticker 底层是 **per-P 四叉小顶堆**（Go 1.14+），**调度器 findRunnable 顺手 check 堆顶**——没有独立的 timer 检查线程，触发就是给 channel 写值唤醒等待的 G。精度毫秒级（受调度影响）。**Ticker 必 Stop，循环里别用 time.After（Go 1.23 前堆积），Reset 在 Go 1.23+ 已自动 drain**。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/timer" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redis中内存淘汰算法实现 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Redis中内存淘汰算法实现
+
+> 一句话：先分清「**过期键删除**（key 到 TTL 怎么删）」和「**内存淘汰**（内存满了删谁）」两件事——前者靠惰性删除 + 定期删除，后者靠 `maxmemory` + 8 种策略，其中 LRU/LFU 都是**近似实现**（采样 + 24bit 时钟/计数器），不是全局精确算法。
+
+## 一、先把两件事彻底分清（最常被混）
+
+面试里这俩极易混为一谈，先用一张表钉死边界：
+
+| 维度 | ① 过期键删除策略 | ② 内存淘汰策略 |
+|---|---|---|
+| 触发条件 | key **设置了 TTL** 且到期 | 内存用量逼近 / 超过 `maxmemory` |
+| 处理对象 | 只针对带过期时间的 key | 可针对全体 key，或仅带 TTL 的 key |
+| 目的 | 让过期数据在逻辑上消失、顺便回收内存 | 内存吃紧时**腾空间**，保证写入可继续 |
+| 机制 | 惰性删除 + 定期删除 | `maxmemory-policy` 8 选 1（LRU/LFU/random/ttl/noeviction） |
+| 配置项 | `hz` / `maxmemory-eviction-tenacity`（影响定期删除节奏） | `maxmemory` / `maxmemory-policy` / `maxmemory-samples` |
+
+```text
+                     一个 key 的命运
+   ┌────────────────────────────────────────────────┐
+   │  设了 TTL 且到期？ ──是──→ 过期删除(惰性/定期)    │
+   │        │否                                       │
+   │        ↓                                         │
+   │  内存超过 maxmemory？ ──是──→ 内存淘汰(按 policy) │
+   │        │否                                       │
+   │        ↓  继续存活                               │
+   └────────────────────────────────────────────────┘
+```
+
+> 关键直觉：**过期删除是「该不该还活着」，内存淘汰是「活着但地方不够了」**。两套机制独立运行，又互相兜底——过期键没被及时删掉占着内存，最终会被内存淘汰顺手清掉。
+
+---
+
+## 二、过期键删除策略
+
+Redis 的 key 过期时间记录在每个 db 的独立字典里——`redisDb` 结构有两个字典：`dict`（存所有 key→value）和 `expires`（只存「设了 TTL 的 key」→「绝对过期时间戳，毫秒」）。删除过期键有三种思路，Redis 选了其中两种组合。
+
+### 三种思路对比
+
+| 策略 | 做法 | 优点 | 缺点 | Redis 是否采用 |
+|---|---|---|---|---|
+| 定时删除 | 给每个 key 设一个定时器，到点就删 | 内存最友好，过期即删 | **CPU 极不友好**：大量定时器消耗 CPU，且要维护一堆时间事件 | ❌ 不用 |
+| 惰性删除 | 访问 key 时才检查是否过期，过期则删 | CPU 最友好（不做无用功） | **内存不友好**：没被访问的过期 key 一直占内存 | ✅ 用 |
+| 定期删除 | 每隔一段时间，随机抽一批检查并删 | 折中：限定时长，分摊 CPU | 难以平衡频率/时长，有漏删 | ✅ 用 |
+
+> 为什么不用「定时删除」？给每个带 TTL 的 key 挂定时器，会产生海量定时事件；在内存紧张但 CPU 也紧张的场景，宁可省 CPU。Redis 是单线程处理命令的，CPU 时间极宝贵，所以放弃了对 CPU 最不友好的定时删除。
+
+### 惰性删除（lazy / passive expiration）
+
+```text
+client: GET foo
+          │
+          ① 命令执行前调用 expireIfNeeded(db, key)
+          │
+          ② foo 在 expires 字典里？且 now > 过期时间？
+          │            ├─ 是 → 删除 foo，按 NULL 处理（GET 返回 nil）
+          │            └─ 否 → 正常读取
+```
+
+源码入口：所有读写命令在真正操作 key 前会先走 `expireIfNeeded()`。**没人访问的过期 key，惰性删除永远碰不到它**——这就是它的缺陷，必须靠定期删除补位。
+
+> 补充：从节点（replica）上惰性删除不会自己删数据，而是等主节点发来 `DEL`，从节点逻辑上把它当过期处理但保留数据，以保证主从一致。
+
+### 定期删除（active expiration）
+
+由 `serverCron` 定时任务驱动（默认 `hz=10`，即每秒约 10 次 → 每 100ms 一轮），内部调用 `activeExpireCycle()`：
+
+```text
+activeExpireCycle()  每轮（默认 SLOW 模式）：
+  for 每个 db:
+    do {
+      从该 db 的 expires 字典里【随机抽样】最多 20 个 key
+      检查并删除其中已过期的
+      统计本批过期比例
+    } while (过期比例 > 25%)        ← 过期太多就继续清，说明这个 db 脏
+    │
+    └─ 总耗时受限：单轮不超过 CPU 时间的 25%
+       (由 timelimit 控制，避免阻塞正常命令)
+```
+
+要点（基于 Redis 6.x/7.x 行为）：
+
+- **随机抽样**而非全量扫描，避免遍历巨大的 expires 字典。
+- **自适应**：一批里过期比例高就继续多删几轮；低于阈值（约 25%）就停手，跳到下一个 db。
+- **限时**：单轮总时间有上限，绝不能因为清过期把正常请求饿死。
+- 还有一个 FAST 模式（在事件循环 `beforeSleep` 中触发），用更短的时间限制做快速清理。
+- Redis 6 起 `maxmemory-eviction-tenacity`（默认 10）可调节淘汰/清理的「努力程度」，值越大越激进。
+
+### 惰性 + 定期 的配合与缺陷
+
+```text
+        ┌─ 惰性删除：被访问到 → 立即删（CPU 友好，但漏没人访问的）
+配合 ──┤
+        └─ 定期删除：周期随机抽样删一批（兜底没人访问的，但抽样有漏网）
+                │
+                ↓ 仍有漏删的过期 key 占着内存
+                ↓
+        内存淘汰策略（maxmemory）最终兜底
+```
+
+> 缺陷链条：惰性漏掉「没人访问的」→ 定期靠随机抽样也可能漏掉「恰好没被抽到的」→ 这些「僵尸过期 key」继续占内存 → 当内存逼近 `maxmemory`，内存淘汰机制会把它们（以及其它 key）清掉。**三道防线层层兜底**。
+
+---
+
+## 三、maxmemory + 8 种淘汰策略
+
+当内存用量达到 `maxmemory` 上限，Redis 在执行写命令前会先尝试释放内存（`performEvictions()`）。删谁，由 `maxmemory-policy` 决定。
+
+```text
+maxmemory 100mb
+maxmemory-policy allkeys-lru
+maxmemory-samples 5
+```
+
+### 8 种策略一览（Redis 4.0 起完整 8 种）
+
+| 策略 | 候选集合 | 淘汰依据 | 典型场景 |
+|---|---|---|---|
+| `noeviction` | —— | 不淘汰，写命令直接返回 `OOM` 错误（读仍可） | **默认值**；不容许丢数据的存储型用途 |
+| `allkeys-lru` | 全体 key | 最近最少使用（近似 LRU） | 通用缓存，热点不明确 |
+| `allkeys-lfu` | 全体 key | 最不经常使用（近似 LFU，4.0+） | 缓存且存在长期热点 |
+| `allkeys-random` | 全体 key | 随机 | key 访问分布均匀、无明显冷热 |
+| `volatile-lru` | 仅设了 TTL 的 key | 近似 LRU | 缓存 + 持久数据混存，只想淘汰缓存部分 |
+| `volatile-lfu` | 仅设了 TTL 的 key | 近似 LFU（4.0+） | 同上，且看重访问频率 |
+| `volatile-random` | 仅设了 TTL 的 key | 随机 | 同上，淘汰对象不挑 |
+| `volatile-ttl` | 仅设了 TTL 的 key | 优先淘汰**剩余 TTL 最短**（最早过期）的 | 想让快过期的早点走 |
+
+```text
+      allkeys-*                    volatile-*
+   ┌──────────────┐            ┌──────────────┐
+   │  全体 key 都  │            │  只在 expires │
+   │  是淘汰候选   │            │  字典里的 key │
+   │              │            │ (即设了 TTL)  │
+   └──────────────┘            └──────────────┘
+```
+
+> 易错点：`volatile-*` 系列的候选集合**只有设了过期时间的 key**。如果内存满了但没有任何带 TTL 的 key，`volatile-*` 会**淘汰不出东西**，行为退化得跟 `noeviction` 一样——写命令报 OOM。所以纯缓存场景通常用 `allkeys-*`。
+
+> `noeviction` 是 Redis 的**默认策略**：宁可写失败也不主动删数据。把 Redis 当持久存储用时合理，但当纯缓存用时往往该改成 `allkeys-lru` / `allkeys-lfu`。
+
+---
+
+## 四、近似 LRU 的实现
+
+### 为什么不做精确 LRU
+
+精确 LRU 需要一条贯穿所有 key 的双向链表，每次访问把节点挪到表头。问题：
+
+- 额外维护链表指针，**每个 key 多耗十几字节内存**——Redis 动辄上亿 key，代价巨大。
+- 每次访问都要改链表，增加开销。
+
+Redis 的取舍：**用「近似 LRU」省内存，牺牲一点精度换巨大的内存/性能收益**。
+
+### redisObject 里的 24bit lru 字段
+
+```text
+struct redisObject {
+    unsigned type:4;
+    unsigned encoding:4;
+    unsigned lru:24;   ← 关键：24 bit
+    int refcount;
+    void *ptr;
+};
+```
+
+- 在 **LRU 模式**下，这 24bit 存「**最后一次访问的时间戳**」（精度为秒，取自一个全局 LRU 时钟 `server.lruclock`，约每 100ms 更新一次）。
+- 24bit 秒级时钟约 194 天循环一次（2^24 秒 ≈ 194 天）。
+- 访问 key 时更新这个字段，**不需要任何链表**——这就是省内存的关键。
+
+### 采样淘汰：maxmemory-samples
+
+```text
+需要淘汰时（以 allkeys-lru 为例）：
+  ① 从候选集合中【随机抽样】maxmemory-samples 个 key（默认 5）
+  ② 比较它们的 lru 字段，挑【空闲时间最长】（最久没访问）的那个淘汰
+  ③ 内存仍不够 → 重复 ①②
+```
+
+```text
+随机抽 5 个 (samples=5):
+  keyA  idle=12s
+  keyB  idle=3s
+  keyC  idle=88s   ← 空闲最久，淘汰它
+  keyD  idle=7s
+  keyE  idle=20s
+```
+
+- `maxmemory-samples` 越大，近似越接近精确 LRU，但 CPU 开销越高。**默认 5 是精度与性能的平衡点**；调到 10 已经非常接近精确 LRU。
+- 注意：是在**采样的小样本里**挑最久未用，不是全局最久未用——所以叫「近似」。
+
+### 4.0 起的改进：淘汰池（eviction pool）
+
+```text
+Redis 3.0 之前：每次只在「本次采样的 N 个」里挑最差的，样本间无记忆。
+Redis 3.0+：引入【淘汰池】eviction pool（容量 16）
+   ┌─────────────────────────────────────────┐
+   │ pool（按空闲时间升序排列的候选，长期保留） │
+   └─────────────────────────────────────────┘
+   每次采样的 key 与池中元素比较：
+     比池里现有候选「更该淘汰」(更久未用) 的才进池
+     淘汰时从池尾(空闲最久)取
+```
+
+淘汰池让历次采样的「好候选」被记住、跨轮次累积，使近似 LRU 的效果显著逼近精确 LRU。这套池机制后来也被 LFU 复用（池里换成按访问频率排序）。
+
+---
+
+## 五、LFU 的实现（Redis 4.0+）
+
+LRU 的软肋：**只看「多久没访问」，不看「访问过多少次」**。一个只被偶然访问一次的 key，会因为「刚访问过」而长期不被淘汰，挤占真正高频热点的空间。LFU（Least Frequently Used，最不经常使用）按**访问频率**淘汰，更适合有稳定热点的缓存。
+
+### 复用那 24bit：拆成两段
+
+LFU 模式下，redisObject 的 24bit `lru` 字段被重新解释为：
+
+```text
+ ┌──────────────────────────┬───────────────┐
+ │   16 bit   ldt            │   8 bit  counter │
+ │  上次访问的分钟级时间戳    │   访问计数(对数)  │
+ └──────────────────────────┴───────────────┘
+   ldt = Last Decrement Time（分钟精度，用于衰减）
+   counter = 频率计数器，0~255
+```
+
+- 高 16bit：上次「衰减」的时间（分钟精度），用于随时间衰减 counter。
+- 低 8bit：一个 **0~255 的访问频率计数器**（不是真实访问次数）。
+
+### counter 为什么是「概率对数递增」
+
+8bit 最多到 255，若直接 +1，热点 key 一会儿就撞顶、彼此再也分不出高低。Redis 用**概率递增 + 对数化**（`lfu-log-factor`，默认 10）：
+
+```text
+访问一次时，counter 是否 +1 由概率决定：
+   counter 越大 → 越难再 +1（增长越来越慢，像对数曲线）
+   p = 1 / ((counter - LFU_INIT_VAL) * lfu_log_factor + 1)
+   以概率 p 决定本次是否 +1
+```
+
+- `lfu-log-factor` 越大，counter 增长越慢、能区分的访问量级越大。
+- 这样 8bit 就能表达从「几次」到「上百万次」访问的差异，而不会轻易饱和。
+- 新建 key 的 counter 初始值为 `LFU_INIT_VAL = 5`（不是 0），给新 key 一点缓冲，避免刚写入就被秒淘汰。
+
+### counter 为什么要「随时间衰减」
+
+如果只增不减，**昔日热点（如某次大促的爆款 key）会因为历史高 counter 永远赖着不走**，哪怕早已无人访问。所以引入衰减（`lfu-decay-time`，默认 10，单位分钟）：
+
+```text
+访问 key 时，先看距上次衰减过了多少分钟 N：
+   衰减量 = N / lfu_decay_time
+   counter = max(0, counter - 衰减量)
+   再更新 ldt = 当前分钟
+然后才走概率递增逻辑。
+```
+
+- `lfu-decay-time` 越小，counter 衰减越快，「过气热点」越容易被淘汰。
+- 设为 0 表示**每次访问都衰减**（极端，几乎不用）。
+
+> LFU 的精髓：counter 同时受「概率对数递增」和「随时间衰减」两股力量约束——**既要常被访问才能高，又会因为久不访问而降下来**，从而真实反映「近期访问频率」。
+
+### LFU 淘汰流程
+
+和 LRU 一样走**采样 + 淘汰池**，只是比较的维度从「空闲时间」换成「counter 大小」：采样若干 key，淘汰 **counter 最小**（最不常用）的那个。
+
+> 实用命令：`OBJECT FREQ key`（仅 LFU 模式下有效）可查看某 key 的 counter；`OBJECT IDLETIME key`（仅 LRU 模式下）可查空闲秒数。
+
+---
+
+## 六、LRU vs LFU 对比与选型
+
+| 维度 | 近似 LRU | 近似 LFU（4.0+） |
+|---|---|---|
+| 淘汰依据 | 最久**未访问**（时间维度） | 访问**频率最低**（频率维度） |
+| 24bit 用法 | 全部存「上次访问时间戳」（秒） | 16bit 时间 + 8bit 频率 counter |
+| 实现核心 | 采样 + 淘汰池，比空闲时间 | 采样 + 淘汰池，比 counter（对数增 + 衰减） |
+| 抗「偶发访问」 | 弱：偶访一次就「保命」 | 强：偶访一次 counter 升得极慢 |
+| 抗「过气热点」 | 天然：久不访问就被淘汰 | 靠 `lfu-decay-time` 衰减实现 |
+| 关键参数 | `maxmemory-samples` | `maxmemory-samples` / `lfu-log-factor` / `lfu-decay-time` |
+| 适用 | 访问有时间局部性、冷热随时间漂移 | 存在长期稳定热点、冷热分明 |
+
+```text
+访问模式            更优策略
+─────────────────────────────────
+最近用的最可能再用   →   LRU
+被反复访问的最该留   →   LFU
+分布均匀、无冷热     →   random（省去采样开销）
+想让快过期的先走     →   volatile-ttl
+```
+
+---
+
+## 七、实战建议
+
+- **纯缓存场景**：把默认的 `noeviction` 改成 `allkeys-lru`（通用）或 `allkeys-lfu`（有明显长期热点，如商品详情、热门内容）。LFU 在「偶发大 key 刷一遍」时比 LRU 更稳。
+- **缓存 + 持久数据混存**在同一实例：用 `volatile-*`，并**确保需要被淘汰的缓存 key 都设了 TTL**——否则候选集为空，淘汰失效退化成 OOM。
+- **当持久存储用、绝不能丢数据**：保留 `noeviction`，并在应用侧严格监控内存，避免写入打到 OOM。
+- `maxmemory-samples` 一般保持默认 5；对 LRU/LFU 精度要求高且 CPU 有余量，可调到 10。
+- LFU 调参：热点切换快就调小 `lfu-decay-time`；想区分更大的访问量级就调大 `lfu-log-factor`。
+- `maxmemory` 别设满物理内存——要给 RDB/AOF rewrite 的 fork（copy-on-write）和缓冲区留余量，一般预留 30%~50%。
+- `noeviction` 下写失败要在客户端有降级/重试预案；其它策略下要意识到「淘汰是近似的，可能误删略热的 key」。
+
+---
+
+## 一句话总结
+
+> **过期删除**（惰性 + 定期随机抽样）解决「设了 TTL 的 key 何时删」，**内存淘汰**（`maxmemory` + 8 策略）解决「内存满了删谁」，前者漏删的由后者兜底。
+>
+> LRU/LFU 都是**近似实现**：靠 redisObject 里 24bit 字段 + **采样（`maxmemory-samples` 默认 5）+ 淘汰池**，而非全局精确算法——LRU 该字段存「上次访问时间」，LFU（4.0+）拆成「16bit 时间 + 8bit 概率对数递增并随时间衰减的 counter」。
+>
+> 纯缓存优先 `allkeys-lru`/`allkeys-lfu`；`volatile-*` 只在带 TTL 的 key 中淘汰，候选为空会退化成 OOM。（行为基于 Redis 4.0 引入 LFU、3.0 引入淘汰池，描述以 Redis 6.x/7.x 为准。）
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="redis/eviction" data-base="../"></script>
+</body>
+</html>

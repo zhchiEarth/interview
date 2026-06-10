@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>string 底层 &amp; 不可变性 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速过 / 速答</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# string 底层 & 不可变性
+
+## 一、string 是什么
+
+Go 的 string 是 **`(指针, 长度)` 的 header**——内部结构跟 slice 类似但只有两个字段：
+
+```go
+type stringHeader struct {
+    Data *byte   // 指向底层字节数据
+    Len  int     // 字节数 (不是字符数!)
+}
+```
+
+```
+string 在内存里 (16 字节 header):
+  ┌──────────────┐
+  │ Data ────────┼─→ 底层字节序列 (只读)
+  ├──────────────┤
+  │ Len  int     │
+  └──────────────┘
+```
+
+**关键性质**：
+
+| 性质 | 含义 |
+|---|---|
+| **不可变** | 一旦创建，内容**永远不能改**（语言级强制） |
+| **header 按值传递** | 拷贝两个字段（16 字节），底层字节共享 |
+| **Len 是字节数** | 不是字符数；UTF-8 多字节字符占多个 byte |
+
+---
+
+## 二、为什么不可变
+
+Go 在编译期就**禁止**修改 string：
+
+```go
+s := "hello"
+s[0] = 'X'    // ❌ 编译错: cannot assign to s[0]
+```
+
+底层原因：**string 的 Data 一般指向 .rodata 段（只读数据段）**——内存被 OS 标为只读，硬件层面也改不了。
+
+```
+程序内存:
+  ┌──────────────────────┐
+  │  .rodata (只读段)    │  ← 字符串字面量都在这
+  │  "hello\0world\0..."│
+  └──────────────────────┘
+  ┌──────────────────────┐
+  │  .data (可写段)       │  ← 全局变量
+  └──────────────────────┘
+  ┌──────────────────────┐
+  │  heap / stack         │  ← 动态分配
+  └──────────────────────┘
+
+s := "hello"
+  s.Data ─→ .rodata 里的 "hello"
+  s.Len = 5
+```
+
+### 不可变的好处
+
+- **多个 string 可安全共享底层字节** → 子串、传参不拷贝
+- **string 可以做 map key** → 内容不变才能稳定 hash
+- **并发安全** → 多 goroutine 读同一个 string 不需要锁
+
+---
+
+## 三、string 的"按值传递"几乎免费
+
+虽然是 16 字节 header，但实际开销跟 8 字节指针差不多——**底层字节共享**：
+
+```go
+func f(s string) { ... }   // s 是 16 字节 header 拷贝
+s := veryLongString          // 即使是 1GB
+f(s)                          // 只拷贝 16 字节 header, 底层不动
+```
+
+→ **不需要为了"避免拷贝"传 `*string`**——Go 团队习惯就是直接传 string。
+
+---
+
+## 四、子串：`s[i:j]` 几乎零开销
+
+```go
+s := "hello world"
+sub := s[6:11]   // "world"
+```
+
+底层：
+
+```
+s:    Data ─→ "hello world"  Len=11
+              │     │
+              │     └── sub.Data ─→ 这里 (偏移 6)
+              │           Len = 5
+              ▼
+        共享同一段底层字节
+```
+
+**只是改 Data 指针和 Len，不拷贝字节**——O(1) 操作。
+
+### 子串陷阱：长字符串无法被 GC
+
+```go
+big := readBigFile()   // 100MB
+header := big[:32]      // 只想要前 32 字节
+return header
+// big 整体不能 GC! 因为 header 仍引用底层
+```
+
+**修法**：
+
+```go
+header := string([]byte(big[:32]))   // 拷贝出独立的字节
+// 或 Go 1.20+:
+header := strings.Clone(big[:32])
+```
+
+类似 [slice 大数组阻止 GC](../02-advanced/slice.html) 的坑。
+
+---
+
+## 五、`[]byte` ↔ `string` 互转
+
+```go
+s := "hello"
+b := []byte(s)      // 默认: 分配新数组拷贝 ([]byte 可改, 必须独立)
+s2 := string(b)     // 默认: 又拷贝一次
+```
+
+**两次都要拷贝**——因为：
+
+- string 不可变 → `[]byte` 不能直接共享 string 的底层
+- `[]byte` 可改 → string 不能直接用 `[]byte` 的底层
+
+每次 `[]byte(s)` 或 `string(b)` 都是**新的内存分配 + 拷贝**——hot path 上是性能杀手。
+
+---
+
+## 六、编译器的零拷贝优化（隐式）
+
+Go 编译器对**几种特殊场景**做了零拷贝优化——你写 `string(b)` 它不会真拷贝：
+
+```go
+// ① map key (查 map 时)
+if v, ok := m[string(b)]; ok { ... }   // 零拷贝
+
+// ② 字符串比较
+if string(b) == "hello" { ... }         // 零拷贝
+
+// ③ for range string(b)
+for i, c := range string(b) { ... }     // 零拷贝
+
+// ④ 字符串拼接的某些场景
+s := "a" + string(b)                    // 看具体情况
+```
+
+→ 这些场景常用，编译器特判避免拷贝。**其它转换仍然是真拷贝**。
+
+---
+
+## 七、真零拷贝（unsafe，慎用）
+
+Go 1.20+ 提供官方 unsafe API：
+
+```go
+import "unsafe"
+
+// string → []byte (零拷贝, 但绝不能改返回的 b!)
+b := unsafe.Slice(unsafe.StringData(s), len(s))
+
+// []byte → string (零拷贝, 但之后绝不能改 b)
+s := unsafe.String(unsafe.SliceData(b), len(b))
+```
+
+**条件**：用了就必须保证后续不修改 source——一旦改了就破坏了 string 的不可变性，行为未定义。
+
+**实战**：只在极致性能场景用——多数代码用普通转换就好。
+
+---
+
+## 八、字符 vs 字节 vs rune
+
+```go
+s := "héllo"     // é 是 2 字节 UTF-8
+
+len(s)            // 6  ← 字节数, 不是字符数!
+                  //    h=1, é=2, l=1, l=1, o=1 = 6
+
+// 按字节遍历
+for i := 0; i < len(s); i++ {
+    b := s[i]       // byte (uint8), 拿到 UTF-8 原始字节
+}
+
+// 按 rune 遍历 (字符)
+for i, r := range s {
+    // i 是字节索引, r 是 rune (int32)
+    // 自动解码 UTF-8
+}
+
+// 字符数 (rune 数)
+n := utf8.RuneCountInString(s)   // 5
+```
+
+| 概念 | 类型 | 含义 |
+|---|---|---|
+| **byte** | `uint8` | 1 字节 |
+| **rune** | `int32` | 1 个 Unicode 字符（4 字节） |
+| **`s[i]`** | byte | UTF-8 原始字节 |
+| **`for i, r := range s`** | (int, rune) | i 是字节索引，r 是字符 |
+| **`len(s)`** | int | **字节数** |
+| **`utf8.RuneCountInString`** | int | 字符数 |
+
+**常见踩坑**：误以为 `len(s)` 是字符数 → 截取中文导致乱码。
+
+---
+
+## 九、字符串拼接的几种方式
+
+```go
+// ① + 拼接 - 少量字符串 OK, 多次会反复分配
+s := "a" + "b" + "c"
+
+// ② strings.Builder - 推荐, 最快
+var b strings.Builder
+b.Grow(estimatedSize)   // 预分配
+b.WriteString("a")
+b.WriteString("b")
+s := b.String()
+
+// ③ bytes.Buffer - 类似 Builder, 稍慢 (内部多一层拷贝)
+var buf bytes.Buffer
+buf.WriteString("a")
+s := buf.String()
+
+// ④ fmt.Sprintf - 慢, 别在 hot path 用
+s := fmt.Sprintf("%s %s", a, b)
+
+// ⑤ strings.Join - 适合"已有 slice, 用分隔符拼"
+s := strings.Join([]string{"a", "b", "c"}, "-")
+```
+
+**性能排序**：`strings.Builder > strings.Join > bytes.Buffer > + > fmt.Sprintf`
+
+---
+
+## 十、一图总结
+
+```
+            string 底层结构
+                  │
+              (Data, Len) header
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+     Data: *byte         Len: int
+     指向只读字节         字节数 (不是字符数!)
+
+   特性:
+     不可变 (语言级强制, 字面量在 .rodata 段)
+     header 拷贝几乎免费 (16 字节)
+     子串 s[i:j] 零拷贝 (共享底层)
+     可做 map key
+     并发读安全
+
+   转换:
+     默认 []byte(s) / string(b): 都拷贝!
+     编译器零拷贝场景: map key / == / for range / 某些拼接
+     unsafe 零拷贝 (Go 1.20+): unsafe.StringData / unsafe.SliceData
+
+   遍历:
+     for i := 0..len(s):  字节
+     for i, r := range s: rune (自动解码 UTF-8)
+     len(s):              字节数, 不是字符数!
+     utf8.RuneCountInString: 字符数
+
+   拼接性能:
+     strings.Builder > Join > bytes.Buffer > + > Sprintf
+
+   常见陷阱:
+     ❌ 大字符串 sub 阻止 GC → strings.Clone
+     ❌ 误以为 len(s) 是字符数
+     ❌ hot path 反复 []byte(s) 转换
+     ❌ + 拼接百次以上 → 用 Builder
+```
+
+**一句话**：string = **`(*byte, int)` header + 不可变约束**——字面量在只读段，子串零拷贝，按值传递只拷 16 字节但底层共享。**`len(s)` 是字节数不是字符数**，**`[]byte(s)` 默认会拷贝**（map key 等场景编译器免费免拷），**频繁拼接用 strings.Builder**。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/string-internals" data-base="../../"></script>
+</body>
+</html>

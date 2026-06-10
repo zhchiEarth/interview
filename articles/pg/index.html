@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL 索引类型 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# PostgreSQL 索引类型
+
+> 一句话：PostgreSQL 是**堆表 + 独立索引**的架构——表数据存在堆（heap）里、与索引完全分开，索引叶子存的是 **TID（指向堆元组的物理地址）**，没有 InnoDB 那种"叶子直接存整行"的聚簇索引；正因如此，PG 提供了 **B-tree / Hash / GiST / SP-GiST / GIN / BRIN** 六种索引方法各擅其场，外加部分索引、表达式索引、INCLUDE 覆盖索引等技巧，而"覆盖扫描（index-only scan）"还要额外依赖**可见性图**才能成立。
+
+> 本文以 **PostgreSQL 16** 为基准，版本相关特性会显式标注（如 Hash 索引 WAL 安全是 PG 10+、INCLUDE 是 PG 11+）。相关：[进程与内存架构](architecture.html)、[MVCC 与 VACUUM](mvcc-vacuum.html)。
+
+## 一、前提：PG 是堆表 + 独立索引，没有聚簇索引
+
+理解 PG 索引，必须先记住它和 MySQL/InnoDB 最根本的差异：
+
+- **InnoDB**：表本身就是一棵以主键组织的 B+ 树（索引组织表 IOT），主键索引的叶子**直接存整行**——这叫聚簇索引。
+- **PostgreSQL**：表数据存在**堆（heap）**里，行的物理顺序与任何索引都无关；**所有索引都是独立的结构**，叶子节点存的不是数据、而是 **TID（Tuple ID）**——一个 `(块号, 块内偏移)` 二元组，指向堆里那一行的物理位置。
+
+```text
+PostgreSQL: 堆表 + 独立索引(叶子存 TID,指向堆)
+
+   [B-tree 索引]                       [堆 Heap]
+   key='tom' ─→ TID(5,2) ──────────→  block 5, item 2: 整行(name,age,...)
+   key='amy' ─→ TID(3,1) ──────────→  block 3, item 1: 整行(...)
+                  ▲ 索引叶子只存物理地址,不存行数据
+
+对比 InnoDB(聚簇索引): 主键索引叶子 = 整行,二级索引叶子 = 主键值
+```
+
+由此带来几个直接后果：
+
+- **没有"主键决定物理顺序"这回事**：PG 的主键只是一个带唯一约束的普通 B-tree 索引，主键查询和其它二级索引查询**没有本质区别**（都要拿 TID 去堆里取行），不存在 InnoDB"二级索引回表多走一棵主键树"的概念。
+- **想要类似"覆盖"的效果**，PG 靠 **index-only scan**（仅索引扫描），但能不能真免读堆，还要看**可见性图**（见第六节）。
+- `CLUSTER` 命令可以把堆按某索引顺序物理重排一次，但它是**一次性的、之后不维护**，并非 InnoDB 那种始终保持的聚簇索引。
+
+## 二、六种索引方法总览
+
+PostgreSQL 内置 6 种索引访问方法（access method），通过 `CREATE INDEX ... USING <method>` 指定，默认是 B-tree。
+
+| 方法 | 底层结构 | 擅长的查询 | 典型场景 |
+|---|---|---|---|
+| **B-tree** | 平衡多叉树（B+ 树族） | 等值 `=`、范围 `< > BETWEEN`、`IN`、排序 `ORDER BY`、前缀 `LIKE 'x%'`、`IS NULL` | **默认且最常用**，绝大多数标量列 |
+| **Hash** | 哈希表 | 仅等值 `=` | 只做等值、且值很长（哈希后更省空间）；PG 10+ 才 WAL 安全 |
+| **GiST** | 通用平衡树框架（可扩展） | 几何包含/相交、范围类型重叠、全文检索、**最近邻 KNN（`ORDER BY 距离`）** | 几何（PostGIS）、`range` 类型、`tsvector`、相似度 |
+| **SP-GiST** | 空间分区树（**非平衡**：四叉树/k-d 树/前缀树/基数树 radix） | 点数据、前缀匹配、不规则/层级分布的数据 | IP 前缀、电话号码前缀、几何点、文本前缀 |
+| **GIN** | 倒排索引（Generalized **In**verted Index） | "一列含多个值"的包含查询：数组 `@>`、JSONB `@> ? ?\|`、全文 `@@` | **多值列首选**：`jsonb`、数组、`tsvector` |
+| **BRIN** | 块范围摘要（Block Range INdex） | 范围查询，针对**物理有序**的超大表 | 时序日志、按时间/自增主键追加写入的大表；索引体积极小 |
+
+选择主线：**标量等值/范围/排序 → B-tree**；**多值列（数组/JSONB/全文）→ GIN**；**几何/范围类型/KNN → GiST**；**超大且物理有序 → BRIN**。Hash 与 SP-GiST 是特定场景的补充。
+
+## 三、B-tree —— 默认与最常用
+
+B-tree 是默认索引方法，PG 用的是 Lehman-Yao 高并发 B+ 树变体。它支持的操作符最全：
+
+```sql
+CREATE INDEX idx_user_name ON "user" (name);            -- 等价于 USING btree
+CREATE UNIQUE INDEX idx_user_email ON "user" (email);   -- 唯一索引
+```
+
+| 能力 | 是否支持 | 说明 |
+|---|---|---|
+| 等值 `=` | ✅ | |
+| 范围 `< <= > >= BETWEEN` | ✅ | 叶子有序，区间扫描 |
+| `IN` / `= ANY` | ✅ | |
+| 排序 `ORDER BY` | ✅ | 索引天然有序，可省 `Sort`；支持 `ASC/DESC`、`NULLS FIRST/LAST` |
+| 前缀 `LIKE 'abc%'` | ✅（注意排序规则） | 见下方 collation 说明 |
+| 前导 `%`（`LIKE '%abc'`） | ❌ | 无法利用前缀有序，需 GIN+pg_trgm |
+| `IS NULL` / `IS NOT NULL` | ✅ | B-tree 会索引 NULL |
+
+**前缀匹配的坑**：`LIKE 'abc%'` 要走 B-tree，索引列的排序规则（collation）若不是 `C`，普通 B-tree 用不上前缀优化。解决办法是用 `text_pattern_ops` 操作符类建索引：
+
+```sql
+-- 让 LIKE 'abc%' 能用上索引(非 C collation 时必需)
+CREATE INDEX idx_path ON files (path text_pattern_ops);
+SELECT * FROM files WHERE path LIKE '/var/log/%';
+```
+
+多列 B-tree 同样遵循**最左前缀**思想：索引 `(a, b, c)` 对 `WHERE a=? AND b=?` 有效，对单独 `WHERE b=?` 则用不上有序定位（但 PG 仍可能选择"全索引扫描"兜底）。
+
+## 四、其余五种方法详解
+
+### Hash —— 只做等值
+
+哈希索引只支持 `=`，不支持范围和排序。**PG 10 之前哈希索引不写 WAL**（不安全、不能复制、崩溃要重建），所以长期被劝退；**PG 10 起哈希索引已 WAL 安全**，在"只等值 + 键很长"时比 B-tree 更省空间、查得也快。但多数场景 B-tree 已足够，Hash 仍属小众。
+
+```sql
+CREATE INDEX idx_token_hash ON sessions USING hash (token);  -- 仅 token = ? 受益
+```
+
+### GiST —— 通用搜索树框架
+
+GiST（Generalized Search Tree）不是一种固定结构，而是一个**可扩展的平衡树框架**，由操作符类决定它索引什么。它最强的两点：
+
+- **几何 / 范围类型的"重叠、包含、相交"**：地理（PostGIS）、`int4range`/`tstzrange` 等范围类型的 `&&`（重叠）、`@>`（包含）。
+- **最近邻搜索 KNN**：支持 `ORDER BY 列 <-> 点` 这种"按距离排序取最近 N 个"，B-tree 做不到。
+
+```sql
+-- 范围类型: 防止预订时段重叠(排他约束 EXCLUDE 依赖 GiST)
+CREATE INDEX idx_booking ON bookings USING gist (during);  -- during tstzrange
+-- KNN: 取离某点最近的 5 个
+CREATE INDEX idx_geo ON places USING gist (location);
+SELECT * FROM places ORDER BY location <-> point '(10,20)' LIMIT 5;
+```
+
+### SP-GiST —— 空间分区树（非平衡）
+
+SP-GiST（Space-Partitioned GiST）面向**非平衡**的分区结构：四叉树、k-d 树、前缀树（trie）、基数树（radix）。适合**数据分布不均、有自然层级或前缀**的场景，如 IP 网段、电话号码前缀、文本前缀、几何点。
+
+```sql
+-- 文本前缀(基数树),适合大量共享前缀的字符串
+CREATE INDEX idx_url ON pages USING spgist (url);
+-- inet 网段
+CREATE INDEX idx_ip ON logs USING spgist (client_ip inet_ops);
+```
+
+### GIN —— 倒排索引（多值列首选）
+
+GIN（Generalized Inverted Index）是**倒排索引**：把"一行里包含的多个元素"拆开，建立"元素 → 包含它的行列表"的映射。专治"一列里装了多个值，要查某行是否包含某些值"。这正是 JSONB、数组、全文检索 `tsvector` 的核心索引。
+
+```sql
+-- 数组包含
+CREATE INDEX idx_tags ON posts USING gin (tags);          -- tags text[]
+SELECT * FROM posts WHERE tags @> ARRAY['go','pg'];
+-- 全文检索
+CREATE INDEX idx_doc ON docs USING gin (to_tsvector('english', body));
+SELECT * FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('postgres');
+-- JSONB(详见 JSONB 篇)
+CREATE INDEX idx_data ON events USING gin (data);
+```
+
+GIN 写入/更新较慢（一行可能涉及很多键），PG 用 **fastupdate**（待合并列表）摊还写入开销。JSONB 的 GIN 还可选更小更快的 `jsonb_path_ops`，详见 [JSONB 与丰富数据类型](jsonb.html)。
+
+### BRIN —— 块范围索引（超大有序表）
+
+BRIN（Block Range INdex）不为每行建索引项，而是把堆按**连续的块区间（block range，默认 128 页一组）**分组，每组只记录该区间内列值的**摘要（最小值/最大值等）**。查询时先用摘要排除掉一定不含目标的块区间，只扫剩下的块。
+
+- **优点**：索引**极小**（可能只有 B-tree 的几千分之一），构建快、维护轻。
+- **前提**：列值与**物理存储顺序高度相关**（correlation 接近 1）才有效——否则每个块区间的 min/max 都覆盖全域，过滤不掉任何块。
+- **典型**：按时间/自增 ID **追加写入**的时序、日志、明细表。
+
+```sql
+-- 按 created_at 追加写入的超大日志表
+CREATE INDEX idx_log_time ON logs USING brin (created_at);
+SELECT * FROM logs WHERE created_at >= '2026-06-01' AND created_at < '2026-06-02';
+```
+
+## 五、特殊索引技巧
+
+这些不是新的索引方法，而是建索引时的**修饰手段**，常与 B-tree 配合，是 PG 相比 MySQL 表达力更强的地方。
+
+### 部分索引（Partial Index）
+
+只索引满足 `WHERE` 条件的**行子集**——索引更小、更快，且能精准服务高频查询。
+
+```sql
+-- 只给"未删除"的行建索引(软删表里热数据通常是未删的少数)
+CREATE INDEX idx_active ON orders (created_at) WHERE deleted_at IS NULL;
+-- 只索引未支付订单,查询带相同条件才能命中
+CREATE INDEX idx_unpaid ON orders (uid) WHERE status = 'unpaid';
+-- 妙用: 部分唯一索引 —— 仅对未删除行保证 email 唯一
+CREATE UNIQUE INDEX uq_email_active ON users (email) WHERE deleted_at IS NULL;
+```
+
+### 表达式索引（Expression Index）
+
+对**列的函数/表达式结果**建索引，使原本"列被函数包裹导致失效"的查询能走索引。
+
+```sql
+-- 大小写不敏感查询: 给 lower(email) 建索引
+CREATE INDEX idx_lower_email ON users (lower(email));
+SELECT * FROM users WHERE lower(email) = 'a@b.com';   -- 命中
+-- 按日期(从时间戳)分组/过滤
+CREATE INDEX idx_day ON logs ((created_at::date));
+```
+
+### 覆盖索引 INCLUDE（PG 11+）
+
+`INCLUDE` 把额外列作为**非键列**塞进索引叶子——它们**不参与排序/定位**，只为让查询"所需列都在索引里"，从而走 index-only scan 免读堆。比把列硬塞进键列更省、也不破坏键的语义；还能让唯一索引覆盖额外列。
+
+```sql
+-- 键是 uid(用于定位),把 name、email 作为附带列放进叶子
+CREATE INDEX idx_uid_inc ON users (uid) INCLUDE (name, email);
+-- 这条查询所需列(uid,name,email)全在索引 → 可走 index-only scan
+SELECT uid, name, email FROM users WHERE uid = 'U123';
+```
+
+### 多列索引
+
+```sql
+CREATE INDEX idx_a_b ON t (a, b);   -- 服务 WHERE a=? [AND b=?],遵循最左前缀
+```
+
+## 六、index-only scan 与可见性图
+
+"覆盖扫描"在 PG 里叫 **index-only scan（仅索引扫描）**：查询所需列全在索引里时，理论上只读索引、不读堆。但这里有个 MVCC 带来的关键约束——
+
+**索引项里没有行的可见性信息**。一行是否对当前事务可见（是否被删除、是否是未提交版本）记录在**堆元组**的 MVCC 头里，索引并不知道。所以只看索引无法判断"这一行此刻该不该返回"。
+
+PG 的解法是**可见性图（Visibility Map, VM）**：每个堆数据页对应 VM 里 1~2 个 bit，其中 `all-visible` 位表示"这一页里所有元组对所有事务都可见"。该位由 **VACUUM** 维护（见 [MVCC 与 VACUUM](mvcc-vacuum.html)）。
+
+```text
+index-only scan 的判定流程:
+   在索引里命中一项,拿到 TID(指向某堆页) + 索引里已有的列值
+        │
+        ▼
+   查可见性图: 该 TID 所在堆页的 all-visible 位 = 1 ?
+        ├── 是 → 整页都可见 → 直接用索引里的列值返回,不读堆  (真正的 index-only)
+        └── 否 → 不确定可见性 → 仍要回堆(heap fetch)读那一行的 MVCC 头确认
+```
+
+所以 **index-only scan 不等于"零堆访问"**：`EXPLAIN (ANALYZE)` 里会显示 `Heap Fetches: N`，N 越大说明回堆越多、覆盖收益越小。让 index-only scan 真正生效的要点：
+
+- 表的 **VACUUM 要跟得上**（VM 的 all-visible 位足够新、覆盖足够多页）；刚大批写入又没 VACUUM 的表，`Heap Fetches` 会很高。
+- 用 `INCLUDE` 或多列索引让**所需列都在索引内**。
+
+## 七、怎么选索引
+
+| 你的查询 / 数据 | 选择 | 理由 |
+|---|---|---|
+| 等值 + 范围 + 排序的标量列 | **B-tree** | 默认全能，先建它准没错 |
+| 只做等值、键很长 | Hash（PG 10+） | 比 B-tree 省空间；否则 B-tree 也行 |
+| 数组 / JSONB / 全文 `tsvector`（多值包含） | **GIN** | 倒排，专治"含某些值" |
+| 几何 / `range` 类型重叠 / 最近邻 KNN | **GiST** | 框架支持重叠、包含、距离排序 |
+| IP/电话/文本**前缀**、点数据、层级分布 | SP-GiST | 非平衡分区、前缀树 |
+| 超大表 + 列值与物理顺序强相关（时序/日志） | **BRIN** | 索引极小、维护轻 |
+| 只查行的某个子集（如未删除、未支付） | **部分索引** | 索引更小、更快 |
+| 查询里列被函数包裹（`lower(x)`、`x::date`） | **表达式索引** | 让函数结果可被索引 |
+| 想免回堆、所需列略多于键列 | **INCLUDE 覆盖索引**（PG 11+）+ 跟上 VACUUM | 配合可见性图走 index-only scan |
+| `LIKE 'abc%'` 前缀且非 C collation | B-tree + `text_pattern_ops` | 否则前缀用不上索引 |
+| `LIKE '%abc%'` 任意位置模糊 | GIN + `pg_trgm` | 三元组倒排支持中缀模糊 |
+
+通用建议：先用默认 B-tree，再用 `EXPLAIN (ANALYZE, BUFFERS)` 看实际执行计划（`type`/扫描方式/`Heap Fetches`/`Buffers`），按瓶颈换更合适的方法或加部分/表达式/INCLUDE 修饰。
+
+## 一句话总结
+
+> PostgreSQL 是**堆表 + 独立索引**：索引叶子存 **TID** 指向堆元组，**没有 InnoDB 式聚簇索引**，主键也只是带唯一约束的 B-tree。内置 **6 种索引方法**——**B-tree**（默认，等值/范围/排序最全能）、**Hash**（仅等值，PG 10+ 才 WAL 安全）、**GiST**（几何/范围类型/全文/最近邻 KNN 的可扩展平衡树）、**SP-GiST**（四叉树/前缀树等非平衡分区，擅长前缀与点数据）、**GIN**（倒排索引，**数组/JSONB/全文等多值列首选**）、**BRIN**（块范围摘要，**超大且物理有序**的时序日志表，索引极小）。再叠加**部分索引**（按 `WHERE` 只索引子集）、**表达式索引**（`lower(x)`）、**INCLUDE 覆盖索引**（PG 11+）、多列索引等技巧。要走真正的 **index-only scan**，除了所需列在索引内，还得依赖 **VACUUM 维护的可见性图**——因为可见性信息只在堆元组里、不在索引里，`all-visible` 位为 0 时仍要回堆（看 `EXPLAIN` 的 `Heap Fetches`）。选型主线：标量→B-tree，多值→GIN，几何/KNN→GiST，超大有序→BRIN，一切以 `EXPLAIN (ANALYZE)` 实测为准（基于 PostgreSQL 16）。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/index" data-base="../"></script>
+</body>
+</html>

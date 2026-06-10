@@ -1,0 +1,302 @@
+# Kafka 知识地图（重排版）
+
+## 一句话定位
+
+**Kafka = 高吞吐的分布式消息中间件**，核心场景四个字：**削峰、解耦、异步、冗余**。
+
+| 场景 | 解决什么问题 |
+|---|---|
+| 削峰 | 突发流量先进队列，下游按自己节奏消费 |
+| 解耦 | 上下游不直接调用，互不感知 |
+| 异步 | 生产者不等结果，丢进去就走 |
+| 冗余 | 一条消息可被多个消费组各自消费一次 |
+
+---
+
+## 一、先看一张图（核心术语全在这）
+
+```
+                    ┌──────────────  Kafka 集群（多个 Broker）──────────────┐
+                    │                                                       │
+   Producer ──写──> │  Topic: orders                                        │
+                    │   ├── Partition 0 ──[Leader]── Replica@Broker1        │
+                    │   │                  └─ Follower @Broker2, Broker3    │
+                    │   ├── Partition 1 ──[Leader]── Replica@Broker2        │
+                    │   └── Partition 2 ──[Leader]── Replica@Broker3        │
+                    └───────────────────────────────────────────────────────┘
+                                              │ 拉取
+                                              ▼
+                              Consumer Group A           Consumer Group B
+                              ├ Consumer-1 (P0,P1)       ├ Consumer-1 (P0,P1,P2)
+                              └ Consumer-2 (P2)          (互不影响，各消费各的)
+```
+
+**记住三件事：**
+1. **Topic 是逻辑队列，Partition 才是物理存储单元**。一个 Topic 横向切成多个 Partition，散在不同 Broker 上 → 这就是 Kafka 能并行的根因。
+2. **每个 Partition 有 1 个 Leader + N 个 Follower**。读写都走 Leader，Follower 只负责同步备份（Kafka **不做读写分离**，原因见第四节）。
+3. **Consumer Group 是消费的并行单位**。同一 Group 内：一个 Partition 只能被一个 Consumer 消费；不同 Group 之间互不影响。
+
+---
+
+## 二、为什么 Kafka 这么快？（5 个杀手锏）
+
+| 优化 | 通俗解释 |
+|---|---|
+| **顺序写磁盘** | 顺序写比随机内存写还快（避免磁盘寻道）。Kafka 把消息当流水账往后追加，从不改写。 |
+| **Page Cache** | 不用 JVM 堆内存做缓存，直接用操作系统的 Page Cache，重启不丢、GC 不卡。 |
+| **零拷贝** | 数据从磁盘 → 网卡，跳过用户态拷贝（`sendfile`），少两次内存复制。 |
+| **批量 + 压缩** | Producer 攒一批再发，Broker 批量落盘；支持 GZIP / Snappy / LZ4。 |
+| **分区并行** | N 个 Partition 就能 N 倍并行，受限于 Broker 数和磁盘数。 |
+
+---
+
+## 三、生产者侧：消息怎么"安全又均衡"地写进去
+
+### 3.1 发送模式
+
+- **异步**（默认）：扔进缓冲区就返回，靠回调拿结果 → 吞吐高
+- **同步**：`future.get()` 阻塞等结果 → 吞吐低但确定性强
+
+### 3.2 分区策略（决定消息落到哪个 Partition）
+
+| 策略 | 行为 | 何时用 |
+|---|---|---|
+| 轮询 (RoundRobin) | 按顺序均摊 | 默认，没指定 key |
+| 随机 | 老版本默认，效率差，已淘汰 | — |
+| Hash by Key | 同 key 必落同 Partition | **保证同一类消息有序**（如同一订单 ID） |
+| Sticky（2.4+） | 一段时间内粘住一个 Partition，凑够批再换 | 减少小批次、降低延迟 |
+| 自定义 | 实现 `Partitioner` 接口 | 业务规则路由 |
+
+### 3.3 ACK：决定"消息算写成功"的强度
+
+| acks | 行为 | 风险 |
+|---|---|---|
+| `0` | 发出去就算成功 | 丢得最狠 |
+| `1` | Leader 写入即返回 | Leader 挂了且未同步给 Follower 时丢 |
+| `-1` / `all` | ISR 全部确认才返回 | 几乎不丢；配合 `min.insync.replicas` |
+
+**配套参数：**
+- `min.insync.replicas`：ISR 至少剩几个才允许写。**典型组合：副本=3 + acks=all + min.insync.replicas=2**。
+- `retries`：重试次数（开了幂等才安全重试）。
+- `buffer.memory`：发送缓冲区大小，满了会阻塞。
+
+### 3.4 幂等 & 事务（解决"生产端重复"）
+
+- **幂等（`enable.idempotence=true`）**：靠 `PID + 分区 + Sequence Number`，Broker 端做去重。
+  局限：**单会话、单分区**。Producer 重启 PID 就变了。
+- **事务（`transactional.id`）**：跨分区、跨会话原子写。
+  ```java
+  props.put("transactional.id", "tx-1");
+  producer.initTransactions();
+  producer.beginTransaction();
+  producer.send(...);
+  producer.commitTransaction();   // 或 abortTransaction()
+  ```
+  消费端配合 `isolation.level=read_committed`，看不到未提交/回滚的消息。
+
+---
+
+## 四、副本机制：AR / ISR / OSR / HW / LEO 一次讲透
+
+### 4.1 三个集合
+
+```
+AR（全部副本）
+ ├── ISR（同步中的，可被选为 Leader）
+ └── OSR（落后太多的，被踢出）
+```
+
+- 判定标准：`replica.lag.time.max.ms`（0.10 后只看时间，不看消息条数差，避免抖动）。
+- OSR 追上来 → 回到 ISR；ISR 落后 → 掉到 OSR。
+- 默认 OSR **不参与选举**；除非 `unclean.leader.election.enable=true`（会丢数据，慎开）。
+
+### 4.2 两个水位线
+
+```
+Partition 日志：[m0][m1][m2][m3][m4][m5][m6]
+                              ↑           ↑
+                              HW          LEO
+```
+
+- **LEO (Log End Offset)**：下一条要写入的位置 = 当前最大 offset + 1
+- **HW (High Water Mark)**：所有 ISR 都已确认的位置，**消费者只能看到 HW 之前的消息**
+
+> Follower 拉取 → Leader 收到所有 ISR 的拉取请求 → 推进 HW → 消费者才能看到。这就是"消息何时对外可见"的边界。
+
+### 4.3 ISR 收缩机制（两个后台任务）
+
+- `isr-expiration`：定时扫，谁落后超时谁出 ISR
+- `isr-change-propagation`：变更后写 ZK，但有节流（距上次变更 >5s 且距上次写 ZK >60s）—— 避免频繁写 ZK 把集群拖垮
+
+### 4.4 为什么不做读写分离？
+
+| 原因 | 解释 |
+|---|---|
+| 一致性 | Follower 有同步 lag，可能读到旧数据 |
+| 延迟 | 多走一遍"网络→内存→盘→网络→内存→盘"，反而更慢 |
+
+Kafka 的并发模型是**靠 Partition 数水平扩展**，而不是读写分离。
+
+---
+
+## 五、消费者侧：Rebalance 是绕不开的大坑
+
+### 5.1 Pull vs Push
+
+Kafka 选 **Pull**：消费者按自己节奏拉，避免被压垮。代价是空轮询要靠 `fetch.max.wait.ms` 控制。
+
+### 5.2 分区分配策略
+
+| 策略 | 行为 | 场景 |
+|---|---|---|
+| Range（默认） | 按 Topic 分段切给消费者 | 简单，可能不均 |
+| RoundRobin | 所有 Topic 的 Partition 一起轮询分配 | 均匀，但订阅不一致时混乱 |
+| Sticky | 尽量保留上次分配，减少 Rebalance 抖动 | **推荐** |
+
+### 5.3 Rebalance：消费组的"重新洗牌"
+
+**触发条件：**
+- 组内消费者增减
+- 订阅 Topic 变化
+- Partition 数变化
+
+**两阶段：**
+1. JoinGroup：所有成员上报订阅信息给 Coordinator，选出 Leader Consumer
+2. SyncGroup：Leader 算分配方案，Coordinator 下发
+
+**痛点**：Rebalance 期间**整个消费组停止消费**（STW）。所以要少触发：
+- 调大 `session.timeout.ms`（别让消费者被误判挂了）
+- 调大 `max.poll.interval.ms`（别让长任务超时）
+- 用 Sticky 策略
+
+### 5.4 重复消费怎么办？
+
+**根因：** 消费完没来得及提交 offset 就挂了 / 自动提交在处理前就发生了。
+
+**解决路径：**
+1. 关掉 `enable.auto.commit`，改手动提交（处理完再提交）
+2. 业务层做幂等：唯一 ID + Redis / DB 唯一键去重
+3. 调参：`max.poll.records ↓`、`session.timeout.ms ↑`
+
+---
+
+## 六、高可用：选举 & 防脑裂
+
+### 6.1 三种选举
+
+| 选举对象 | 怎么选 |
+|---|---|
+| **Controller**（管整个集群的 Broker） | 谁先在 ZK 创建 `/controller` 节点谁就是；其他人 watch |
+| **Partition Leader** | Controller 从 ISR 里挑第一个存活的 |
+| **Consumer Group Leader** | Coordinator 从注册的成员 HashMap 里随便挑第一个 |
+
+### 6.2 脑裂 & Epoch
+
+**问题**：老 Controller 长 GC → ZK 会话超时 → 新 Controller 上位 → 老 Controller 恢复后还以为自己是老大，命令全发出去。
+
+**解法**：每次选举 **epoch +1**，Broker 只听更大 epoch 的命令，老 Controller 的命令直接丢弃。
+
+---
+
+## 七、可靠性总账：不丢 + 不重 + 有序 + 恰好一次
+
+### 7.1 消息丢失全场景
+
+| 来源 | 场景 |
+|---|---|
+| **Broker** | `unclean.leader.election=true` 选了 OSR；断电时 Page Cache 还没刷盘 |
+| **Producer** | acks=0/1；不开重试；超 `max.request.size`（默认 1MB）；缓冲区满 |
+| **Consumer** | 自动提交 offset 但还没处理完就挂了 |
+
+### 7.2 三种语义
+
+```
+At Most Once    = 最多一次（acks=0 / 自动提交在前）→ 可能丢
+At Least Once   = 至少一次（acks=all + 重试 + 手动提交）→ 可能重复
+Exactly Once    = 恰好一次（幂等 Producer + 事务 + 消费端 read_committed）
+```
+
+**EOS 实现 = 多副本持久化 + Producer 重试 + 序列号去重 + 事务**。
+
+### 7.3 顺序消息
+
+- **单分区天然有序**，但要设 `max.in.flight.requests.per.connection=1`（或开幂等）防止重试乱序。
+- **跨分区无全局有序**。要顺序就靠 **同一个 Key 路由到同一 Partition**。
+
+---
+
+## 八、调优常见问答
+
+### 8.1 分区数怎么定？
+
+```
+Partition 数 ≥ max( 目标吞吐 / 单 Producer 吞吐,
+                    目标吞吐 / 单 Consumer 吞吐 )
+```
+经验值：单 Partition 生产 ~10 MB/s。消费侧靠业务实测。
+
+**Consumer 数最好 = Partition 数**（多了闲着，少了不够并行）。
+
+### 8.2 分区数能改吗？
+
+- **能加不能减**：`kafka-topics.sh --alter --partitions N`。
+- 加了之后 Key 路由会变 → **打破原有顺序保证**。
+- 减少不支持，因为要处理已有数据迁移、时间戳、状态，得不偿失。
+
+### 8.3 分区不是越多越好
+
+| 副作用 | 原因 |
+|---|---|
+| 文件句柄爆 | 每个 Partition 都开 index + log |
+| 内存压力 | Producer/Consumer 每分区都有缓存 |
+| 选举变慢 | Leader 选举耗时 ∝ Partition 数 |
+
+### 8.4 怎么提升消费能力？
+
+1. Partition 和 Consumer 同步加（保持 1:1）
+2. 加大 `fetch.min.bytes` / `max.poll.records` 一次拉更多
+3. 优化处理逻辑，必要时上线程池处理（注意提交时机）
+
+---
+
+## 九、按 offset 查消息怎么做到 O(log N)？
+
+每个 Partition 的日志切成 1GB 大小的 **Segment**，每个 Segment 配一个 **稀疏索引**：
+
+```
+查 offset = 368776
+   ↓ 二分查找索引文件名 → 落到 00000000000368769.index
+   ↓ 二分查找索引 [offset → 物理 position]
+   ↓ 跳到 .log 文件对应 position 顺序读取
+```
+
+---
+
+## 十、ZooKeeper 角色 & 演进
+
+老版本 ZK 管：Broker 注册、Topic 元数据、Consumer 订阅、Offset、Rebalance 协调。
+
+**演进路线：**
+- 0.9 之前：Offset 存 ZK
+- 0.9 之后：Offset 改存 `__consumer_offsets` 这个内置 Topic
+- **3.0+：KRaft 模式可去 ZK**，靠 Raft 自管元数据
+
+---
+
+## 十一、Kafka 的局限性（用之前先知道）
+
+1. 批量机制 → **不适合强实时**（毫秒级）
+2. 不支持 MQTT，**不直接对接 IoT 设备**
+3. 只有**单分区有序**，无全局顺序
+4. 监控生态弱，需要外挂（Kafka Manager / Burrow / Prometheus + JMX）
+5. 老版本强依赖 ZK（3.0 后可解）
+
+---
+
+## 速查口诀
+
+> **写得快**：顺序写 + 零拷贝 + Page Cache + 批量 + 分区并行
+> **不丢**：副本=3 + acks=all + min.insync.replicas=2 + 手动提交
+> **不重**：幂等 Producer + 业务去重
+> **有序**：同 Key 同 Partition + max.in.flight=1
+> **不抖**：Sticky 分配 + 调大 session.timeout

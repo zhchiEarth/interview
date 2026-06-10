@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Doris 是什么 · 架构与原理 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Doris 是什么 · 架构与原理
+
+> 一句话：Apache Doris 是一款开源的、MPP 架构的实时分析型数据库（OLAP），兼容 MySQL 协议，主打亚秒级查询、高并发与实时更新。
+
+## 一、定位：它到底是个什么数据库
+
+Apache Doris 是一个面向 **OLAP（在线分析处理）** 的 MPP（Massively Parallel Processing，大规模并行处理）数据库。几个关键标签：
+
+- **MPP 架构**：一条查询会被拆成多个子任务，分发到多个节点上**并行**执行，再汇总结果，因此面对大数据量的聚合/扫描有很高的吞吐。
+- **实时分析（OLAP）**：列式存储 + 向量化执行，擅长大批量数据的扫描、聚合、分组、过滤，典型查询亚秒级返回。
+- **兼容 MySQL 协议**：可以直接用 `mysql` 命令行客户端、JDBC/ODBC、各类 BI 工具连接，SQL 语法也高度贴近 MySQL，学习与接入成本低。
+- **支持实时更新**：通过 Unique 数据模型（Merge-on-Write）支持按主键 upsert，这是它相比很多传统 OLAP 引擎的一大特点。
+- **高并发**：相比某些「单查询吃满集群」的引擎，Doris 在点查/小聚合等场景能支撑较高的 QPS。
+
+一句话区分：MySQL 是 OLTP（面向事务、行存、单行读写），Doris 是 OLAP（面向分析、列存、大批量扫描聚合）。两者解决的是不同的问题。详细取舍见 [Doris vs ClickHouse vs MySQL 怎么选](vs.html)。
+
+> 版本基准：本文以 Doris **2.x** 为基准描述；涉及存算分离等新能力时单独标注 **3.0**。
+
+## 二、两类进程：FE 与 BE
+
+Doris 的部署模型非常简洁，整个集群只有**两类核心进程**：**FE** 和 **BE**。这也是它运维相对简单的根本原因——没有外部依赖的 ZooKeeper、没有独立的元数据服务、没有专门的协调进程。
+
+```
+            ┌──────────────────────────────────────────────┐
+            │   MySQL Client / JDBC / BI 工具 (MySQL 协议)    │
+            └───────────────────────┬──────────────────────┘
+                                    │ SQL
+        ┌───────────────────────────┼───────────────────────────┐
+        │                        FE 集群 (Java)                   │
+        │   元数据管理 / SQL 解析 / 查询优化 / 分布式计划 / 调度    │
+        │                                                         │
+        │   ┌──────────┐   ┌──────────┐   ┌──────────┐           │
+        │   │ Follower │   │ Follower │   │ Observer │           │
+        │   │ (Master) │←→│           │   │ (只读扩展) │           │
+        │   └──────────┘   └──────────┘   └──────────┘           │
+        │     ↑ 选主 + 元数据同步 (BDB JE / 类 Raft edit log)      │
+        └───────────────────────────┬───────────────────────────┘
+                                    │ 下发 Fragment 执行计划
+        ┌───────────────────────────┼───────────────────────────┐
+        │                        BE 集群 (C++)                    │
+        │          数据存储 (列存)  +  查询执行 (向量化)            │
+        │                                                         │
+        │   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐    │
+        │   │  BE 1  │   │  BE 2  │   │  BE 3  │   │  BE n  │    │
+        │   │ Tablet │   │ Tablet │   │ Tablet │   │ Tablet │    │
+        │   └────────┘   └────────┘   └────────┘   └────────┘    │
+        │        ↕ 跨节点 Shuffle / 多副本 (默认 3 副本)           │
+        └─────────────────────────────────────────────────────────┘
+```
+
+### FE（Frontend，Java 编写）
+
+FE 是集群的「大脑」，**不存业务数据**，主要职责：
+
+- **管理元数据**：库表结构、分区分桶信息、数据副本分布、节点状态等都存在 FE 的内存 + 持久化的 edit log 里。
+- **接收 MySQL 协议连接**：客户端连的是 FE。
+- **SQL 解析、优化、生成分布式执行计划**：把一条 SQL 解析成逻辑计划，经优化器（2.x 有基于代价的 Nereids 新优化器）优化后，切分为可分发到各 BE 的 **Fragment**。
+- **调度与协调**：负责副本均衡、导入任务调度、元数据变更等。
+
+FE 按角色分为三种：
+
+| 角色 | 是否参与选主 | 是否持有完整元数据 | 作用 |
+| --- | --- | --- | --- |
+| **Follower** | 是 | 是（可写副本） | 组成选主仲裁组，其中**被选为 Master 的那个负责写元数据** |
+| **Master** | —（它本身是被选出来的 Follower） | 是 | **唯一可写元数据的节点**，处理所有元数据变更 |
+| **Observer** | 否 | 是（只读副本） | 只同步元数据、分担读请求与 SQL 解析压力，**横向扩展读能力**，不参与选主 |
+
+> Master 不是独立角色，而是 Follower 通过选举产生的「主」。
+
+FE 之间靠 **BDB JE**（Berkeley DB Java Edition，一个嵌入式存储库）维护一份 **edit log**，用**类 Raft / Paxos** 的多数派协议完成：
+1. **选主**：Follower 们投票选出一个 Master；
+2. **元数据同步**：Master 写元数据时先写 edit log，多数 Follower 确认后才提交，Observer 异步拉取。
+
+这就保证了元数据的高可用与一致性——只要多数 Follower 存活，集群元数据就不丢、可继续写。**生产建议部署奇数个（如 3 个）Follower**。
+
+### BE（Backend，C++ 编写）
+
+BE 是集群的「肌肉」，负责两件事：
+
+- **数据存储**：表的数据按 Tablet（分片）分布在各 BE 的本地磁盘上，列式存储，默认 **3 副本**保证可靠性。
+- **查询执行**：接收 FE 下发的 Fragment，用**向量化引擎**（按列批量计算，充分利用 CPU SIMD 与 cache）执行扫描、过滤、聚合、join 等算子。
+
+BE 是**对等的（无主从）**，可以水平扩缩容；新增/下线 BE 时，FE 会自动触发 Tablet 副本的迁移与均衡，基本无需人工干预。
+
+> 关于数据怎么切成 Tablet、分区分桶规则，见 [存储与数据划分](storage.html)；查询如何被切成 Fragment 并行执行，见 [查询执行](query.html)。
+
+## 三、MPP：一条查询是怎么并行跑起来的
+
+MPP 的核心思想是「**把计算推到数据所在的地方，并行做，再汇总**」。一条 SQL 在 Doris 里的大致流程：
+
+```
+SQL ──FE 解析/优化──► 逻辑计划 ──切分──► 多个 Fragment
+                                          │
+              ┌───────────────────────────┼───────────────────────────┐
+              ▼                            ▼                            ▼
+          BE1 执行                      BE2 执行                     BE3 执行
+       (扫本地 Tablet)               (扫本地 Tablet)              (扫本地 Tablet)
+              │                            │                            │
+              └────────► 跨节点 Shuffle（如按 join key / group key 重分布）◄────┘
+                                          │
+                                   上层 Fragment 聚合
+                                          │
+                                     FE 汇总 ──► 返回客户端
+```
+
+要点：
+
+- **Fragment**：执行计划的并行单元，每个 Fragment 可在多个 BE 上以多个实例并发跑。
+- **Shuffle（数据重分布）**：做 join 或全局聚合时，需要把相同 key 的数据汇聚到同一节点，这就需要 BE 之间通过网络交换数据（Exchange 算子）。这是 MPP 能做**多表分布式 join** 的关键，也是它与「只擅长单表」的引擎的重要区别。
+- **向量化**：每个算子按列、按批（batch）处理数据，而非一行一行，极大提升 CPU 效率。
+
+## 四、MySQL 协议兼容：接入几乎零成本
+
+Doris 在 FE 层实现了 MySQL 网络协议，所以：
+
+```sql
+-- 直接用 mysql 客户端连 FE（默认查询端口 9030）
+mysql -h fe_host -P 9030 -u root
+
+-- SQL 语法贴近 MySQL
+SHOW DATABASES;
+USE demo;
+SELECT region, COUNT(*) AS cnt, SUM(amount) AS total
+FROM orders
+WHERE dt >= '2026-01-01'
+GROUP BY region
+ORDER BY total DESC
+LIMIT 10;
+```
+
+- 应用侧可以直接用 **MySQL JDBC/ODBC 驱动**接入，无需专门的客户端 SDK。
+- 各类 BI/可视化工具（如支持 MySQL 数据源的）开箱即用。
+- 注意：「兼容协议」不等于「等同 MySQL」——Doris 没有 OLTP 的行级事务、不适合高频单行更新；它在建表时要选 [三种数据模型](data-model.html) 之一，这是 MySQL 没有的概念。
+
+## 五、存算一体 vs 存算分离（3.0）
+
+| 维度 | 存算一体（2.x 默认 / 经典模式） | 存算分离（**3.0** 起支持） |
+| --- | --- | --- |
+| 数据存放 | BE 本地磁盘，多副本（默认 3 副本） | 远端**对象存储**（S3 / OSS 等）或 HDFS，单份数据 |
+| 计算节点 | BE 既存数据又算（有状态） | 计算节点**无状态**，本地只做缓存 |
+| 扩缩容 | 加 BE 需迁移/均衡 Tablet 副本，较重 | 计算节点可秒级弹性扩缩，不搬数据 |
+| 成本 | 多副本占用本地盘，成本较高 | 存储靠对象存储，单副本，成本更低 |
+| 隔离性 | 读写、不同业务共享 BE 资源 | 可按「计算组」隔离不同负载，存储共享 |
+| 适用 | 对延迟极敏感、规模稳定 | 弹性需求强、降本、湖仓一体 |
+
+- **存算一体**：数据和计算都在 BE 上，靠本地盘 + 多副本保证性能与可靠性，是传统/默认形态，延迟最低。
+- **存算分离（3.0）**：把数据下沉到对象存储，计算层无状态化，本地盘只做缓存（cache）。好处是**计算可弹性扩缩、存储成本低、读写资源可隔离**，更契合云上与湖仓场景。代价是首次访问冷数据需走远端存储（靠缓存命中缓解）。
+
+> 选型时如果听到「3.0 存算分离」，核心卖点就是**弹性 + 降本 + 资源隔离**。
+
+## 六、典型适用场景
+
+- **实时报表 / 看板**：数据实时导入后秒级可查，支撑运营/经营大屏。
+- **即席分析（Ad-hoc）**：分析师任意维度自由探查，无需预先建好所有指标。
+- **用户行为分析**：漏斗、留存、路径分析等（Doris 内置 bitmap、hll 等近似/去重函数）。
+- **日志检索与分析**：配合倒排索引做日志的过滤与聚合。
+- **湖仓分析**：通过 Multi-Catalog 直接查询 Hive/Iceberg/Hudi 等外部数据源，做湖仓联邦查询。
+
+> 数据怎么实时/批量进 Doris，见 [数据导入](data-load.html)。
+
+## 一句话总结
+
+Apache Doris（基准 2.x）是「**MySQL 协议 + MPP 并行 + 列存向量化**」的实时 OLAP 数据库：FE（Java）管元数据与计划、靠类 Raft 的 BDB JE 选主同步，BE（C++）存数据并向量化执行；一条查询被拆成 Fragment 在多 BE 并行跑、跨节点 Shuffle 完成分布式 join；经典模式存算一体多副本，3.0 起支持存算分离实现弹性与降本。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/overview" data-base="../"></script>
+</body>
+</html>

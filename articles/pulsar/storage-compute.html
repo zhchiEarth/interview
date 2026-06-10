@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>存算分离：Broker 无状态 + BookKeeper · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 存算分离：Broker 无状态 + BookKeeper
+
+> 一句话：Pulsar 把传统 MQ「Broker 管一切」拆成**无状态的 Broker（只算）** + **分布式日志 BookKeeper（只存）** + **元数据中心**，于是计算和存储能各自独立扩缩，故障迁移搬的是元数据而非 TB 级数据。
+
+## 一、三层架构总览
+
+Pulsar 不是「单体 Broker」，而是把职责拆成三层，每层可独立扩缩：
+
+```text
+        Producer / Consumer
+               │  produce / subscribe
+               ▼
+   ┌───────────────────────────────┐
+   │ Broker（无状态计算 / 服务层）  │  ← 只算不存
+   │ 协议 / 路由 / Topic Ownership  │
+   │ Subscription 游标 / 流控 / 鉴权│
+   └───────────┬───────────────────┘
+               │ append / read（多副本）
+               ▼
+   ┌───────────────────────────────┐
+   │ Apache BookKeeper（存储层）    │  ← 真正落盘
+   │ Bookie A   Bookie B   Bookie C │
+   └───────────────────────────────┘
+               ▲
+               │ 谁是 Topic Owner / Ledger 元数据
+   ┌───────────────────────────────┐
+   │ Metadata Store（元数据层）     │
+   │ ZooKeeper（新版可用 etcd / 其它│
+   │ 兼容实现）                     │
+   └───────────────────────────────┘
+```
+
+| 层 | 角色 | 是否有状态 | 存什么 |
+|------|------|--------|--------|
+| Broker | 计算 / 服务 | **无状态** | 不存消息，只存运行期缓存 |
+| BookKeeper（Bookies） | 存储 | 有状态 | 真正的消息数据（多副本） |
+| Metadata Store（ZooKeeper 等） | 元数据 | 有状态 | Topic 归属、Ledger 列表、配置策略 |
+
+## 二、Broker 为什么是「无状态」
+
+「无状态」指的是：**Broker 本地磁盘不长期保存消息数据**。它干的全是服务层的活：
+
+- **produce / consume 服务**：收发协议、把消息追加到存储、把数据投递给消费者；
+- **Topic Ownership（归属）**：一个 Topic 在某一刻只被一个 Broker「拥有」，由它负责路由；
+- **Subscription / Cursor**：管理订阅进度（游标本身持久化在 BookKeeper / 元数据，不是赖在 Broker 本地）；
+- **限流 / 鉴权 / Schema 校验**等控制面逻辑。
+
+因为数据不在本地，带来两个直接好处：
+
+```text
+扩容：新加一台 Broker → 立刻能接管部分 Topic，无需搬历史数据
+故障：Broker 宕机
+      → 它拥有的 Topic 失去 Owner
+      → 其它 Broker 通过元数据重新认领（lookup）
+      → 从 BookKeeper 接着读写，秒级恢复
+```
+
+> 「Client 如何找到当前 Owner、迁移如何发生」详见总览：[Pulsar 渐进式理解](deep-dive-overview.html)。
+
+## 三、存储下沉到 BookKeeper
+
+消息数据不写 Broker 本地盘，而是写入 **Apache BookKeeper**——一个分布式、多副本、**只追加（append-only）**的日志存储。Broker 只是把每个 Topic 当作一条逻辑日志，调用 BookKeeper 追加 Entry、按位置读取。
+
+```text
+Topic 的数据 = 一串 Ledger（只追加日志段）
+每个 Ledger 的每条 Entry 多副本写到一组 Bookie 上
+Broker 自己不持有这些数据，只持有「指针」（在哪个 Ledger 的哪个位置）
+```
+
+> Bookie / Ledger / Entry、E·Qw·Qa 三个数字、写路径与故障恢复，见专题：[BookKeeper 存储原理](bookkeeper.html)。
+
+## 四、对比 Kafka 的「存算一体」
+
+这是面试高频对比点。Kafka 的 Broker **既算又存**——分区副本就是 Broker 本地磁盘上的 segment 文件：
+
+```text
+Kafka（存算一体）              Pulsar（存算分离）
+┌────────────────┐            ┌──────────┐   ┌────────────┐
+│ Broker         │            │ Broker   │   │ BookKeeper │
+│  ├ 处理协议    │            │ 只算     │──▶│  只存      │
+│  └ 本地磁盘    │            └──────────┘   └────────────┘
+│    存分区数据  │             计算与存储可分别独立扩展
+└────────────────┘
+```
+
+| 维度 | Kafka（存算一体） | Pulsar（存算分离） |
+|------|----------------|----------------|
+| Broker 是否存数据 | 是，分区数据在本地盘 | 否，数据在 BookKeeper |
+| 扩容计算 | 加 Broker 要做分区**重平衡、搬数据** | 加 Broker **不搬数据**，立即分担 Topic |
+| 扩容存储 | 与 Broker 绑定，加盘=加 Broker | 加 Bookie **即时生效**，与 Broker 解耦 |
+| 故障恢复 | 重新选主 + 副本追赶本地日志 | Topic 换 Broker 接管，从 BookKeeper 续读，无需搬数据 |
+| 弹性 | 计算/存储捆绑，弹性差 | 计算与存储**独立伸缩** |
+
+一句话区别：**Kafka 缩容要先把数据迁走才能下线节点；Pulsar 加减 Broker 与数据无关。**
+
+## 五、好处与代价
+
+**好处**
+
+- **弹性**：计算（Broker）与存储（Bookie）按各自瓶颈独立扩缩；
+- **扩容无数据搬迁**：加 Broker 不搬数据，加 Bookie 即时被新 Ledger 使用；
+- **故障恢复快**：Topic 迁移搬的是元数据（KB 级），不是历史消息（TB 级）。
+
+**代价**
+
+- **组件更多**：Broker + BookKeeper + 元数据，部署 / 运维 / 监控面更宽；
+- **链路更长**：一次写要经 Broker 转发到多个 Bookie，**端到端延迟略高于** Kafka 的本地直写；
+- 排障要跨多层定位（服务层 vs 存储层 vs 元数据层）。
+
+## 六、相关阅读
+
+- 配套专题：[BookKeeper 存储原理](bookkeeper.html)
+- [分区 Topic 与无缝扩容](partitioned-topic.html)
+- [Pulsar vs Kafka](vs-kafka.html)
+- 总览：[Pulsar 渐进式理解](deep-dive-overview.html)
+
+## 一句话总结
+
+> 存算分离 = **无状态 Broker 只负责服务、BookKeeper 负责多副本存储、元数据中心记归属**；好处是弹性、扩容不搬数据、故障秒级换主，代价是组件更多、链路更长、延迟略高。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/storage-compute" data-base="../"></script>
+</body>
+</html>

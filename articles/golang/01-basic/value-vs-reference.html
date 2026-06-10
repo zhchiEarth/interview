@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go 只有值传递？slice/map 像引用是怎么回事 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Go 只有值传递？slice/map 像引用是怎么回事
+
+## 一、Go 永远是值传递
+
+**Go 函数调用的参数永远是按值拷贝**——这是个铁律，没有例外。
+
+```go
+func modify(x int) { x = 99 }
+n := 1
+modify(n)
+fmt.Println(n)   // 1, 不是 99
+```
+
+那为什么下面这段看起来像"引用传递"？
+
+```go
+func modify(s []int) { s[0] = 99 }
+arr := []int{1, 2, 3}
+modify(arr)
+fmt.Println(arr)   // [99, 2, 3]  ← 真的被改了!
+```
+
+→ 答案：**slice 是值传递了，但 slice 这个值本身包含一个指针**。下面拆开看。
+
+---
+
+## 二、关键概念：值传递 ≠ 不能修改外部状态
+
+容易混淆的两件事：
+
+| 概念 | 含义 |
+|---|---|
+| **值传递（pass by value）** | 函数参数是**实参的拷贝** |
+| **能不能修改外部状态** | 看拷贝里**有没有指向外部的指针** |
+
+如果拷贝里有指针指向外部数据 → 通过这个指针**能改外部**——但传递本身仍然是"值传递"。
+
+```
+modify(s []int) {
+    // s 是 arr 的拷贝
+    // 但 s 里的 Data 指针, 指向同一个底层数组!
+    s[0] = 99   // 通过 Data 指针改原数组
+}
+```
+
+---
+
+## 三、"看起来像引用"的 5 种类型
+
+这 5 种类型的值**本身就包含指针**——所以传递时虽然是值拷贝，但底层数据共享：
+
+| 类型 | 内部结构 | 拷贝时拷什么 |
+|---|---|---|
+| **slice** | `(ptr, len, cap)` 24 字节 | 拷贝 header，**Data 指向同一底层数组** |
+| **map** | `*hmap` 8 字节 | 拷贝指针，**指向同一 hmap** |
+| **chan** | `*hchan` 8 字节 | 拷贝指针，**指向同一 hchan** |
+| **func** | `(code, captured)` 16 字节 | 拷贝指针，**捕获的变量共享** |
+| **interface** | `(type, data)` 16 字节 | 拷贝两个指针，**data 共享** |
+
+**string 是特例**——内部也是 `(ptr, len)`，但因为 string 不可变，所以表现完全像值类型。
+
+```
+                  各种类型在函数参数里的表现:
+
+   值类型 (拷贝完全独立):
+      int / float / bool / array [N]T / struct
+      → 函数改参数, 外部不变
+
+   "自带指针" 的值类型 (拷贝 header, 底层数据共享):
+      slice / map / chan / func / interface
+      → 函数改元素值, 外部可见
+      → 函数重新赋值参数本身, 外部不变 (header 被替换的是拷贝)
+```
+
+---
+
+## 四、Slice 的两种"修改"行为对比
+
+```go
+func modify(s []int) {
+    s[0] = 99            // ① 通过共享底层修改 — 外部能看到
+    s = append(s, 4)     // ② 改 header (可能扩容换底层) — 外部看不到
+    s = []int{100, 200}  // ③ 重新赋值 — 外部看不到
+}
+
+arr := []int{1, 2, 3}
+modify(arr)
+fmt.Println(arr)   // [99, 2, 3]
+                   //  ↑ 只有第①步影响外部
+```
+
+### 为什么 append 外部看不到
+
+```
+函数外:  arr.Data ─→ [1,2,3]   arr.Len=3 arr.Cap=3
+              │
+              │ 调 modify(arr) — 拷贝 header
+              ▼
+函数内:  s.Data   ─→ [1,2,3]   s.Len=3 s.Cap=3
+                       (共享底层)
+
+s = append(s, 4):
+  cap 不够 → 扩容 → 新底层 [1,2,3,4]
+  s.Data → 新底层, s.Len=4
+
+函数外的 arr 还指着旧底层 [1,2,3] — 看不到 append
+```
+
+如果 cap 够：
+
+```go
+arr := make([]int, 3, 10)   // cap=10
+modify(arr)
+// modify 里 append 没扩容, 直接写到底层 [arr[3]]
+// 但 arr.Len 还是 3 — 外部看不到那个元素!
+```
+
+→ 详见 [Slice 底层是怎么实现的](../02-advanced/slice.html) 里"分家 / 不分家"那节。
+
+---
+
+## 五、Map 的修改：拷贝指针，效果"全透"
+
+```go
+func modify(m map[string]int) {
+    m["a"] = 99           // 外部能看到 (同一个 hmap)
+    delete(m, "b")        // 外部能看到
+    m = make(map[string]int)  // 外部看不到 (改的是参数指针)
+}
+```
+
+map 本质是个**指向 hmap 的指针**——所有操作都走指针，外部直接可见。
+
+---
+
+## 六、想"真改"的两种姿势
+
+### 姿势 1：传指针
+
+```go
+func grow(s *[]int) {
+    *s = append(*s, 4)   // 解引用赋值, 改的是外部的 slice header
+}
+
+arr := []int{1, 2, 3}
+grow(&arr)
+fmt.Println(arr)   // [1, 2, 3, 4]
+```
+
+### 姿势 2：返回新值（标准库风格）
+
+```go
+func grow(s []int) []int {
+    return append(s, 4)
+}
+
+arr := []int{1, 2, 3}
+arr = grow(arr)   // 必须接住返回值
+fmt.Println(arr)   // [1, 2, 3, 4]
+```
+
+**Go 标准库一律用姿势 2**——这就是 `append` 本身的设计（`s = append(s, x)`）。
+
+---
+
+## 七、struct 的传递：永远拷贝
+
+```go
+type User struct {
+    Name string
+    Age  int
+}
+
+func update(u User) {
+    u.Age = 99   // 改的是拷贝
+}
+
+alice := User{Name: "alice", Age: 20}
+update(alice)
+fmt.Println(alice.Age)   // 20, 没变!
+```
+
+struct 是**纯值类型**——传参拷贝整个 struct 的所有字段。
+
+**想改**：传指针 `func update(u *User)`，或者用指针接收者方法 `func (u *User) Update()`。
+
+⚠️ struct 内嵌的字段如果是 slice / map / 指针，**仍然遵循"自带指针"规则**——struct 拷贝但内部指针字段还是指向同一份数据。
+
+---
+
+## 八、性能视角：大 struct 别值传递
+
+```go
+type Big struct {
+    data [1024]int   // 8KB
+}
+
+func process(b Big) { ... }   // ❌ 每次调用拷贝 8KB
+
+func process(b *Big) { ... }  // ✓ 只拷贝 8 字节指针
+```
+
+**经验**：
+
+- 小 struct（几十字节内）→ 值传递清晰、无所谓
+- 大 struct → 一定传指针
+- 临界点没有死规则，benchmark 才准
+
+---
+
+## 九、一图总结
+
+```
+            Go 函数传参铁律
+                  │
+              永远值传递 (拷贝)
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+     纯值类型             自带指针的值类型
+     int/float/array       slice/map/chan/func/interface
+     struct                string (但因不可变,像值)
+
+     拷贝独立              拷贝 header (指针)
+     改不动外部             header 拷贝但底层共享
+                          → 改元素外部可见
+                          → 重新赋值 header 不可见
+
+   "看似引用"的 5 种类型:
+     slice  = (ptr, len, cap)
+     map    = *hmap
+     chan   = *hchan
+     func   = (code, captures)
+     interface = (type, data)
+
+   想改外部状态:
+     ① 传指针 *T, 函数里 *p = ...
+     ② 返回新值, 调用方接住 (标准库风格)
+
+   性能:
+     小 struct 值传递无所谓
+     大 struct (几 KB) 一定传指针
+```
+
+**一句话**：Go **永远值传递**——但 slice / map / chan / func / interface **自身就含指针**，拷贝 header 后底层数据共享，所以"改元素"外部能看到，但"重新赋值参数"外部看不到。**想真改外部**：要么传 `*T`，要么返回新值让调用方接住（`s = append(s, x)` 风格）。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/value-vs-reference" data-base="../../"></script>
+</body>
+</html>

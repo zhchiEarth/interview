@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.Pool 原理与适用场景 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.Pool 原理与适用场景
+
+## 一、sync.Pool 是干嘛用的
+
+**减少高频小对象的分配/回收开销**——把"用完即扔"的对象塞回池里，下次直接复用，**避开 GC**。
+
+典型场景：HTTP handler 里每个请求都要一个 `bytes.Buffer` / `json.Decoder` / `[]byte` 临时空间。直接 `make` 的话，**每秒几万次请求 = 每秒几万次堆分配 + GC 压力暴涨**。
+
+```go
+// ❌ 每次分配
+func handler(w http.ResponseWriter, r *http.Request) {
+    buf := bytes.NewBuffer(nil)   // 堆分配
+    buf.WriteString(...)
+    // 函数结束, buf 等 GC 回收
+}
+
+// ✓ 池化复用
+var bufPool = sync.Pool{
+    New: func() any { return new(bytes.Buffer) },
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    buf := bufPool.Get().(*bytes.Buffer)
+    defer bufPool.Put(buf)
+    buf.Reset()
+    buf.WriteString(...)
+}
+```
+
+sync.Pool 的核心定位：
+
+| 这是什么 | 不是什么 |
+|---|---|
+| ✅ **GC 周期内的本地缓存** | ❌ 连接池（生命周期管理） |
+| ✅ Get/Put 几乎无锁 | ❌ 长寿命对象池 |
+| ✅ 短期可丢的临时对象 | ❌ 数据库 / Redis 连接 |
+| ✅ 减少 mallocgc 调用 | ❌ 限流 / 并发控制 |
+
+→ **"GC 会清空"是 Pool 的核心约束**——不能拿来管生命周期。
+
+---
+
+## 二、设计推导：这套结构是被什么一步步逼出来的
+
+> 直接看到 `private / shared / victim` 三层容易懵。其实它是从最朴素的方案一步步**被问题逼出来**的——顺着走一遍，每一层为什么存在就全通了。
+
+### 起点 · 问题
+
+高频临时对象直接 `make`：每次都是一次**堆分配**，用完又交给 **GC** 扫描、回收。每秒几万次请求 = 每秒几万次 `mallocgc` + GC 压力暴涨。
+
+> 目标很简单：**把"用完即扔"的对象留下来下次复用，绕开分配和 GC。**
+
+### 第 1 版 · 一个全局空闲链表 + 一把锁
+
+最朴素：维护一个全局 free list，`Get` 加锁取一个，`Put` 加锁还回去。
+
+✗ **致命伤**：每次 Get/Put 都抢**同一把全局锁**。CPU 核越多，锁竞争越炸——高并发下比直接 `make` 还慢，**锁本身成了瓶颈**。
+
+### 第 2 版 · 每个 P 一份本地缓存（干掉锁）
+
+既然全局锁是瓶颈，那就**别共享**：给每个 P（逻辑处理器）一份自己的缓存，自己存自己取。同一时刻一个 P 上只有一个 G 在跑 → **天然不需要锁**。这就是 `local []poolLocal` 的来历，也是 Pool 快的根。
+
+✗ **新问题**：负载不均。P0 上的 G 疯狂 Put 攒了一堆，P1 上的 G 却 Get 不到（本地空）→ 只能去 `New`，白白浪费 P0 的库存。
+
+### 第 3 版 · 本地缓存拆成 private + shared，shared 可被偷
+
+要解决不均 → 让**别的 P 能来"偷"**。但偷不能拖慢本地无锁的快路径。于是把每个 P 的缓存拆成两块：
+
+- **private**：一个**独占单槽**，只有本 P 能碰 → 一条 swap 指令，最快。`Get` 完马上 `Put` 这种**配对场景**全在这命中。
+- **shared**：一个**双端队列**，本 P 从**队头**无锁存取，别的 P 从**队尾** CAS 来偷。
+
+> 既然 shared 本 P 也能无锁，为什么还要 private？为了把**最热的配对路径**压到一条指令，连双端队列那点结构开销都省掉。
+
+### 第 4 版 · 绑定 GC + 加 victim 平滑
+
+还差最后一环：**这些缓存的对象什么时候释放？**
+
+不管它 → 池子只涨不跌 = **变相内存泄漏**。
+→ 让 **GC 来收**：每次 GC 把池清掉，对象就能被回收。
+
+✗ 但一**清空**，GC 后的流量峰值全部 miss → 全走 `New`，GC 后瞬间变慢、抖动。
+→ 再加一层 **victim（牺牲区）**：GC 时不直接扔，先把 `local` 降级到 `victim` 再扛一轮，**下一次** GC 才真清。这样池子不会一下子空掉，突发流量仍能命中。
+
+### 终点 · 于是得到这套结构
+
+```text
+   per-P 缓存       ┌ private  单槽, 本 P 独占, 一条指令          (最热路径)
+   (local)         └ shared   双端队列, 本 P 队头无锁 / 他 P 队尾偷
+        +
+   victim          上一轮 GC 降级下来的, 再扛一轮做缓冲
+        +
+   New             全都没有时, 兜底造一个
+        │
+   生命周期挂在 GC 上:  local ──降级──→ victim ──下轮 GC──→ 清空
+```
+
+> **反过来，这条主线正好解释了 Pool 最大的约束**：因为它的清理是**搭 GC 的便车**——你管不了对象活多久，所以**不能拿它管生命周期、不能当连接池**（详见后面"不能干的事"一节）。
+
+后面的章节就是把这张图的每一块讲细：**内部结构**拆 private/shared/victim，**Get/Put 路径**走查找顺序，**GC 行为**讲两轮回收，**为什么无锁**讲 procPin 与双端队列。
+
+---
+
+## 三、典型用法：三步范式
+
+```go
+// ① 定义池, New 给出"找不到时怎么造一个新的"
+var bufPool = sync.Pool{
+    New: func() any {
+        return new(bytes.Buffer)
+    },
+}
+
+// ② Get 取对象, Reset 清空, defer Put 归还
+func handle() {
+    buf := bufPool.Get().(*bytes.Buffer)
+    defer bufPool.Put(buf)
+    buf.Reset()                  // ⚠️ 必须清空旧数据!
+
+    buf.WriteString("hello")
+    // ... 用 buf ...
+}
+```
+
+**铁律**：
+
+1. **`Get` 后必 `Reset`**——上次的残留数据会污染本次（机密泄漏、bug）
+2. **`Put` 用 `defer`**——异常路径也要还回去，否则池子越用越空
+3. **`New` 必须提供**——没提供时 `Get` 会返回 `nil`，要手动处理
+
+---
+
+## 四、内部结构：双层 P-local + victim
+
+sync.Pool 是 **per-P + 跨 P stealing + victim cache** 的组合：
+
+```
+sync.Pool 内部:
+
+┌──────────────────────────────────────────────────────┐
+│ local []poolLocal   (每个 P 一个)                    │
+│                                                      │
+│  P0:  ┌─────────────┬──────────────────┐             │
+│       │ private: x  │ shared: [..队列..] │ ← 双端队列  │
+│       └─────────────┴──────────────────┘             │
+│                                                      │
+│  P1:  ┌─────────────┬──────────────────┐             │
+│       │ private: y  │ shared: [..队列..] │             │
+│       └─────────────┴──────────────────┘             │
+│  ...                                                 │
+├──────────────────────────────────────────────────────┤
+│ victim []poolLocal  (上一轮 GC 留下的)                │
+│  P0: 旧 private + 旧 shared                          │
+│  P1: 旧 private + 旧 shared                          │
+│  ...                                                 │
+├──────────────────────────────────────────────────────┤
+│ New  func() any                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+### 三层结构详解
+
+| 层 | 作用 | 访问速度 |
+|---|---|---|
+| **private**（单槽） | 当前 P 独占的一个槽位 | **最快**——无锁，单条指令 |
+| **shared**（双端队列） | 当前 P 的可共享队列，**可被其它 P 偷** | 较快——CAS，但跨 P 偷有竞争 |
+| **victim** | 上一轮 GC 留下的"复活区"——再活一轮就清掉 | 较慢——遍历查找 |
+
+### 关键设计：private + shared 的分工
+
+- **private**：每个 P 一个槽——单条指令 swap 就拿到/放回。**99% 路径**走这里。
+- **shared**：当 private 满了或空了，溢出/补给到 shared。shared 是双端队列：
+  - **本 P** 从头部取（无锁）
+  - **其它 P 来偷**时从尾部取（CAS）
+
+这种"队首本人无锁、队尾他人 CAS"的设计跟 [GMP 的 work-stealing](../03-expert/gpm-scheduler.html) 几乎一样。
+
+---
+
+## 五、Get / Put 详细路径
+
+### Get 的 5 级查找
+
+```
+Get():
+  ① 拿当前 P 的 private 槽    → 命中? 取走,返回      [最快]
+  ② 当前 P 的 shared 队头     → 命中? 取走,返回
+  ③ 偷别的 P 的 shared 队尾   → 命中? 取走,返回      (work stealing)
+  ④ 从 victim 里找            → 命中? 取走,返回
+  ⑤ 都没找到                  → 调用 New(), 返回新对象
+```
+
+**99% 的请求**在 ① 命中——一条 swap 指令就完事，几纳秒级开销。
+
+### Put 的路径
+
+```
+Put(x):
+  ① 当前 P 的 private 空?     → 是? 放进去,完事     [最快]
+  ② private 满了              → 把 x 推入当前 P 的 shared 队头
+```
+
+`Put` 几乎总是走 ①——把对象塞回本地槽，等下一次 Get 直接取走，**热缓存命中率极高**。
+
+---
+
+## 六、GC 行为：两轮 GC 才彻底回收
+
+这是 sync.Pool **最关键的一条特性**——也是它"不能管生命周期"的根本原因。
+
+```
+GC cycle N:
+  ┌─────────────────────┐
+  │ local:  [a, b, c]   │ ← 本轮缓存(都是 Put 回来的, 没人在用)
+  │ victim: [d, e]      │ ← 上一轮残留
+  └─────────────────────┘
+
+GC 发生 (cycle N+1 开始前):
+  → victim 整个清空 (那些 d, e 被回收)
+  → local 整个移到 victim
+  ┌─────────────────────┐
+  │ local:  []          │ ← 清空了!
+  │ victim: [a, b, c]   │ ← 上一轮的全在这, 可以再用
+  └─────────────────────┘
+
+下次 Get():
+  → local 空 → 去 victim 找 → 命中 a → 拿走
+  (victim 里的 a 被"复活"到 local? 不, 直接给用户)
+
+第 2 次 GC:
+  → victim 再次清空
+  → 那时 local 里的对象再次降级到 victim
+```
+
+> **⚠️ 别被"活跃对象"误导：`local → victim` 是无条件的整体搬迁，不看单个对象死活。**
+> `poolCleanup` 做的就是 `victim = local; local = nil` 一次指针交换——里面是谁、"活没活"它都不管。所以**没有任何对象能留在 local 过一轮 GC**，每轮 local 都被整块清空降级。
+>
+> 一个对象的命运只取决于 **GC 那一刻它躺在哪一层**：
+> - **被 Get 出去还没 Put** → 它根本不在 local 里，GC 的搬迁碰不到它，你用多久都行；
+> - **躺在 local** → 本轮必降级到 victim；
+> - **躺在 victim** → 本轮被丢弃、回收。
+>
+> 想让 `a` 多活，唯一办法是**在它从 victim 被丢弃前，再次 Get+Put 把它塞回 local**（时钟重置）——靠的是"被复用"，不是"还活着"。
+
+### 续命：靠 Get+Put 重新塞回 local
+
+接着上面的图——如果在 victim 被丢弃前，有人把 `a` Get 出来用完再 Put 回去，它就回到 local，"时钟"重置、又能多扛一轮：
+
+```text
+GC N+1 后:   local:[]        victim:[a, b, c]
+
+   Get()  → 从 victim 取出 a (a 离开池子, 到你手里)
+   Put(a) → a 放回          → local:[a]       ← a 重新回到 local
+
+GC N+2 触发:
+   ① victim[b, c] 丢弃 → b, c 被回收 (没人 Get+Put, 时钟到点)
+   ② local[a] → victim
+             local:[]        victim:[a]        ← a 又续了一轮
+```
+
+→ 所以"a 能活多久"真正取决于**它有没有在被丢弃前被再次 Get+Put**，而不是它"还活着"。热点对象自然一直续命，没人碰的 2 轮内回收。
+
+### 两条结论
+
+1. **对象在 pool 里最多活 2 个 GC 周期**——超过就被 GC 收掉
+2. **GC 后第一次 Get 可能拿到上轮的对象**（来自 victim），但**池子是"半空"的**——压力大的时候命中率下降
+
+**Why 两轮**？Go 1.13 之前只有 local，GC 一来全清空——压测峰值时全去 New，反而成瓶颈。加 victim 是为了**平滑过渡**：GC 不会一下子让池子空空，让突发流量也能命中。
+
+---
+
+## 七、为什么 Get/Put 几乎无锁
+
+Pool 的快是因为**绝大多数操作都不需要锁**：
+
+| 操作 | 同步原语 |
+|---|---|
+| 读/写本 P 的 private | **无锁**——`runtime_procPin` 把 G 钉在当前 P 上，private 单线程访问 |
+| 读/写本 P 的 shared 队头 | **无锁**（同上） |
+| 偷别 P 的 shared 队尾 | **CAS**——双端队列的 lock-free pop |
+| 访问 victim | **无锁**（victim 在 GC 时已经"切换"过，正常路径上不变） |
+
+**关键 trick：runtime_procPin**
+
+```go
+// pool 内部:
+pid := runtime_procPin()    // 把当前 G 钉在 P 上, 关闭抢占
+                             // → 这段时间内 private 槽只有我能访问
+// ... 操作 private/shared ...
+runtime_procUnpin()          // 解除钉子
+```
+
+短暂关闭抢占（几个指令的代码）就能保证 private 槽的独占——比加锁快几十倍。
+
+---
+
+## 八、Pool 不能干的事
+
+### ❌ 当连接池用
+
+```go
+// 灾难写法
+var connPool = sync.Pool{
+    New: func() any { return newDBConn() },
+}
+
+func query() {
+    conn := connPool.Get().(*DBConn)
+    defer connPool.Put(conn)
+    // 用 conn...
+}
+```
+
+**问题**：
+
+1. **GC 一来全清空**——你以为有 N 个连接备用，下次发现要重新建立 N 个
+2. **没有"借用上限"**——并发起飞时所有 G 都 Get 到不同 conn，连接数失控
+3. **没有"健康检查"**——拿到的 conn 可能已经 broken
+
+→ 数据库连接用 `database/sql` 的连接池；redis 用 `go-redis` 的连接池。
+
+### ❌ 当全局对象注册表用
+
+Pool 的目的不是"持久化对象"。**任何"我需要 X 个对象始终存在"的需求都不该用 Pool。**
+
+### ❌ 塞大对象
+
+```go
+// ❌
+var pool = sync.Pool{
+    New: func() any { return make([]byte, 100*1024*1024) },  // 100MB!
+}
+```
+
+GC 时这些大对象要扫描、要释放——**反而成 GC 压力源**。Pool 适合**小到中型**（几 KB ~ 几 MB）对象。
+
+### ❌ 不 Reset 就 Put
+
+```go
+// 危险
+buf := bufPool.Get().(*bytes.Buffer)
+buf.WriteString(secret)
+bufPool.Put(buf)               // 下次 Get 出来的 buf 里还残留 secret!
+```
+
+可能导致**敏感数据跨请求泄漏**。
+
+---
+
+## 九、典型陷阱
+
+### ① Put 进去的对象被其它代码持有
+
+```go
+buf := bufPool.Get().(*bytes.Buffer)
+defer bufPool.Put(buf)
+return buf.Bytes()             // ❌ 返回的 slice 指向 buf 内存
+                               //    Put 后下次 Get 可能复用,数据被改
+```
+
+**修法**：用前拷贝出去 `append([]byte(nil), buf.Bytes()...)`。
+
+### ② Get/Put 类型不一致
+
+```go
+pool := sync.Pool{New: func() any { return new(int) }}
+pool.Put("string")              // ❌ 编译不报, 但下次 Get 出来类型断言会 panic
+```
+
+> Go 1.18+ 加了 `sync.Pool` 但没泛型化。建议自己包一层泛型 wrapper。
+
+### ③ 把 Pool 当变量传
+
+```go
+type Server struct {
+    Pool sync.Pool   // ❌ 不能 copy! Server 一旦被复制就坏了
+}
+
+// 正确:
+type Server struct {
+    Pool *sync.Pool
+}
+```
+
+或者把 Pool 做成包级变量。
+
+### ④ 高频小对象 + 低频大对象混用一个 Pool
+
+```go
+pool := sync.Pool{
+    New: func() any {
+        if needsLarge() { return make([]byte, 1<<20) }
+        return make([]byte, 1<<10)
+    },
+}
+// → Put 进去的可能是 1KB 也可能是 1MB
+// → Get 出来不知道大小, 还得检查
+```
+
+**解法**：分多个 Pool，按对象大小分桶。或者用 `bytebufferpool` 这种带分级的库。
+
+---
+
+## 十、谁在用：标准库 + 知名框架实例
+
+> 前面讲的都是抽象适用性，这里给一串能"对号入座"的真实案例——很多你天天在跑，只是没意识到。
+
+### 标准库里（你没察觉但一直在用）
+
+| 包 | 池化的对象 | 为什么 |
+|---|---|---|
+| **`fmt`** | `pp`（printer 状态 + buffer） | 每次 `Printf/Sprintf` 都要临时 buffer，复用免分配 |
+| **`encoding/json`** | `encodeState`（类 bytes.Buffer） | 每次 `Marshal` 复用编码缓冲 |
+| **`net/http`** | `bufio.Reader` / `bufio.Writer`（2K/4K 分级） | 每个连接读写都要 bufio |
+| **`regexp`** | `machine`（匹配状态机） | 每次匹配要一份执行状态 |
+| **`compress/flate`、HTTP/2** | 帧缓冲 / 压缩窗口 | 高频小缓冲 |
+
+> 所以你调一次 `fmt.Sprintf` 或 `json.Marshal`，背后就走了一次 `Pool.Get/Put`。
+
+### 知名框架 / 库（高性能卖点很大程度靠它）
+
+- **gin**：`engine.pool` 复用 **`gin.Context`**——每个请求 `Get` 一个，`ServeHTTP` 末尾 `Put` 回去。最经典的"请求级对象池"。
+- **fasthttp**：大量复用 `RequestCtx`、`Request`/`Response`、byte buffer——零分配是它比 net/http 快的核心手段。
+- **zap / zerolog**：复用编码日志行的 buffer，做到日志热路径零分配。
+- **gRPC / protobuf**：复用 codec buffer，有时复用 message 对象。
+- **valyala/bytebufferpool**：把"分级 buffer 池"封装成库，底层就是 sync.Pool。
+
+### 自己代码里的四类典型
+
+```go
+// ① bytes.Buffer 复用 —— 序列化 / 拼接 / 日志格式化(最常见)
+var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+buf := bufPool.Get().(*bytes.Buffer)
+defer func() { buf.Reset(); bufPool.Put(buf) }()
+
+// ② []byte 临时缓冲 —— io 读写搬运(注意按大小分桶)
+var bytePool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+
+// ③ 高频 RPC 的大消息对象 —— 每秒几万次解析, 复用避免 GC 抖动
+var reqPool = sync.Pool{New: func() any { return new(MyRequest) }}
+
+// ④ 带内部缓冲、可 Reset 的对象 (Encoder / Decoder / Writer)
+var gzPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+```
+
+### 共同长相
+
+> 这些用户几乎都满足：**生命周期短（用完即弃）+ 高频 + 创建有分配成本 + 能 Reset + 大小相近**。
+> 典型反例（连接池、长寿命对象、超大对象、大小悬殊）见"Pool 不能干的事"一节。
+
+---
+
+## 十一、什么时候用 Pool，什么时候不用
+
+| 用 Pool ✅ | 不用 Pool ❌ |
+|---|---|
+| 高频复用临时对象 | 长生命周期对象（用专门的池） |
+| 短期可丢的缓冲 | 数据库连接（用 sql.DB） |
+| Reset 后能复用 | 必须保留状态的对象 |
+| 对象大小相近 | 大小差异巨大 |
+| 几 KB ~ 几 MB | 几十 MB 以上（GC 压力反而大） |
+| benchmark 显示 `allocs/op` 高 | 跑下来根本不是瓶颈 |
+
+**实战 checklist**：
+
+```
+1. 用 go test -bench -benchmem 量一下 → allocs/op > 0?
+2. 加 sync.Pool 改造 → 再 benchmark → allocs/op 变 0?
+3. 确认 Reset 已加 + defer Put 已加
+4. 上压测看 P99 延迟有没有改善 (GC pause 变短)
+```
+
+---
+
+## 十二、一图总结
+
+```
+                  sync.Pool 核心思想
+                        │
+                        ▼
+              用 P-local 缓存替代 mallocgc
+              减少 GC 压力, 重复用对象
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+     local (每 P 一份)               victim (上轮 GC 残留)
+     ┌─────────┬───────────┐
+     │ private │  shared   │
+     │  (单槽) │ (双端队列) │
+     │  无锁   │ 本 P 无锁  │
+     │         │ 他 P CAS 偷│
+     └─────────┴───────────┘
+
+   Get 5 级查找:
+     ① 本 P private     [最快, ~1 ns]
+     ② 本 P shared 头
+     ③ 偷其它 P shared 尾
+     ④ victim
+     ⑤ New()
+
+   Put:
+     ① 本 P private 空? → 放进去
+     ② 满 → 推入本 P shared 头
+
+   GC 行为:
+     local → victim (整体降级)
+     victim → 清空 (回收)
+     对象最多活 2 个 GC 周期
+
+   适用 ✓                    不适用 ✗
+     高频小对象                连接池
+     临时缓冲                  长寿命对象
+     Reset 后可复用            大对象
+     allocs/op 是瓶颈          状态必须保留
+
+   铁律:
+     Get 后必 Reset
+     Put 用 defer
+     Pool 不能 copy
+     Put 前的对象不能再被别人引用
+```
+
+**一句话**：sync.Pool = **per-P + work stealing + victim cache** 的本地对象缓存，**Get/Put 几乎无锁**，但**两轮 GC 内必然清空**——所以只能用来缓存"用完即扔的短期对象"，**不能管生命周期、不能当连接池**。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-pool" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.Map 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.Map 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> sync.Map = **read 无锁 + dirty 加锁** 的双 map 设计；无锁读的两层物理基础：**read 用 `atomic.Pointer` 包起来**（永不原地改，要换就整体替换）+ **map 值是 `*entry`**（read/dirty 共享 entry，改值只 CAS `entry.p` 不动 map）；`entry.p` **三态**（正常 / nil / expunged）解决「read 不能改 + 删除复活」竞态。**只在「读多 + key 集合稳定」占优**，否则慢于 RWMutex+map。
+
+记不全时，按这条**记忆主线：一套结构 + 两个设计 + 三态 + 性能法则**展开（详细推演看[正文](sync-map.html)）：
+
+---
+
+## 🏗 一套结构 —— 双 map 分离
+
+```go
+type Map struct {
+    read   atomic.Pointer[readOnly] // 无锁读, 99% 走这
+    mu     Mutex
+    dirty  map[any]*entry           // 受 mu 保护, 加锁读写
+    misses int                      // read 没命中查 dirty 时 +1
+}
+type readOnly struct { m map[any]*entry; amended bool } // amended: dirty 有 read 没有的 key
+type entry struct { p atomic.Pointer[any] }             // 指向真实 value
+```
+- `read.m["k"]` 与 `dirty["k"]` 是**同一个 `*entry` 指针**指向同一对象，所以更新值二者同步。
+
+## 🔑 两个设计 —— atomic.Pointer 包 read + 值用 *entry
+
+```text
+① read 用 atomic.Pointer:
+   Load/Store 一条原子指令 → 防撕裂(32位上 64位指针分两次写半新半旧)
+   + 内存屏障 → 防发布竞态(指针发布了但指向对象还没构造完)
+   铁律: read 这个 map 永不原地改(加/删 key 禁止), 要更新整体换新 readOnly
+② map 值 *entry 不是 entry:
+   有"指针→entry"间接层 → 改值=CAS entry.p, map 结构不动 → 软删才可行
+```
+- 反例：若存 `entry` 值 → 改值要改 map 必加锁(无锁读没了) + read/dirty 各一份不一致 + 没法软删。
+
+## 🚦 三态 + 流程 —— entry.p 的正常/nil/expunged
+
+```text
+正常值:   p=*value
+nil:      p=nil       被 Delete 软删, dirty 里还有这 entry
+expunged: p=&expunged dirty 里没有这 key(已硬删) → "warning sign: 别走快路径"
+```
+- Load：原子读 read 命中→直接返回(零锁)；没命中且 amended→加锁双检查 dirty + misses++。
+- Store：key 在 read 且正常 → **CAS 改 entry.p 无锁**(甜区)；expunged/只在 dirty/全新 key → 加锁。
+- Delete：软删 `entry.p→nil`(read 不能删 key)；升级时 `nil→expunged` 且不进新 dirty——防「软删后 Store 无锁改回、升级时数据丢」。
+- 升级：`misses ≥ len(dirty)` → `read.Store(&readOnly{m:dirty}); dirty=nil; misses=0`（整体拷贝 + atomic.Store）。
+
+## 📊 性能法则 —— 读多写少快、读写各半慢
+
+```text
+读多写少 / 一次写后只读 → sync.Map 胜  (99% Load 走 read, 全程无锁)
+读写各半 / 频繁加新 key → RWMutex+map 胜(反复拷贝整 map: 构造 dirty + 升级)
+需要 len()/精确 Range  → 自己加锁(sync.Map 不提供 len, Range 不反映未升级 dirty)
+```
+- 反模式：大量 Delete → nil entry 堆积 read 变胖；频繁加 key → 每次加锁且不停升级。
+- **Go 1.24（2025）** 起切换到 **HashTrieMap**（无锁 trie，写性能大幅提升）；API 不变、适用指导仍成立。本文讲 1.9~1.23 经典 double-store 实现（最常考）。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-map-memo" data-base="../../"></script>
+</body>
+</html>

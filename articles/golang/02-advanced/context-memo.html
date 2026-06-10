@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>context 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# context 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **context = 请求生命周期的统一约定**：一棵 ctx 树靠 **`Done()` 这个 channel 被 close 来广播取消**（取消三因：手动 cancel / 超时 / 父取消），**父取消→所有后代取消**。铁律：**cancel 必 defer、ctx 当第一个参数不存 struct、WithValue 只放 traceID 这类跨切面数据**。
+
+记不全时，按这条**记忆主线：四接口 + 六构造 + 一棵树 + 六铁律**展开（详细推演看[正文](context.html)）：
+
+---
+
+## 🧩 四接口 —— 核心是 Done()
+
+```go
+type Context interface {
+    Deadline() (time.Time, bool)
+    Done() <-chan struct{}   // ← 核心: 收取消信号的 channel
+    Err() error              // Canceled / DeadlineExceeded
+    Value(key any) any
+}
+```
+- 未取消 → `Done()` 永远阻塞；一旦取消 → channel close → **所有监听者同时收到广播**（channel close 即广播）。
+
+## 🏗 六构造 —— 根 / 占位 / 取消 / 计时 / 带值
+
+```go
+context.Background()                       // 树根: main/init/test
+context.TODO()                             // 占位, 将来要补 (行为同 Background)
+ctx, cancel := context.WithCancel(parent)  // 手动取消, defer cancel()
+ctx, cancel := context.WithTimeout(parent, 3*time.Second)   // 相对时长
+ctx, cancel := context.WithDeadline(parent, t)              // 绝对时刻
+ctx = context.WithValue(parent, traceIDKey{}, "req-123")    // 携带 KV
+```
+- `WithTimeout` = `WithDeadline(parent, now+d)` 语法糖。Go 1.21+：`WithCancelCause`/`context.Cause` 带取消原因，`AfterFunc` 取消时自动跑 f。
+
+## 🌳 一棵树 —— 父取消则后代全取消
+
+```text
+取消三因(任一触发): ① 手动 cancel()  ② 超时/截止到  ③ 父被取消(向下传)
+父取消    → 所有后代自动取消
+子取消    → 不影响父和兄弟
+内部三型: cancelCtx(done+children) / timerCtx(加 time.Timer) / valueCtx(key,val 链式上查)
+```
+- 取消是遍历 `children` 递归 close，O(树大小)但树通常很浅。
+- **`Value()` 为什么别滥用**：每次 `WithValue` 只新建一个「装一对 KV」的节点，`Value(k)` 沿 parent 链**逐节点比对 key** → **O(链深)线性查找**（不是 map！找不存在的 key 要一路走到根，最坏）。所以：**别当全局变量塞业务参数（见铁律④）、只放少量跨切面数据、hot path 取一次缓存**。
+
+## 📏 六铁律 —— 背口诀，面试常考
+
+```text
+① WithCancel/Timeout 的 cancel 必 defer 调用 —— 不调泄漏 timer + children
+② ctx 不存 struct (请求级, 一请求一个)
+③ ctx 当第一个参数: F(ctx, arg...)
+④ WithValue 只放跨切面数据(traceID/租户ID/认证), 不塞业务参数
+⑤ key 用自定义类型 type kKey struct{}, 不用 string (防撞车)
+⑥ 不传 nil ctx (会 panic), 占位用 context.TODO()
+```
+- 标准用法：`select { case <-ctx.Done(): return ctx.Err(); case r:=<-ch: return r }`，并把 ctx 一层层透传给下游（`db.QueryContext`/`http.NewRequestWithContext`）。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/context-memo" data-base="../../"></script>
+</body>
+</html>

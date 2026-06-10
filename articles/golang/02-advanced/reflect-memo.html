@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>反射 reflect 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 反射 reflect 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **reflect = 运行时操作 interface (type, data) 元数据的 API**：`TypeOf` 拿类型、`ValueOf` 拿值、`Kind()` 拿分类（26 种）；**改值必须 `ValueOf(&x).Elem()` + 字段导出**；功能强但**慢 50~100×**，编译期类型已知优先泛型。
+
+记不全时，按这条**记忆主线：三件套 + 改值规则 + 性能档位 + 五个坑**展开（详细推演看[正文](reflect.html)）：
+
+---
+
+## 🧰 三件套 —— Type / Value / Kind
+
+```go
+t := reflect.TypeOf(x)    // reflect.Type  查类型
+v := reflect.ValueOf(x)   // reflect.Value 操作值
+k := t.Kind()             // reflect.Kind  类型分类
+```
+- `type UserID int` → `t.Name()="UserID"`（具体类型）, `t.Kind()=int`（底层分类）。
+- 写反射一般 `switch v.Kind()`；读 struct：`t.NumField()` + `t.Field(i).Tag.Get("json")` 拿元信息，`v.Field(i).Interface()` 拿值。
+
+## ✍️ 改值规则 —— 必须可寻址 + 导出
+
+```go
+v := reflect.ValueOf(u)            // u 的拷贝 → SetString panic
+v := reflect.ValueOf(&u).Elem()    // &u 指针 + Elem() 解引用 → 可改 ✓
+v.FieldByName("Name").SetString("bob")
+```
+- 检查：`v.CanSet()` / `v.CanAddr()`，false 时 Set/Addr panic。
+- 两条件：① 指针经 Elem() 拿到（非值拷贝）② 字段导出（首字母大写）。
+- 调方法：`v.MethodByName("Greet").Call([]reflect.Value{...})`，最贵操作。
+
+## ⏱ 性能档位 —— reflect 慢 50~100×
+
+| 操作 | 相对开销 |
+|---|---|
+| 直接调用 / 字段访问 | 1× (~1ns) |
+| interface 方法调用 | ~5× |
+| reflect 字段读 | ~50× |
+| reflect 方法调用 | ~100× |
+| reflect 创建实例 | ~200× |
+
+- 慢因：每次查类型描述符、Value 装箱逃逸、CanSet/Kind 检查多、Call 走通用调用路径。
+- 优化：缓存 `reflect.Type`/字段索引（json 内部就这么干）、避免 `.Interface()` 装箱、极致场景降到 `unsafe.Pointer`（easyjson / mongo-driver）。
+
+## ⚠️ 五个坑
+
+```text
+① ValueOf 拿拷贝改不了 → ValueOf(&x).Elem()
+② Interface() 装箱 → 热路径逃逸到堆
+③ 比类型用 t1==t2（比指针快）≠ DeepEqual（比字段慢）
+④ FieldByName 按名查慢 → 缓存 Index 后用 FieldByIndex
+⑤ Kind switch 漏 Int8/16/32 → 处理全部 Int* 或用 v.CanInt()(1.18+)
+```
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/reflect-memo" data-base="../../"></script>
+</body>
+</html>

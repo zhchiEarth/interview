@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL 进程与内存架构 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# PostgreSQL 进程与内存架构
+
+> 一句话：PostgreSQL 是**多进程**架构——主控进程 **postmaster** 监听端口，每来一个连接就 **fork 一个 backend 进程**（拥有独立内存空间），另有一组**后台进程**（bgwriter、walwriter、checkpointer、autovacuum、wal sender/receiver、archiver 等）各司其职；内存上分为所有进程共享的**共享内存**（核心是 `shared_buffers` 缓冲池）和每个进程私有的**进程内存**（`work_mem`、`maintenance_work_mem` 等）；数据以 **8KB 的 page** 存在**堆表（heap）**里，**所有索引都是独立的**（叶子存 TID 指向堆，不内嵌行数据），超大字段走 **TOAST** 压缩/行外存储。
+
+> 本文以 **PostgreSQL 14+/16** 为基准；涉及版本差异处会显式标注。相关：[PostgreSQL vs MySQL 怎么选](vs-mysql.html)、[MVCC 与 VACUUM](mvcc-vacuum.html)、[索引类型](index.html)、[WAL 与持久化](wal.html)、[流复制与高可用](replication.html)。
+
+## 一、多进程模型总览
+
+PostgreSQL **不用线程，用进程**。启动时先拉起主控进程 **postmaster**（即 `postgres` 主进程），它负责监听端口、管理共享内存、按需 fork 子进程。
+
+```text
+                客户端（psql / 驱动）
+                     │ TCP 5432
+                     ▼
+            ┌───────────────────┐
+            │     postmaster      │  主控：监听端口、初始化共享内存、
+            │   （postgres 主进程）│  fork 子进程、回收僵尸、崩溃重启
+            └─────────┬───────────┘
+        fork          │            fork（启动时常驻）
+   ┌──────────────────┼───────────────────────────────┐
+   ▼                  ▼                                 ▼
+┌──────────┐   ┌──────────┐                  ┌───────────────────────┐
+│ backend1 │   │ backend2 │  ← 每连接一个      │      后台进程组          │
+│ (连接1)   │   │ (连接2)   │     独立内存空间   │  bgwriter / walwriter   │
+└────┬─────┘   └────┬─────┘                  │  checkpointer           │
+     │              │                         │  autovacuum launcher    │
+     │              │     都访问 ↓             │  + autovacuum worker(s) │
+     └──────┬───────┴────────────────┐        │  wal sender / receiver  │
+            ▼                         ▼        │  archiver               │
+   ┌────────────────────────────────────┐     │  logical replication... │
+   │        共享内存（Shared Memory）       │ ◄──┤  (logger / startup ...) │
+   │   shared_buffers · WAL buffers · 锁表  │     └───────────────────────┘
+   └────────────────────────────────────┘
+            │ 刷盘 / 读取
+            ▼
+        磁盘：数据文件（base/）+ WAL（pg_wal/）
+```
+
+记忆钩子：**一个 postmaster 当「门卫+包工头」，每个连接配一个专属 backend「干活工人」，再加一队后台「保洁/搬运/记账」进程**。
+
+## 二、各类进程都在干什么
+
+| 类别 | 进程 | 职责 |
+|---|---|---|
+| 主控 | **postmaster** | 监听端口、fork backend 与后台进程、管理共享内存、子进程崩溃后协调重启 |
+| 连接 | **backend（postgres）** | 每个客户端连接一个，独立处理该连接的解析/规划/执行；拥有私有内存 |
+| 后台 | **background writer (bgwriter)** | 把共享缓冲池里的脏页**渐进式**刷盘，减轻 checkpoint 时的刷盘尖峰 |
+| 后台 | **checkpointer** | 周期性做**检查点**：把截至某点的脏页全部刷盘并在 WAL 记录检查点，缩短崩溃恢复时间 |
+| 后台 | **WAL writer (walwriter)** | 把 WAL 缓冲区里的预写日志刷到 `pg_wal/`，保证持久性（见 [WAL 与持久化](wal.html)） |
+| 后台 | **autovacuum launcher + workers** | 定期触发 VACUUM 回收死元组、防止 XID 回卷、更新统计信息（见 [MVCC 与 VACUUM](mvcc-vacuum.html)） |
+| 后台 | **WAL sender / WAL receiver** | 主库 sender 把 WAL 推给备库，备库 receiver 接收并重放（见 [流复制与高可用](replication.html)） |
+| 后台 | **archiver** | 开启归档时，把写满的 WAL 段拷到归档目录（PITR 用） |
+| 后台 | **logical replication launcher / worker** | 逻辑复制时负责逻辑解码与应用 |
+| 后台 | **logger / startup / stats** | 日志收集、崩溃恢复重放、统计信息收集等 |
+
+> 统计信息收集：早期版本是独立的 **stats collector** 进程；**PG 15 起**统计改为存放在共享内存中，移除了该独立进程——是常见版本差异点，面试可提一句。
+
+## 三、对比 MySQL 的线程模型 + 多进程的代价
+
+```text
+PostgreSQL（多进程）              MySQL（多线程）
+每连接 = 一个 OS 进程             每连接 = mysqld 内一个线程
+独立地址空间，隔离强              共享进程地址空间
+单连接崩溃不易波及他人            线程崩溃可能影响整个进程
+创建/销毁成本高、每连接内存高     线程更轻量
+进程间通信靠共享内存             线程间直接共享内存
+```
+
+多进程的**代价**与对策：
+
+```text
+代价：
+  1) 连接创建开销大 —— fork 一个 backend 比起一个线程贵
+  2) 每连接内存高 —— 每个 backend 有私有内存（work_mem 等可叠加）
+  3) 连接数一高，进程数随之膨胀 → 上下文切换 + 内存压力
+
+对策：必须上「连接池」
+  应用 ──► PgBouncer（连接池）──► 复用少量到 PG 的真实连接 ──► PostgreSQL
+  常用 transaction 池化模式：把成百上千的应用连接，复用成几十个后端连接
+```
+
+> 经验值：单机几千上万的客户端连接，**绝不应**直接打到 PG（每个都是一个进程），务必用 **PgBouncer** 一类连接池收敛成几十~几百个后端连接。这是 PG 运维的「第一条军规」。
+
+## 四、内存结构：共享内存 vs 进程私有内存
+
+PG 内存分两大块：**所有进程共享**的共享内存，和**每个 backend 进程私有**的内存。
+
+```text
+┌──────────────────────── 共享内存（所有进程可见） ────────────────────────┐
+│  shared_buffers     共享缓冲池：缓存数据/索引页，PG 内存核心             │
+│  wal_buffers        WAL 缓冲区：未刷盘的预写日志                         │
+│  CLOG / 锁表 / ...   事务提交状态、轻量锁、共享元信息                     │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────── 进程私有内存（每个 backend 各一份，会叠加） ───────────────┐
+│  work_mem               单个排序/哈希操作的内存上限（注意：每操作、每连接） │
+│  maintenance_work_mem   维护操作内存：VACUUM / CREATE INDEX / 导入等       │
+│  temp_buffers           访问临时表用的本地缓冲                            │
+└──────────────────────────────────────────────────────────────────────┘
+
+  effective_cache_size    （不分配内存）只是告诉「规划器」OS+PG 大概有多少可用缓存,
+                          用于估算索引扫描代价、影响执行计划的选择
+```
+
+### 4.1 几个关键参数
+
+| 参数 | 归属 | 作用 | 注意 |
+|---|---|---|---|
+| **shared_buffers** | 共享 | 数据/索引页的共享缓冲池 | 经验起点约**物理内存的 25%**（仍依赖 OS 页缓存协同，不宜盲目调到 80%） |
+| **wal_buffers** | 共享 | 暂存未刷盘的 WAL | 通常自动按 shared_buffers 推算即可 |
+| **work_mem** | 私有 | 每个排序/哈希/聚合**操作**的内存上限 | **会按操作数 × 连接数放大**——设大了易 OOM；超限则落盘成临时文件 |
+| **maintenance_work_mem** | 私有 | VACUUM / 建索引等维护操作 | 可比 work_mem 大很多，因维护通常不并发那么多 |
+| **temp_buffers** | 私有 | 临时表本地缓冲 | 按会话 |
+| **effective_cache_size** | 规划器提示 | 估算可用缓存量 | **不分配内存**，只影响代价估算/执行计划 |
+
+```sql
+-- 演示：查看与会话级调整（演示参数机制，非建表规范）
+SHOW shared_buffers;
+SHOW work_mem;
+SET work_mem = '64MB';   -- 仅当前会话；复杂排序/哈希提速但谨防叠加放大
+```
+
+> 高频坑：`work_mem` **是「每操作」配额**——一条带多个排序/哈希节点的复杂 SQL 会用多份，再乘以并发连接数，总占用可能远超直觉，是 PG OOM 的常见诱因。配大 `work_mem` 时务必结合连接池限制总连接数。
+
+## 五、堆表（heap）与页结构
+
+PG 的表叫**堆表（heap）**：行（元组 tuple）**无序堆放**在一个个固定大小的 **page** 里。
+
+```text
+默认 page = 8KB（编译期 BLCKSZ，一般不改）
+
+┌──────────── 一个 8KB Heap Page ────────────┐
+│ PageHeader（页头：校验、空闲指针等）          │
+│ ItemId 数组（行指针，指向页内各元组偏移）       │
+│ ……空闲空间……                               │
+│ Tuple_N ... Tuple_2  Tuple_1（元组从尾部往前堆）│
+│   每个元组含头部：xmin / xmax（MVCC 可见性）等 │
+└────────────────────────────────────────────┘
+
+  · 元组定位用 TID = (页号 block, 页内序号 offset)
+  · UPDATE 不原地改而是插新版本元组（MVCC），旧版本留待 VACUUM 回收
+```
+
+元组头部的 `xmin`/`xmax` 是 MVCC 可见性判断的核心，回收死元组靠 VACUUM——详见 [MVCC 与 VACUUM](mvcc-vacuum.html)。
+
+### 5.1 索引都是独立的（与 InnoDB 聚簇索引的本质区别）
+
+```text
+PostgreSQL：堆表 + 独立索引
+   ┌── 索引（B-tree 等）──┐        ┌──── 堆表（heap）────┐
+   │ key → TID(block,off) │ ─────► │  真正的行数据存这里  │
+   └─────────────────────┘  回堆   └─────────────────────┘
+   · 索引叶子只存 TID，不存行数据
+   · 主键也是「一个普通的唯一索引」，没有「主键聚簇」
+   · 即便按主键点查，也是「查索引 → 拿 TID → 回堆取行」
+
+MySQL InnoDB：聚簇索引
+   主键索引的叶子节点 = 行数据本身（表按主键物理组织）
+   二级索引叶子存「主键值」，需回表用主键再查聚簇索引
+```
+
+> 这是 PG 与 InnoDB 最本质的存储差异之一。后果：PG 主键点查比 InnoDB 多一次「回堆」；但 PG 可用 **`CLUSTER`** 命令按某索引一次性物理重排（非自动维护），也支持 **Index-Only Scan**（配合 visibility map，命中时无需回堆）。索引类型展开见 [索引类型](index.html)。
+
+## 六、TOAST：超大字段怎么存
+
+一行要尽量塞进一个 8KB 页，但有些字段（长文本、大 `bytea`、大 JSONB）远超 8KB。PG 用 **TOAST**（The Oversized-Attribute Storage Technique）处理。
+
+```text
+当一行总大小超过阈值（约 2KB，TOAST_TUPLE_THRESHOLD）时：
+  1) 先尝试「压缩」可 TOAST 的列（默认 LZ 系压缩）
+  2) 仍放不下 → 把大字段「行外存储」到该表专属的 TOAST 表，
+     主元组里只留一个指针
+  → 主表行变小，读不涉及大字段的查询无需触碰大字段，更快
+
+每列可设 storage 策略：
+  PLAIN（不压缩不外存，仅定长类型）/ MAIN（优先压缩、尽量不外存）
+  / EXTERNAL（外存不压缩）/ EXTENDED（压缩+可外存，变长类型默认）
+```
+
+> 记忆钩子：**TOAST = 「太大就压一压、还大就搬出去存」**，对应用透明，但要知道它的存在——因为大字段更新会牵动 TOAST 表，且 TOAST 表也有自己的膨胀与 VACUUM。
+
+## 一句话总结
+
+> PostgreSQL 是**多进程**架构：**postmaster** 监听并 fork——每连接一个**独立内存的 backend 进程**，外加 **bgwriter / checkpointer / walwriter / autovacuum / wal sender·receiver / archiver** 等后台进程；相比 MySQL 线程模型隔离更强但**连接开销大、每连接内存高，必须上 PgBouncer 连接池**。内存分**共享内存**（核心 `shared_buffers`、`wal_buffers`）与**进程私有内存**（`work_mem` 注意「每操作 × 每连接」放大、`maintenance_work_mem`、`temp_buffers`），另有不分配内存、只供规划器估算的 `effective_cache_size`。存储上是 **8KB page 的堆表（heap）**，**所有索引独立、叶子存 TID 回堆取数据**（区别于 InnoDB 聚簇索引），超大字段走 **TOAST** 压缩/行外存储。延伸见 [PostgreSQL vs MySQL 怎么选](vs-mysql.html)、[MVCC 与 VACUUM](mvcc-vacuum.html)、[索引类型](index.html)、[WAL 与持久化](wal.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/architecture" data-base="../"></script>
+</body>
+</html>

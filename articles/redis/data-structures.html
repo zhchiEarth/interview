@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redis 基础数据结构 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Redis 基础数据结构
+
+> 一句话：Redis 是「键值数据库」，key 一律是字符串，**value 有 5 种核心类型（String / List / Hash / Set / Sorted Set）+ 若干扩展类型（Bitmap / HyperLogLog / Geo / Stream）**；记住「每种类型是什么 + 常用命令 + 典型场景」，就能应对绝大多数缓存与业务设计题。
+
+## 一、先建立全局视图
+
+Redis 是单 key 多 value 类型的内存数据库。所有 key 都是字符串，区别在于**这个 key 指向的 value 是什么类型**。
+
+```text
+              key (字符串)            value (5 大类型之一)
+  ┌──────────────────────┐      ┌─────────────────────────────┐
+  │ "user:1001"          │ ───→ │ Hash {name, age, city...}   │
+  │ "rank:game"          │ ───→ │ ZSet  {玩家 → 分数}          │
+  │ "msg:queue"          │ ───→ │ List  [m1, m2, m3 ...]      │
+  │ "online:users"       │ ───→ │ Set   {uid1, uid2, ...}     │
+  │ "counter:pv"         │ ───→ │ String "10086"              │
+  └──────────────────────┘      └─────────────────────────────┘
+```
+
+| 类型 | 一句话定位 | 是否有序 | 元素能否重复 |
+|---|---|---|---|
+| String | 最基础，二进制安全的字节串 | — | — |
+| List | 双端列表（可当队列/栈） | 插入有序 | 可重复 |
+| Hash | 一个 key 下的字段-值映射（小对象） | 无序 | field 唯一 |
+| Set | 无序集合 | 无序 | 不重复 |
+| Sorted Set (ZSet) | 带分数的有序集合 | 按 score 排序 | member 不重复 |
+
+> 注意：本篇讲**应用层**（怎么用、用在哪），不深入编码实现。同一种类型在底层会根据数据量自动选择不同编码，那部分见 [底层数据结构](internal-structures.html)。
+
+---
+
+## 二、String（字符串）
+
+### 是什么
+
+最基础的类型，value 是一段**二进制安全**的字节序列（可以存文本、数字、序列化对象、甚至图片），单个 value 最大 **512MB**。虽然叫 String，但当内容是整数时 Redis 能直接对它做原子加减。
+
+### 常用命令
+
+```bash
+SET   key value [EX 秒 | PX 毫秒] [NX | XX]   # 设置；NX=不存在才设，XX=存在才设
+GET   key
+SETEX key 60 value                            # 设置并带 60s 过期
+MSET  k1 v1 k2 v2                              # 批量设置
+MGET  k1 k2                                    # 批量获取
+INCR  key            # 原子 +1（value 必须是整数）
+INCRBY key 100       # 原子 +100
+DECR  key
+APPEND key "tail"    # 追加
+SETRANGE / GETRANGE  # 按下标改/取子串
+SETNX key value      # 不存在才设（等价 SET ... NX，分布式锁早期写法）
+```
+
+### 典型场景
+
+- **缓存**：把数据库行/对象序列化成 JSON 存进去，配 `EX` 过期。
+- **计数器**：`INCR` 做文章阅读量、点赞数、接口 QPS 统计，天然原子无需加锁。
+- **分布式锁**：`SET lock_key uuid NX EX 10`，靠 `NX` 保证只有一个客户端拿到锁，释放时用 Lua 校验 uuid 再删。
+- **分布式 ID / 全局序列**：`INCRBY` 发号。
+- **共享 Session**：多实例服务把登录态存到 Redis。
+
+---
+
+## 三、List（列表）
+
+### 是什么
+
+一个**有序、可重复**的字符串列表，本质是双端结构，头尾两端的插入/弹出都是 O(1)，因此既能当**队列**（FIFO）也能当**栈**（LIFO）。
+
+```text
+  LPUSH ──→ ┌────┬────┬────┬────┐ ←── RPUSH
+            │ a  │ b  │ c  │ d  │
+  LPOP  ←── └────┴────┴────┴────┘ ──→ RPOP
+            头(left)            尾(right)
+```
+
+### 常用命令
+
+```bash
+LPUSH key v [v ...]      # 左侧插入
+RPUSH key v [v ...]      # 右侧插入
+LPOP  key [count]        # 左侧弹出
+RPOP  key [count]
+LRANGE key 0 -1          # 取区间（0 到 -1 即全部）
+LLEN  key                # 长度
+LINDEX key 0             # 按下标取
+BLPOP key timeout        # 阻塞式弹出（队列没数据就等）—— 做消息队列的关键
+BRPOP key timeout
+LMOVE src dst LEFT RIGHT # 原子地从一个 list 搬到另一个（可靠队列）
+```
+
+### 典型场景
+
+- **简易消息队列 / 任务队列**：生产者 `LPUSH`，消费者 `BRPOP` 阻塞消费；`LMOVE` 可做「处理中」备份队列防丢。
+- **最新列表**：朋友圈/微博时间线、最新评论，`LPUSH` + `LTRIM` 保留最近 N 条。
+- **栈**：同一端 `LPUSH` / `LPOP`。
+
+> List 做消息队列只适合轻量场景：不支持消费组、消息确认弱。要专业能力建议用下文的 **Stream** 或专门的 MQ。
+
+---
+
+## 四、Hash（哈希）
+
+### 是什么
+
+一个 key 下挂一组 **field → value** 映射，适合存「一个对象的多个字段」。相比把整个对象序列化成一个 String，Hash 能**单独读写某个字段**，省带宽也省反序列化开销。
+
+```text
+  key = "user:1001"
+  ┌─────────┬──────────────┐
+  │ field   │ value        │
+  ├─────────┼──────────────┤
+  │ name    │ "Troy"       │
+  │ age     │ "28"         │
+  │ city    │ "Shanghai"   │
+  └─────────┴──────────────┘
+```
+
+### 常用命令
+
+```bash
+HSET   key f1 v1 f2 v2     # 设置一个/多个字段
+HGET   key f1              # 取单个字段
+HMGET  key f1 f2           # 批量取字段
+HGETALL key                # 取全部字段（字段多时慎用，会阻塞）
+HDEL   key f1              # 删字段
+HINCRBY key f1 1           # 对某字段做原子加减
+HEXISTS key f1
+HKEYS / HVALS / HLEN
+```
+
+### 典型场景
+
+- **存对象**：用户资料、商品信息，需要频繁改单字段时优于 String。
+- **购物车**：key = `cart:uid`，field = 商品 id，value = 数量，`HINCRBY` 改数量。
+- **字段级计数**：一个对象内多个计数维度（如某用户的多种行为次数）。
+
+---
+
+## 五、Set（集合）
+
+### 是什么
+
+**无序、不重复**的字符串集合，支持判断成员是否存在，以及交集/并集/差集等集合运算。
+
+### 常用命令
+
+```bash
+SADD   key m [m ...]       # 添加成员
+SREM   key m               # 删除
+SISMEMBER key m            # 是否存在（O(1)）
+SMEMBERS  key              # 取全部（大集合慎用）
+SCARD  key                 # 基数（元素个数）
+SRANDMEMBER key [count]    # 随机取（抽奖、随机推荐）
+SPOP   key [count]         # 随机弹出
+SINTER / SUNION / SDIFF    # 交 / 并 / 差
+SINTERSTORE dst k1 k2      # 交集结果存到新 key
+```
+
+### 典型场景
+
+- **去重**：UV 统计（精确）、文章标签去重、抽奖名单去重。
+- **共同关注 / 好友推荐**：两个用户关注集合求 `SINTER`（共同关注）、`SDIFF`（你关注但他没关注）。
+- **随机抽奖**：`SRANDMEMBER` / `SPOP`。
+- **黑白名单 / 标签**：`SISMEMBER` 做存在性判断。
+
+---
+
+## 六、Sorted Set / ZSet（有序集合）
+
+### 是什么
+
+每个成员（member）关联一个**分数（score, double 类型）**，集合按 score 排序。成员唯一，但 score 可重复（score 相同则按成员字典序排）。这是 Redis 最有特色的类型——**既能去重又能排序，还支持按分数范围/排名范围查询**。
+
+```text
+  key = "rank:game"
+  ┌─────────┬───────┐         按 score 升序排列
+  │ member  │ score │   ┌──────────────────────────┐
+  ├─────────┼───────┤   │ alice(90) bob(95) cara(99)│
+  │ alice   │  90   │   └──────────────────────────┘
+  │ bob     │  95   │   ZRANGE 取排名区间
+  │ cara    │  99   │   ZRANGEBYSCORE 取分数区间
+  └─────────┴───────┘
+```
+
+### 常用命令
+
+```bash
+ZADD key 90 alice 95 bob       # 添加/更新成员及分数
+ZINCRBY key 5 alice            # 对成员分数原子加减
+ZSCORE key alice               # 取成员分数
+ZRANK  key alice               # 升序排名（0 起）
+ZREVRANK key alice             # 降序排名
+ZRANGE key 0 9 [WITHSCORES]    # 按排名取（前 10 名）
+ZREVRANGE key 0 9              # 降序按排名取
+ZRANGEBYSCORE key 80 100       # 按分数区间取
+ZCARD key                      # 成员数
+ZREM  key alice                # 删成员
+ZPOPMIN / ZPOPMAX              # 弹出最小/最大分数成员
+```
+
+### 典型场景
+
+- **排行榜**：游戏积分榜、热搜榜，`ZINCRBY` 加分，`ZREVRANGE 0 9` 取 Top10——ZSet 的招牌场景。
+- **延迟队列 / 定时任务**：score 存「到期时间戳」，轮询 `ZRANGEBYSCORE 0 now` 取到期任务。
+- **带权重的去重排序**：如按时间排序的去重时间线（score = 时间戳）。
+- **范围/区间查询**：价格区间、评分区间筛选。
+
+---
+
+## 七、扩展类型（各一两句）
+
+这些不是独立的底层类型，而是基于上述类型（多数基于 String）扩展出的「专用玩法」：
+
+| 类型 | 是什么 | 一句话场景 |
+|---|---|---|
+| **Bitmap** | 把 String 当成位数组，按 bit 置 0/1（`SETBIT`/`GETBIT`/`BITCOUNT`） | 签到、活跃用户标记、布隆过滤器底座；1 亿用户在线状态仅 ~12MB |
+| **HyperLogLog** | 基数估算结构，固定 12KB 算海量去重数量，有 ~0.81% 误差（`PFADD`/`PFCOUNT`） | 超大规模 UV 统计，不要求精确时极省内存 |
+| **Geo** | 基于 ZSet 存经纬度（GeoHash 编码为 score），支持半径查询（`GEOADD`/`GEOSEARCH`） | 附近的人、附近门店、打车 |
+| **Stream** | Redis 5.0 引入的**专业消息流**，支持消费组、消息 ID、ACK 确认、阻塞读 | 替代 List 做可靠消息队列；类 Kafka 的轻量方案 |
+
+---
+
+## 八、类型 → 典型应用场景对照表
+
+| 应用场景 | 首选类型 | 关键命令 / 思路 |
+|---|---|---|
+| 对象缓存 | String / Hash | String 整存整取；Hash 需改单字段时 |
+| 计数器（PV/点赞） | String | `INCR` / `INCRBY` 原子自增 |
+| 分布式锁 | String | `SET k v NX EX`，释放用 Lua 校验 |
+| 消息/任务队列（轻量） | List | `LPUSH` + `BRPOP`，`LMOVE` 防丢 |
+| 消息队列（可靠/消费组） | Stream | `XADD` / `XREADGROUP` / `XACK` |
+| 最新列表（时间线） | List | `LPUSH` + `LTRIM` 保留 N 条 |
+| 购物车 | Hash | field=商品，`HINCRBY` 改数量 |
+| 去重（精确 UV、名单） | Set | `SADD` + `SCARD` / `SISMEMBER` |
+| 共同关注 / 标签运算 | Set | `SINTER` / `SUNION` / `SDIFF` |
+| 抽奖 / 随机推荐 | Set | `SRANDMEMBER` / `SPOP` |
+| 排行榜 | ZSet | `ZINCRBY` + `ZREVRANGE` |
+| 延迟队列 / 定时调度 | ZSet | score=到期时间，`ZRANGEBYSCORE` |
+| 签到 / 在线状态位图 | Bitmap | `SETBIT` / `BITCOUNT` |
+| 超大规模 UV（可估算） | HyperLogLog | `PFADD` / `PFCOUNT` |
+| 附近的人 / LBS | Geo | `GEOADD` / `GEOSEARCH` |
+| 限流 | String / ZSet | 计数器固定窗口 / ZSet 滑动窗口 |
+
+---
+
+## 九、选型口诀
+
+```text
+  要存对象 ────────→ 字段常改用 Hash，整存整取用 String
+  要排序/排名 ─────→ ZSet（排行榜、延迟队列）
+  要去重 ──────────→ 精确用 Set，海量可估用 HyperLogLog
+  要队列 ──────────→ 轻量用 List，可靠/消费组用 Stream
+  要计数 ──────────→ String 的 INCR
+  要位标记 ────────→ Bitmap（签到、在线）
+  要地理位置 ──────→ Geo
+```
+
+---
+
+## 十、和底层编码的关系（衔接 B 篇）
+
+要强调一点：上面讲的 5 大类型是**对外暴露的逻辑类型**，每一种在底层都有**多种编码（encoding）**，Redis 会根据元素数量和大小自动在编码之间切换，以在「内存省」和「速度快」之间取最优。例如：
+
+- 元素少且小的 Hash / ZSet 用紧凑的 **listpack**（旧版 ziplist），元素一多就转成 **hashtable / skiplist**；
+- 纯整数的小 Set 用 **intset**，超阈值转 hashtable；
+- 短数字串 String 用 **int** 编码，短文本用 **embstr**，长文本用 **raw**。
+
+这些「编码、SDS、quicklist、跳表、渐进式 rehash、连锁更新」属于实现层，详见 [底层数据结构](internal-structures.html)。
+
+---
+
+## 一句话总结
+
+> Redis 对外是 5 大核心类型（String / List / Hash / Set / ZSet）加 4 个扩展玩法（Bitmap / HLL / Geo / Stream）；记牢「是什么 + 常用命令 + 典型场景」这条主线——缓存计数用 String、对象用 Hash、队列用 List/Stream、去重用 Set、排行榜和延迟队列用 ZSet——应用层的题就稳了，底层编码怎么实现请接着看 [底层数据结构](internal-structures.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="redis/data-structures" data-base="../"></script>
+</body>
+</html>

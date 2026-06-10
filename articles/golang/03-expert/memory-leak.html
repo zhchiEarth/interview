@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go 内存泄漏怎么排查？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Go 内存泄漏怎么排查？
+
+> Go 有 GC，但仍然会泄漏——不是"忘记 free"，而是"对象被某条引用链持着不放"。
+
+## 常见泄漏来源（90% 都在这里）
+
+### 1. goroutine 泄漏（最常见）
+
+一个永远不退出的 goroutine = 它持有的所有变量永远不能 GC。
+
+```go
+ch := make(chan int)  // 无缓冲 + 无人读
+go func() {
+    ch <- 1  // 永远阻塞，goroutine 永久存活
+}()
+```
+
+典型场景：
+
+- 没设超时的 channel 读 / 写
+- HTTP 请求没设 timeout
+- worker goroutine 在 select 里等的 channel 永远不会被 close
+- pprof 看 goroutine 数持续上涨
+
+### 2. time.After / time.Ticker 不停
+
+```go
+for {
+    select {
+    case <-time.After(1 * time.Second):  // 每次都创建新 timer + chan
+        ...
+    }
+}
+```
+
+旧 timer 要等触发后才能 GC，高频场景下大量积压。
+
+解法：用 `time.NewTimer` + `Reset` 复用。
+
+### 3. slice 截取后大数组无法 GC
+
+```go
+data := readBigFile()  // 100MB
+header := data[:32]    // header 引用着 100MB 的底层数组
+return header
+```
+
+解法：深拷贝 → `copy(make([]byte, 32), data[:32])`。
+
+### 4. map 只增不减
+
+`delete(m, k)` 不一定释放底层 bucket 内存。如果 map 只增不减、key 是大对象，内存会持续增长。
+
+解法：
+
+- 定期重建（`m = newMap`）
+- 用 LRU cache 替代
+
+### 5. 全局变量持有引用
+
+```go
+var cache = map[string]*BigObject{}
+```
+
+全局 map 不清理就一直增长。
+
+### 6. Context 泄漏
+
+```go
+ctx, _ := context.WithCancel(parent)  // 没拿 cancel
+// 用 ctx
+// 忘了 cancel() → ctx 树持有所有子 ctx
+```
+
+解法：**`WithCancel` / `WithTimeout` 一定要 `defer cancel()`**。
+
+## 排查工具
+
+### 1. pprof（最常用）
+
+```go
+import _ "net/http/pprof"
+go http.ListenAndServe(":6060", nil)
+```
+
+**heap profile**：
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/heap
+> top
+> list <funcName>
+```
+
+**goroutine profile**：
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+```
+
+goroutine 数持续上涨 = goroutine 泄漏。
+
+### 2. runtime.MemStats
+
+```go
+var m runtime.MemStats
+runtime.ReadMemStats(&m)
+log.Printf("HeapAlloc=%d Goroutines=%d", m.HeapAlloc, runtime.NumGoroutine())
+```
+
+定期打印，看趋势。
+
+### 3. trace
+
+```bash
+go tool trace trace.out
+```
+
+看 GC 频率、goroutine 阻塞情况。
+
+## 排查步骤
+
+1. **看 goroutine 数**：`runtime.NumGoroutine()`，持续上涨 → 大概率 goroutine 泄漏
+2. **diff heap profile**：先采一次，10 分钟后再采一次，diff 看哪些对象在涨
+3. **看泄漏的对象在哪 alloc**：pprof `list` 看代码行，往上回溯持有它的引用
+4. **修代码 → 重测**
+
+## 经验法则
+
+- 启动 goroutine **必须有明确的退出条件**——超时、cancel、close channel 三选一
+- channel 操作搭配 `select + ctx.Done()`
+- 任何 cancellable 操作（HTTP、DB、context）必有 timeout
+- 大对象局部用，不要存全局
+- 用 pprof 是常态，不是出事才用
+
+## 一句话总结
+
+> Go 的"内存泄漏"几乎等于"goroutine 泄漏 + 引用泄漏"。**有 GC ≠ 无泄漏**——只要某条引用链通到 root，对象就活着。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/memory-leak" data-base="../../"></script>
+</body>
+</html>

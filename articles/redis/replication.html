@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redis主从复制原理 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Redis主从复制原理
+
+> 一句话：主从复制是一个主节点（master）把数据**异步**复制给一个或多个从节点（replica）的机制——首次用**全量同步**把存量数据搬过去，之后靠**命令传播**持续同步增量，断线重连时尽量走**部分重同步**少传数据；它是读写分离、数据冗余、以及哨兵 / Cluster 高可用的**基础**，但因为异步所以只能保证**最终一致**。
+
+> 术语说明：Redis 5.0 起，官方把 `slave` / `slaveof` 改名为 `replica` / `replicaof`（旧命令仍兼容）。本文以新术语为主，「主」=master，「从」=replica。
+
+## 一、为什么需要主从复制
+
+单机 Redis 有三个绕不开的问题，主从复制是解决它们的第一块基石：
+
+| 问题 | 单机风险 | 主从如何缓解 |
+|---|---|---|
+| **读压力大** | 所有读写都压在一个实例 | 读写分离：写走主，读分散到多个从 |
+| **数据丢失 / 单点** | 实例宕机数据可能全丢 | 数据冗余：从节点是主数据的实时副本 |
+| **故障恢复慢** | 重建需要从备份恢复 | 从节点可快速顶上（配合哨兵自动切换） |
+
+```
+                 ┌──────────────┐
+   写请求 ─────→ │   Master     │ ←── 唯一可写
+                 │  (可读可写)   │
+                 └──────┬───────┘
+            异步复制      │  (命令传播)
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+   ┌─────────┐    ┌─────────┐    ┌─────────┐
+   │Replica 1│    │Replica 2│    │Replica 3│  ←── 默认只读
+   └────┬────┘    └─────────┘    └─────────┘
+        ▲
+     读请求（读写分离）
+```
+
+> 注意：复制**本身只解决数据冗余 + 读扩展**，并不自带"主挂了自动选新主"的能力——那是**哨兵（Sentinel）**或 **Cluster** 干的事。复制是它们的底座。
+
+---
+
+## 二、建立复制：replicaof / slaveof
+
+让 B 成为 A 的从节点，有三种等价方式（结果一样）：
+
+```
+# 1. 配置文件（重启生效）
+replicaof <masterip> <masterport>
+
+# 2. 启动参数
+redis-server --replicaof <masterip> <masterport>
+
+# 3. 运行时命令（立即生效）
+REPLICAOF <masterip> <masterport>     # 5.0+
+SLAVEOF   <masterip> <masterport>     # 旧名，仍兼容
+```
+
+取消复制、让从重新独立成主：
+
+```
+REPLICAOF NO ONE      # 断开与主的关系，自己变 master，保留现有数据
+```
+
+几个关键默认行为：
+
+- 从节点默认 `replica-read-only yes`——**只读**，写命令会被拒绝（防止从上的写被下一次同步覆盖、造成主从不一致）。
+- 复制是**异步**的：主写完本地、回复客户端后，才在后台把命令发给从。所以主从之间天然有**复制延迟**，数据是**最终一致**而非强一致。
+
+---
+
+## 三、全量同步（full resync）
+
+**触发时机**：从节点第一次连主，或断线太久 / replid 对不上、无法做部分重同步时。目标是把主的**全部存量数据**一次性搬到从。
+
+核心流程（以默认的「磁盘 RDB」方式为例）：
+
+```
+  Replica                                   Master
+    │                                          │
+    │ ── PSYNC ? -1 ──────────────────────────→│  (第一次：不知道 replid 和 offset)
+    │                                          │
+    │ ←─ +FULLRESYNC <replid> <offset> ────────│  告知"我的运行ID + 当前偏移量"
+    │                                          │
+    │                                  ┌───────┴────────┐
+    │                                  │ fork 子进程     │
+    │                                  │ bgsave 生成 RDB │ ← 期间主仍在对外服务
+    │                                  └───────┬────────┘
+    │                                          │
+    │                          【此期间的写命令】缓存到
+    │                          ↓ 每个从对应的 replication buffer（客户端输出缓冲）
+    │                                          │
+    │ ←──────────── 传输 RDB 文件 ─────────────│
+    │                                          │
+ ┌──┴───────────────┐                          │
+ │ 清空自身旧数据    │   (replica-side flush)    │
+ │ 加载 RDB          │                          │
+ └──┬───────────────┘                          │
+    │                                          │
+    │ ←──── 重放 buffer 里缓存的增量写命令 ─────│  追平 bgsave 期间的差异
+    │                                          │
+    │ ════════ 此后进入「命令传播」持续同步 ════│
+```
+
+要点：
+
+- **fork + bgsave**：主 fork 出子进程生成 RDB 快照，**不阻塞**主进程处理请求（fork 本身有短暂卡顿，数据集大时 fork 可能耗时）。
+- **replication buffer**：从 bgsave 开始到 RDB 传输完成期间，主收到的所有写命令必须**额外缓存**到该从对应的输出缓冲区，等从加载完 RDB 再补发，否则会丢掉这段增量。这块缓冲由 `client-output-buffer-limit replica ...` 控制；**写太猛或从加载太慢导致缓冲溢出，主会断开该从连接，全量同步失败重来**——是生产常见坑。
+- 从加载 RDB 前会**清空自己原有的全部数据**。
+
+> Redis 2.8 之前只有 `SYNC`（无部分重同步），任何断线都得全量；2.8 引入 `PSYNC`，4.0 又升级为 `PSYNC2`（改进主从切换 / 重启后的部分重同步能力）。
+
+---
+
+## 四、命令传播（propagate）
+
+全量同步完成后，主从进入**长期同步**阶段。机制很简单：
+
+> 主每执行一条**写命令**，就**异步**把这条命令转发给所有从节点；从节点收到后在本地重放同一条命令，从而保持数据一致。
+
+```
+   client ── SET k v ──→ Master ── 1. 本地执行
+                            │      2. 回复 client（不等从）
+                            │      3. 异步 propagate 给所有 replica
+                            ▼
+                  ┌─────────┴─────────┐
+                  ▼         ▼          ▼
+              Replica1  Replica2   Replica3   各自重放 SET k v
+```
+
+注意两个细节：
+
+- 因为是**异步**——主回复客户端在前、转发给从在后，所以"主已写成功但从还没收到"的窗口客观存在（见第十节坑）。
+- 部分**带随机性 / 时间性的命令**（如 `SPOP`、`EXPIRE`、`INCRBYFLOAT`）主会改写成**确定性命令**再传播（如 `SPOP` → `SREM` 具体成员、过期 → 显式 `DEL` / `UNLINK`），保证从重放结果与主一致。
+
+---
+
+## 五、增量同步 / 部分重同步（partial resync，2.8+）
+
+**问题**：网络抖动让从断开几秒又重连，如果每次都全量同步（fork + 传整个 RDB），代价太大。
+
+**方案**：2.8 起，断线重连时如果条件满足，主只**补发断线期间缺的那一小段写命令**，避免全量。这就是部分重同步，依赖三个要素：
+
+### ① 复制偏移量（replication offset）
+
+主和从各自维护一个 `master_repl_offset`：主每向复制流写入 N 字节就 +N，从每成功处理 N 字节也 +N。**两者的差值 = 复制延迟（落后多少字节）**。它是判断"从落后到哪里"的标尺。
+
+### ② 复制积压缓冲区（repl_backlog）
+
+主端维护的一个**固定长度环形缓冲区**（`repl-backlog-size` 默认 **1MB**），主在做命令传播的同时，也把写命令**顺带写一份进 backlog**。
+
+```
+   master_repl_offset 不断增长 ───────────────→
+   ┌──────────────────────────────────────────┐
+   │  环形 backlog（默认 1MB，会覆盖最旧数据）  │
+   └──────────────────────────────────────────┘
+        ▲ 已被覆盖              ▲ 还在缓冲区内
+        offset 太旧            offset 在范围内 → 可部分重同步
+```
+
+> 关键：backlog 只保留**最近 1MB 写流量**。如果从断线时间 × 写入速率 > backlog 容量，缺失的那段已被环形覆盖、无法补发，就只能退化为**全量同步**。写量大的实例应调大 `repl-backlog-size`。
+
+### ③ 运行 ID（replid，replication ID）
+
+每个主启动时生成一个 40 位十六进制随机串 `replid`，标识"这一份数据历史"。从节点会**记住自己当前主的 replid**。重连时从把这个 replid 报给主，主用它判断"你之前跟的还是不是我这份数据"。
+
+> PSYNC2（4.0+）里从还会保留 `replid2`（上一个主的 ID），用于主从切换 / 重启后仍可能部分重同步。
+
+---
+
+## 六、PSYNC 握手与判定流程
+
+从重连时发的不再是 `PSYNC ? -1`，而是带上记住的 replid 和已处理到的 offset：
+
+```
+    PSYNC <replid> <offset+1>
+```
+
+主收到后的判定逻辑：
+
+```
+                 ┌─────────────────────────────┐
+                 │  主收到 PSYNC <replid><off>  │
+                 └──────────────┬──────────────┘
+                                ▼
+                 ┌──────────────────────────────┐
+        ┌── 否 ──┤ replid 与本机当前 replid 匹配? │
+        │        └──────────────┬───────────────┘
+        │                       │ 是
+        │                       ▼
+        │        ┌──────────────────────────────┐
+        │ ┌─ 否 ─┤ offset 仍在 repl_backlog 内?  │
+        │ │      └──────────────┬───────────────┘
+        │ │                     │ 是
+        ▼ ▼                     ▼
+  ┌───────────────┐    ┌─────────────────────────┐
+  │ +FULLRESYNC   │    │ +CONTINUE                │
+  │ 走全量同步    │    │ 走部分重同步：           │
+  │ （第三节）    │    │ 只补发 backlog 里        │
+  │               │    │ offset 之后那段命令      │
+  └───────────────┘    └─────────────────────────┘
+```
+
+一句话记忆：**replid 对得上 + offset 还在 backlog 里 → `+CONTINUE`（增量）；否则 → `+FULLRESYNC`（全量）。**
+
+---
+
+## 七、心跳与进度上报
+
+主从建立后靠两条周期信号维持健康检测：
+
+| 方向 | 命令 / 频率 | 作用 |
+|---|---|---|
+| 主 → 从 | `PING`，默认每 **10s** 一次（`repl-ping-replica-period`） | 主探活，让从确认主还在 |
+| 从 → 主 | `REPLCONF ACK <offset>`，每 **1s** 一次 | 上报从已复制到的 offset |
+
+`REPLCONF ACK` 的三个用途：
+
+- 让主知道每个从**复制进度**（落后多少字节）；
+- **检测从是否掉线**（超时没 ACK 视为异常）；
+- 支撑 **`min-replicas-to-write` / `min-replicas-max-lag`**：可配置"至少有 N 个从、且延迟不超过 M 秒时主才接受写"，否则主拒绝写——用一点可用性换数据安全。
+
+---
+
+## 八、无盘复制（diskless replication）
+
+默认全量同步要先把 RDB **落到主的磁盘**，再读出来发给从。当**磁盘慢、网络快**时，落盘成了瓶颈。
+
+**无盘同步**（`repl-diskless-sync yes`，3.0+）：主 fork 子进程后，把 RDB 内容**直接通过 socket 写给从**，不在主侧落盘。
+
+```
+   普通：fork → bgsave 写磁盘 → 读磁盘 → 网络发给从     （多一次磁盘 IO）
+   无盘：fork → 直接把 RDB 字节流 socket 发给从          （省掉磁盘）
+```
+
+- `repl-diskless-sync-delay`：发车前等待几秒，攒齐多个同时请求的从**一次推送共用**（因为 socket 流式发送一旦开始就不好再加新从）。
+- 从侧也有 `repl-diskless-load`（4.0+）：控制从是否把收到的 RDB 直接在内存解析、不落盘加载（有 `disabled` / `on-empty-db` / `swapdb` 几档，需权衡风险）。
+- 适用：磁盘 IO 是瓶颈、网络带宽充足的场景。
+
+---
+
+## 九、主从级联与高可用关系
+
+**级联复制（sub-replica）**：从节点本身也可以挂自己的从（主-从-从），形成树状结构，把复制压力从主分摊到中间层；级联从对其上游而言就是一个普通从。
+
+```
+        Master
+        /    \
+   ReplicaA  ReplicaB
+      |
+   ReplicaA1   ← A 的从（sub-replica），从 A 复制
+```
+
+**与哨兵 / Cluster 的关系**（一句话带过）：
+
+- **Sentinel（哨兵）**：在复制之上加监控 + 自动故障转移——主挂了选一个从 `REPLICAOF NO ONE` 升为新主，其余从改指向新主。
+- **Cluster**：在复制之上加数据分片（16384 slot），每个分片是一套主从。
+
+> 两者都把**主从复制当作底层数据冗余机制**——没有复制就没有它们的高可用。
+
+---
+
+## 十、常见坑
+
+**1. 主从延迟导致读到旧数据。** 异步复制下从总是略落后于主。读写分离时，"先写主、立刻读从"可能读到旧值。对一致性敏感的读应读主，或用 `WAIT numreplicas timeout` 等待写被 N 个从确认（仍非强一致，只是缩小窗口）。
+
+**2. 主宕机可能丢失未同步的写。** 主回复客户端在先、转发给从在后。若主在"已回复客户端但还没发给从"的瞬间宕机，且发生故障转移，这部分写就丢了。可用 `min-replicas-to-write` / `min-replicas-max-lag` 收紧，但代价是可用性下降，且**根本上无法做到零丢失**（异步复制的固有特性）。
+
+**3. repl-backlog 太小 → 频繁退化全量。** 写量大、网络偶尔抖动的实例，1MB 默认 backlog 几秒就被覆盖，每次重连都全量同步、反复 fork + 传 RDB，雪上加霜。按"断线容忍时间 × 写入速率"调大 `repl-backlog-size`。
+
+**4. 复制缓冲区（client-output-buffer）溢出 → 全量失败重来。** 全量同步期间主写太猛或从加载太慢，从对应的输出缓冲区超过 `client-output-buffer-limit replica` 上限，主直接断开该从，全量同步前功尽弃、循环重试。
+
+**5. 从节点可写引发不一致。** 误把 `replica-read-only` 改成 `no` 后往从写数据，这些写不会回传主、且下次同步可能被覆盖，造成主从数据分叉。生产保持从只读。
+
+**6. 大 key / 大数据集 fork 卡顿。** 全量同步 fork 子进程时，写时复制（COW）下若主写入频繁会触发大量内存页复制，可能引起延迟抖动甚至内存翻倍。
+
+---
+
+## 一句话总结
+
+> Redis 主从复制（术语 5.0+ 为 `replicaof` / `replica`）是**异步、最终一致**的数据复制：首次连接走**全量同步**（从发 `PSYNC` → 主 fork+bgsave 生成 RDB 并把期间写命令缓存进 replication buffer → 传 RDB → 从清空并加载 → 主补发缓冲增量），之后靠**命令传播**异步转发每条写命令。断线重连时凭 **replid + offset + repl_backlog（默认 1MB 环形缓冲）** 三要素判定：`replid` 匹配且 `offset` 仍在 backlog 内就 `+CONTINUE` 走**部分重同步**（2.8+），否则 `+FULLRESYNC` 退化为全量。配合主每 10s `PING`、从每 1s `REPLCONF ACK` 心跳，以及 3.0+ 的**无盘复制**（RDB 经 socket 直发不落盘）。它是**哨兵 / Cluster 高可用的基础**，但异步特性决定了主从延迟（读到旧数据）和主宕机丢未同步写**无法根除**，只能靠 `min-replicas-*` 等手段权衡缓解。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="redis/replication" data-base="../"></script>
+</body>
+</html>

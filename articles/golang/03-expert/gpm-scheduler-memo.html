@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPM 调度器 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# GPM 调度器 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **GMP = 把「调度位 P」从「OS 线程 M」里抽出来做 M:N 调度**：G（协程）排在 **P 的本地队列（无锁）**，**M 必须持 P 才能跑 G**；找活走 **runnext → 本地 → 全局 → netpoller → 偷一半** 五级；**syscall 阻塞 → hand-off 把 P 借给别的 M**，**死循环 → sysmon 发 SIGURG 抢占**。
+
+记不全时，按这条**记忆主线：三个角色 + 一条查找链 + 两个兜底**展开（详细演化看[正文](gpm-scheduler.html)）：
+
+---
+
+## 🎭 三个角色
+
+| | 是什么 | 关键 |
+|---|---|---|
+| **G** | goroutine 用户态协程 | 栈起步 **2KB**（动态扩到 1GB），切换 ~100ns，不进内核 |
+| **M** | OS 线程，真正上 CPU 执行 | **必须持有一个 P** 才能跑 G |
+| **P** | 调度位 / 逻辑 CPU，持本地队列 | 数量 = `GOMAXPROCS` = 核数；本地队列 **256 槽，无锁** |
+
+> **为什么要 P**：队列挂在 P（不挂 M），M 陷阻塞时 **P 能转交**给别的 M → 阻塞不传染。这正是 hand-off 的基础（GM 模型没有 P，全局一把锁是瓶颈）。
+
+---
+
+## 🔎 一条查找链 —— M 找下一个 G（`findrunnable`，5 级）
+
+```text
+① P.runnext     单槽 LIFO，缓存最热（channel ready 的 G 走这）
+② P 本地队列     256 槽，无锁
+③ 全局队列       抢 sched.lock；每 61 次调度强制查一次（防饿死）
+④ netpoller      epoll/kqueue 就绪的网络 / 定时器 G
+⑤ work-steal     随机偷另一个 P 本地队列的一半（最多 4 轮）
+```
+
+- 都没活也别立刻睡：保留少量 **spinning M**（≤ GOMAXPROCS/2）自旋等活，比线程睡/醒（2~10μs）便宜。
+
+---
+
+## 🛟 两个兜底 —— 都由 sysmon 后台监控触发
+
+```text
+hand-off（syscall 阻塞）：M 陷内核 → P 标 _Psyscall
+   → sysmon 见 P 阻塞 >20μs → 摘下 P 挂到别的 M，继续跑队列剩下的 G
+   → 原 M 返回：抢到 P 就接着跑 / 抢不到就把 G 扔回全局、自己睡
+
+异步抢占（死循环，Go 1.14+）：G 跑 >10ms 还没让出
+   → sysmon 给 M 发 SIGURG → 信号处理注入抢占点 → G 强制让出
+```
+
+- **sysmon** = 不绑任何 P 的独立监控线程，还管触发 GC、唤醒 netpoller；自身指数退避（20μs ~ 10ms）。
+
+---
+
+## 🔢 五个数字（必背）
+
+```text
+2KB    G 初始栈              256   P 本地队列容量
+61     每 61 次查一次全局      20μs  hand-off 阈值      10ms  异步抢占阈值
+```
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/gpm-scheduler-memo" data-base="../../"></script>
+</body>
+</html>

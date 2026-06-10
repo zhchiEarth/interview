@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>select 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# select 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **select = 同时等多个 channel，谁先就绪走谁。** 锁住所有 → 随机扫一轮（就绪就走）→ 有 default 就走它（非阻塞）→ 否则挂到每条队列睡，任一就绪唤醒再清理。三机制：**随机防饥饿 · 地址排序锁防死锁 · 醒后清理兄弟**。
+
+记不全时，按这条**记忆主线：一张表 + 一条流程 + 三个为什么**展开（详细推演看[正文](select.html)）：
+
+---
+
+## 📋 一张表 —— 行为速查（面试先背这个）
+
+```text
+1 个就绪              → 走它
+多个同时就绪          → 随机选一个（不是按代码顺序！）
+都没就绪 + 有 default → 走 default（select 变非阻塞）
+都没就绪 + 无 default → 阻塞挂起，直到任一就绪
+全是 nil + 无 default → 永远阻塞
+```
+
+---
+
+## 🔄 一条流程 —— selectgo（锁 → 扫 → 挂 → 醒）
+
+```text
+① 随机 polling order                    ← 防饥饿
+② 按 channel 地址排 lock order，锁住所有  ← 防死锁
+③ 第一轮非阻塞扫：任一就绪 → 完成、解锁、返回   （fast path，99% 走这）
+④ 有 default → 解锁，走 default
+⑤ 无 default → 每个 case 造一个 sudog 挂到各自队列，解锁、gopark 睡（slow path）
+⑥ 被唤醒 → 从其它队列摘下兄弟 sudog，返回选中的 case
+```
+
+> 一句话串起来：**锁住所有 → 扫一轮 → 没货就挂所有队列睡 → 醒来摘干净。**
+
+---
+
+## 🧩 三个为什么 —— 三个机制
+
+- **随机扫**：多个就绪时按代码顺序选会饿死后面的 case → 随机保证**公平**。
+- **按地址排序加锁**：**多个 goroutine 各跑各的 select、抢同一组 channel** 时，selectgo 要一次锁住多把 channel 锁，加锁顺序不一致就**死锁**；全局按地址统一顺序就不会。（单条 select 内部只有一个 G，锁顺序问题是跨 goroutine 的）
+- **醒后清理兄弟**：G 同时挂在 N 条队列上，醒来必须把其它 N−1 个兄弟 sudog 摘掉，否则以后被**误唤醒**。
+
+---
+
+## 🔌 实战两招 —— nil 开关 + timer 坑
+
+**① nil channel = 开关**（高频考点）
+
+```text
+nil channel：读 / 写永远阻塞、close 直接 panic
+→ select 里把某 case 的 channel 置 nil = 这个分支永远不被选中
+```
+
+消费完的 channel **必须置 nil**，否则关闭的 channel 一直返回零值 → 死循环：
+
+```go
+case v, ok := <-inA:
+    if !ok { inA = nil; continue }   // 关了就置 nil，下一轮不再选它
+```
+
+**② time.After 在高频循环里漏 timer**
+
+→ 改用 `time.NewTimer` + `Reset`，或 `context.WithTimeout`。
+（Go 1.23 起 timer 能提前 GC，缓解但循环里仍推荐复用）
+
+---
+
+## 附 · 常用模式（认得出就行）
+
+```text
+超时       select { case v:=<-ch:  case <-time.After(t): }
+可取消     select { case v:=<-ch:  case <-ctx.Done(): }
+非阻塞读   select { case v:=<-ch:  default: }
+非阻塞写   select { case ch<-v:    default: }
+优雅退出   select { case t:=<-tasks: ...  case <-done: return }
+```
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="channel/select-memo" data-base="../"></script>
+</body>
+</html>

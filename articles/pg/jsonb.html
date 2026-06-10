@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JSONB 与丰富数据类型 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# JSONB 与丰富数据类型
+
+> 一句话：PostgreSQL 的类型系统远比关系型常识里丰富——数组、范围、枚举、UUID、网络地址、几何、全文、自定义类型与域一应俱全；其中最重要的是 **JSONB**：它以**解析后的二进制**存储 JSON（键去重、读取无需重解析、**支持 GIN 索引**和丰富操作符），是半结构化/灵活 schema 场景的利器；但它**不该替代关系建模**，join、约束、统计在 JSONB 上都会变差。
+
+> 本文以 **PostgreSQL 16** 为基准，版本相关特性会显式标注（如 `@@`/SQL/JSON path 是 PG 12+）。相关：[PostgreSQL 索引类型](index.html)。
+
+## 一、PG 的丰富类型系统
+
+相比"只有数字/字符串/时间"的朴素认知，PG 原生提供了一大批"开箱即用"的类型，很多场景因此无需自己造轮子：
+
+| 类别 | 类型 | 用途举例 |
+|---|---|---|
+| 数组 | 任意类型加 `[]`，如 `int[]`、`text[]` | 标签、枚举集合 |
+| 范围 | `int4range`、`numrange`、`tstzrange`、`daterange` | 时段、价格区间，支持重叠/包含判断 |
+| 枚举 | `CREATE TYPE ... AS ENUM (...)` | 固定取值的状态字段 |
+| UUID | `uuid` | 分布式主键 / 外部 ID |
+| 网络地址 | `inet`、`cidr`、`macaddr` | IP、网段、MAC，含网段包含运算 |
+| 几何 | `point`、`line`、`polygon`、`circle` 等 | 坐标、图形（PostGIS 更专业） |
+| 全文检索 | `tsvector`、`tsquery` | 文档检索 |
+| 半结构化 | `json`、**`jsonb`** | 灵活/稀疏属性 |
+| 自定义 | 复合类型、`DOMAIN`（带约束的别名类型） | 业务值对象、统一校验 |
+
+```sql
+-- 域: 给类型加统一约束(如邮箱、正数金额)
+CREATE DOMAIN email AS text CHECK (VALUE ~ '^[^@]+@[^@]+$');
+-- 枚举
+CREATE TYPE order_status AS ENUM ('unpaid','paid','shipped','done');
+```
+
+本文聚焦使用最广的 **JSONB**，并附带数组、范围两类简单举例。
+
+## 二、JSON vs JSONB
+
+PG 有两种 JSON 类型，名字像、用途差别很大。**几乎所有场景都应该用 jsonb**，`json` 只在"需要原样保留输入文本"的极少数场景才用。
+
+| 维度 | `json` | `jsonb` |
+|---|---|---|
+| 存储形式 | **原始文本**，逐字节照存 | **解析后的二进制**结构 |
+| 保留空格 / 缩进 | 是（原样） | 否（重新格式化） |
+| 保留键顺序 | 是 | 否（无序） |
+| 重复键 | **全部保留** | **去重**，只留最后一个 |
+| 读取 / 取字段 | 每次都要**重新解析**文本 | 直接读二进制，**快** |
+| 写入 | 略快（不解析） | 略慢（要解析+构建二进制） |
+| **GIN 索引内部键值** | ❌ 不支持 | ✅ **支持** |
+| 丰富操作符（`@>`、`?`、jsonpath） | 部分不支持 | ✅ 全支持 |
+
+```sql
+-- 直观差异
+SELECT '{"a":1, "a":2,  "b":3}'::json;   -- {"a":1, "a":2,  "b":3}  原样:留空格、留重复键
+SELECT '{"a":1, "a":2,  "b":3}'::jsonb;  -- {"a": 2, "b": 3}        去重、无序、规整
+```
+
+结论：**默认 jsonb**。只有当你要把客户端发来的 JSON 原封不动落库（保留格式/键序，做审计或回放）才考虑 `json`。
+
+## 三、JSONB 操作符
+
+JSONB 的查询能力来自一组操作符，面试常被追问 `->` 与 `->>` 的区别（**取 json 还是取 text**）。
+
+| 操作符 | 含义 | 示例 | 返回 |
+|---|---|---|---|
+| `->` | 取字段/元素，返回 **jsonb** | `data->'addr'`、`data->0` | jsonb |
+| `->>` | 取字段/元素，返回 **text** | `data->>'name'` | text |
+| `#>` | 按**路径**取，返回 jsonb | `data #> '{addr,city}'` | jsonb |
+| `#>>` | 按路径取，返回 text | `data #>> '{addr,city}'` | text |
+| `@>` | 左是否**包含**右 | `data @> '{"vip":true}'` | bool |
+| `<@` | 左是否被右包含 | `'{"a":1}' <@ data` | bool |
+| `?` | 顶层是否**存在某键** | `data ? 'email'` | bool |
+| `?\|` | 是否存在**任一**键 | `data ?\| array['a','b']` | bool |
+| `?&` | 是否存在**全部**键 | `data ?& array['a','b']` | bool |
+| `@@` | jsonpath 谓词匹配（PG 12+） | `data @@ '$.age > 18'` | bool |
+| `@?` | jsonpath 是否有匹配（PG 12+） | `data @? '$.tags[*] ? (@ == "go")'` | bool |
+
+```sql
+-- 取标量要用 ->> (text);链式取嵌套要注意中间用 -> 保持 jsonb
+SELECT data->>'name'              AS name,        -- 'tom'
+       data->'addr'->>'city'      AS city,        -- 中间 -> 取 jsonb,末端 ->> 取 text
+       data #>> '{addr,city}'     AS city2        -- 路径写法,等价
+FROM users;
+
+-- 包含查询(最常用,且能被 GIN 索引加速)
+SELECT * FROM users WHERE data @> '{"vip": true}';
+SELECT * FROM users WHERE data @> '{"addr": {"city": "SH"}}';   -- 嵌套也行
+
+-- 键存在
+SELECT * FROM users WHERE data ? 'phone';
+
+-- jsonpath(PG 12+): 表达力强,支持过滤/比较
+SELECT * FROM users WHERE data @@ '$.age > 18';
+```
+
+`->>` 返回 text，需要数值比较时记得显式转换：`(data->>'age')::int > 18`。
+
+## 四、GIN 索引加速
+
+JSONB 的"包含/存在"类查询默认会全表扫描，用 **GIN 索引**可大幅加速。有两种操作符类，按需求二选一：
+
+| 操作符类 | 索引什么 | 支持的查询 | 体积/速度 |
+|---|---|---|---|
+| `jsonb_ops`（**默认**） | 每个**键**和**值**都建项 | `@>`、`<@`、`?`、`?\|`、`?&`、jsonpath | 较大，但支持键存在查询 |
+| `jsonb_path_ops` | 只对"**路径+值**的哈希"建项 | **仅 `@>`**（及 `@?`/`@@`） | **更小、更快**，但不支持 `?` 键存在 |
+
+```sql
+-- 默认 GIN: 支持 @> 和 ? 系列键存在查询
+CREATE INDEX idx_data_gin ON users USING gin (data);
+-- jsonb_path_ops: 更小更快,只服务 @> 包含查询
+CREATE INDEX idx_data_pathops ON users USING gin (data jsonb_path_ops);
+
+SELECT * FROM users WHERE data @> '{"vip": true}';   -- 两种索引都能用
+SELECT * FROM users WHERE data ? 'phone';            -- 只有默认 jsonb_ops 能用
+```
+
+选择：**只用 `@>` 包含查询 → `jsonb_path_ops`**（更省更快）；**还要 `?`/`?|`/`?&` 键存在 → 默认 `jsonb_ops`**。
+
+**只索引某个高频路径**时，用表达式索引（B-tree）更精准、更小：
+
+```sql
+-- 只对 data->>'email' 这一个标量路径建 B-tree
+CREATE INDEX idx_email ON users ((data->>'email'));
+SELECT * FROM users WHERE data->>'email' = 'a@b.com';   -- 命中
+```
+
+为什么 GIN 适合 JSONB？因为一个 JSONB 文档里"含多个键值"，正是倒排索引（"键值 → 含它的行"）的用武之地——同 [PostgreSQL 索引类型](index.html) 里讲的数组/全文一个道理。
+
+## 五、数组与范围类型简单举例
+
+### 数组
+
+```sql
+CREATE TABLE posts (id bigserial PRIMARY KEY, tags text[]);
+INSERT INTO posts (tags) VALUES (ARRAY['go','pg','backend']);
+
+SELECT * FROM posts WHERE tags @> ARRAY['go'];        -- 包含 go
+SELECT * FROM posts WHERE 'pg' = ANY(tags);           -- 含某元素
+CREATE INDEX idx_tags ON posts USING gin (tags);      -- GIN 加速 @>
+```
+
+### 范围类型
+
+```sql
+CREATE TABLE bookings (room int, during tstzrange);
+-- 重叠判断 &&、包含 @>、某点是否落入 <@
+SELECT * FROM bookings WHERE during && tstzrange('2026-06-12 09:00','2026-06-12 11:00');
+SELECT * FROM bookings WHERE during @> '2026-06-12 10:00'::timestamptz;
+
+-- 排他约束: 用 GiST 保证同一房间时段不重叠(见索引篇 GiST)
+ALTER TABLE bookings
+  ADD CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, during WITH &&);
+```
+
+## 六、何时用 JSONB（以及何时别用）
+
+**适合 JSONB**：
+
+- **半结构化数据**：第三方回调、Webhook 原始 payload、审计/事件明细。
+- **灵活 / 多变的 schema**：字段经常增减、不同记录字段不一样（多租户的自定义字段、商品的可变规格）。
+- **稀疏属性**：上百个可选属性，大多数行只填几个——用列存会一堆 NULL。
+
+**不适合（别拿 JSONB 替代关系建模）**：
+
+- 需要频繁 **JOIN** 的实体关系——JSONB 内部无法被外部高效关联。
+- 需要**约束**（外键、唯一、CHECK、NOT NULL）保证数据完整性——JSONB 里的字段拿不到这些保障。
+- 优化器**统计信息**对 JSONB 内部字段较弱，**选择率估算**不如普通列准，复杂查询的计划可能变差。
+- 强类型校验、强一致的核心业务表——核心字段就该是规规矩矩的列。
+
+实务折中：**核心、要 join/约束/统计的字段建成普通列；外围、可变、稀疏的属性塞进一个 jsonb 列**——两全。
+
+## 七、对比 MySQL 的 JSON
+
+MySQL（5.7+/8.0）也有 JSON 类型，且同样是二进制存储，但**索引方式差别大**：
+
+| 维度 | PostgreSQL JSONB | MySQL JSON |
+|---|---|---|
+| 存储 | 解析后二进制 | 二进制（binary JSON） |
+| 直接对整列内部建索引 | ✅ **GIN**（`@>`、`?` 等开箱即用） | ❌ **不能直接索引**，要靠**生成列** |
+| 索引内部字段的做法 | `USING gin (data)` 或表达式索引 | 抽出**生成列**（`GENERATED`）再在生成列上建普通 B-tree（或 8.0.17+ 的 multi-valued index 索引数组） |
+| 包含查询 | `@>` 原生且可走 GIN | `JSON_CONTAINS()` 函数；要走索引仍需生成列/多值索引 |
+| 操作符丰富度 | 高（`-> ->> #> @> ? ?\| ?& @@` + jsonpath） | 以函数为主（`JSON_EXTRACT`、`->`、`->>`、`JSON_CONTAINS` 等） |
+
+```sql
+-- MySQL: 想索引 JSON 内部字段,典型要先抽生成列
+ALTER TABLE users
+  ADD COLUMN email VARCHAR(255) AS (JSON_UNQUOTE(data->'$.email')) STORED,
+  ADD INDEX idx_email (email);
+```
+
+一句话：**PG 的 JSONB 可以直接对整列建 GIN 索引、原生支持包含/键存在查询；MySQL 的 JSON 要索引内部字段通常得先建生成列（或对数组用多值索引）**——PG 在"半结构化 + 可索引"上更顺手。
+
+## 一句话总结
+
+> PostgreSQL 类型系统很丰富（数组、范围、枚举、UUID、`inet`、几何、`tsvector`、自定义类型/域），其中 **JSONB** 最常用：它存**解析后的二进制**（键去重、无序、读取免重解析、**可建 GIN 索引**、操作符丰富），相对 `json`（存原始文本、保留空格/键序/重复键、每次重解析、不能索引内部）几乎总是更优——**默认用 jsonb**。核心操作符要记牢：`->` 取 jsonb / `->>` 取 text，`#>`/`#>>` 走路径，`@>` 包含，`?`/`?\|`/`?&` 键存在，`@@`/jsonpath（PG 12+）。加速靠 **GIN**：默认 `jsonb_ops`（支持 `@>` 和 `?` 系列），`jsonb_path_ops`（**只支持 `@>`，但更小更快**）；只索引单一高频标量路径用表达式索引（B-tree）更精准。JSONB 适合**半结构化/灵活 schema/稀疏属性**，但**别替代关系建模**——join、约束、统计都会变差，折中做法是核心字段建列、外围可变属性塞 jsonb。对比 MySQL：MySQL 也有二进制 JSON，但**索引内部字段要靠生成列**，PG 能直接 `USING gin` 原生索引（基于 PostgreSQL 16）。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/jsonb" data-base="../"></script>
+</body>
+</html>

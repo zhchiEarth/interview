@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.WaitGroup & sync.Once 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.WaitGroup & sync.Once 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **WaitGroup** = `[counter|waiter]` **挤进一个 uint64** + 信号量 sema——`Done` 把 counter 减到 0 的**同一次原子读**就知道要不要唤醒等待者，**`Add` 必须在 `go` 之前**；**Once** = `atomic done(0/1) + Mutex 双检`——快路径无锁读、慢路径锁内再检防重复，`done` 用 atomic **是为可见性**（看到 done=1 必看到 f 的写），`defer Store(1)` 让 **panic 也算跑过**。
+
+记不全时，按这条**记忆主线：两个结构 + 两条流程 + 两组规则**展开（详细推演看[正文](sync-waitgroup-once.html)）：
+
+---
+
+## 🏗 两个结构 —— 各一个原子状态 + sema
+
+```go
+type WaitGroup struct {
+    noCopy noCopy        // go vet: 禁拷贝
+    state  atomic.Uint64 // 高32=counter, 低32=waiter 数
+    sema   uint32        // runtime 信号量, Wait 的 G 挂这
+}
+type Once struct {
+    done atomic.Uint32   // 0=没跑过, 1=跑过
+    m    Mutex
+}
+```
+- 为什么 counter+waiter 挤一个 uint64：`Done` 减到 0 的**那一刻一次原子读**同时拿到 counter==0 与 waiter 数，决定是否 `Semrelease`——**中间没有缝**，避免「读完 waiter==0 决定不唤醒，紧接着有人 Wait 进来永久死等」。
+
+## 🔁 两条流程 —— Add/Wait 与 Do 双检
+
+```text
+Add(n): state.Add(n<<32) → 新 counter v
+   v<0            → panic(negative WaitGroup counter)
+   v>0 或无 waiter → 返回
+   v==0 且有 waiter→ 清 0, 唤醒【所有】waiter
+Wait(): v==0 返回; v>0 → CAS waiter+1, Semacquire 挂起(醒来 state 须为 0)
+
+Do(f): done.Load()==0? 否→直接返回(无锁快路径)
+       是→doSlow: m.Lock → 再检 done==0 → defer done.Store(1); f()
+```
+- Once 三个为什么：**双检**防「快路径读到 0 → 抢到锁」这段被别人跑过；**atomic**是 release/acquire 的**可见性**（不是为原子）；**defer Store(1)** 让 f panic 也算「跑过」，官方："If f panics, Do considers it to have returned"——f 内务必自己处理错误。
+
+## ⚠️ 两组规则 —— WaitGroup 四铁律 + Once 衍生
+
+```text
+WaitGroup 四铁律:
+ ① Add 必须在 go 之前 (Add happens-before Wait, 否则 Wait 看到 0 直接返回)
+ ② counter 变负 → panic(sync: negative WaitGroup counter)
+ ③ 不能拷贝 (noCopy / go vet); 传一律用 *sync.WaitGroup
+ ④ 复用要等上轮 Wait 完全返回 (否则 panic: reused before previous Wait returned)
+```
+- Once 衍生（**Go 1.21+**）：`OnceFunc(f)` 只跑一次无返回；`OnceValue(f)` 只算一次、之后返缓存值（懒加载单例最干净写法）；`OnceValues(f)` 双返回值版。内部即 Once + 缓存结果 + 处理 panic 传播。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-waitgroup-once-memo" data-base="../../"></script>
+</body>
+</html>

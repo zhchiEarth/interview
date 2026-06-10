@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>netpoller 怎么把同步代码异步化？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# netpoller 怎么把同步代码异步化？
+
+> 一句话：你写的 `conn.Read` 看起来是「阻塞等数据」，runtime 在底下把它变成——**没数据就把 goroutine（不是线程）挂到 epoll，线程转头跑别人，数据就绪再唤醒 goroutine 接着读**。挂起的是廉价的 G，复用的是宝贵的线程，这就是 Go 几十万连接的根本。
+
+## 一、先搞清楚：这里的「同步 / 异步」指什么
+
+大多数人卡在这——以为「同步」和「异步」互相矛盾。其实是**两个视角**：
+
+| 视角 | 看到的 |
+|---|---|
+| **你（写代码的人）** | **同步**：调 `Read` → 卡住 → 数据来了 → 返回往下走。直觉、好写。 |
+| **runtime（底层）** | **异步**：`Read` 内部偷偷把你的 goroutine 挂起又唤醒，中间那根线程跑别人去了。 |
+
+> **"把同步代码异步化" = 你写同步、runtime 跑异步，且对你完全透明。** goroutine 醒来后从 `Read` 那一行继续，就像它从没离开过。
+
+```go
+conn, _ := net.Dial("tcp", "1.2.3.4:80")
+buf := make([]byte, 1024)
+n, _ := conn.Read(buf)   // ← 这一行就是全部魔法发生的地方
+useData(buf[:n])
+```
+
+---
+
+## 二、为什么需要它：传统「阻塞 IO」的问题
+
+C / Java 默认是「一个连接一个线程 + 阻塞 read」：
+
+```text
+线程调用 read(fd)
+  数据没就绪 → 内核把【整根 OS 线程】挂起睡觉
+  → 这根线程除了干等，啥也干不了
+```
+
+代价：
+
+- 一根 OS 线程栈 **1~8MB**，**1 万连接 = 1 万线程 = 几十 GB 内存**
+- 线程切换走内核，**1~10μs** 一次，几千线程光切换就吃满 CPU
+- 这就是经典的 **C10K 问题**
+
+→ 必须把「**等一次 IO 的成本**」从「一根线程」降到「一个 goroutine」。
+
+---
+
+## 三、三个关键动作（netpoller 的核心）
+
+### ① fd 设成「非阻塞」（O_NONBLOCK）
+
+Go 创建的网络 fd 一律是非阻塞的。这样 `read` 没数据时内核**不挂线程**，而是**立刻返回错误 `EAGAIN`**（意思是"现在没数据，等会再来"）。
+
+### ② 没数据时，挂起的是 goroutine，不是线程
+
+收到 `EAGAIN`，runtime **不会反复轮询**（那会空转烧 CPU），而是：
+
+- 把「这个 fd ↔ 当前 goroutine」登记到 **epoll**
+- 调 `gopark` 把当前 **goroutine** 置为 `_Gwaiting`、从 P 上摘下
+- 线程（M）立刻回到调度器，**去跑别的 goroutine** ← 线程没浪费
+
+### ③ 数据就绪后唤醒 goroutine
+
+后台有人调 `epoll_wait` 问内核「哪些 fd 好了」，就绪的 fd 查表找回对应 goroutine，`goready` 置回 `_Grunnable` 重新入队；调度器下次捡起它，**重试 read**，这次读到了，`Read` 返回。
+
+> **一句话差别**：阻塞 IO 挂起「OS 线程」（MB 级、几千根就爆）；netpoller 挂起「goroutine」（KB 级、几十万没问题），线程被立刻复用。
+
+---
+
+## 四、完整流程 + 时间线
+
+源码调用链（Linux，简化）：
+
+```text
+conn.Read
+ └─ net.netFD.Read
+     └─ internal/poll.FD.Read
+         for {
+           n, err = syscall.Read(fd, buf)      // ① 非阻塞试读
+           if err == EAGAIN {                  // ② 没数据
+             fd.pd.waitRead()                  //    去睡
+               └─ runtime_pollWait
+                   └─ netpollblock → gopark    //    goroutine 挂起，让出 P
+             continue                          // ③ 被唤醒后回到 for 顶，重试
+           }
+           return n, err                       // ④ 读到了，返回
+         }
+```
+
+时间线（盯着同一根线程 M，看它一直没闲着）：
+
+```text
+时间 ──────────────────────────────────────────────────►
+
+G_A: conn.Read → syscall.Read → EAGAIN
+        │ 把 fd→G_A 登记到 epoll，gopark
+        ▼
+     [ G_A 睡在 epoll 上 ]
+                                （这段时间 M 不闲着）
+M(同一根线程): ───────► 转头跑 G_B → G_C → G_D …
+
+后台某次调度 / sysmon:  netpoll() = epoll_wait(...)
+        │ 内核回答：fd 就绪了
+        ▼
+     查表找回 G_A → goready → 放回运行队列
+        │
+        ▼
+M 下次调度捡起 G_A → 回到 for 顶 → syscall.Read 这次成功 → Read 返回
+```
+
+**G_A「睡着」的整段时间，线程 M 一直在跑别的 goroutine**——这就是「IO 等待不占线程」。
+
+---
+
+## 五、epoll 是什么，谁去调 epoll_wait
+
+**epoll（Linux）** = 内核提供的「**一次性问一大堆 fd：你们谁就绪了？**」机制，三个系统调用：
+
+| 调用 | 作用 | Go 里何时 |
+|---|---|---|
+| `epoll_create` | 建一个 epoll 实例 | 第一次用网络时 `netpollinit`，全局一个 |
+| `epoll_ctl(ADD)` | 把某个 fd 加进来监听 | fd 首次 `waitRead/Write` 前 `netpollopen` |
+| `epoll_wait` | 返回当前就绪的 fd 列表 | runtime 的 `netpoll()` |
+
+**谁调 `netpoll()`（即 epoll_wait）**——不需要专门线程死等，runtime 在这些时机**顺手** poll：
+
+- 调度器 `findrunnable` **找不到活干时**（最主要）
+- **sysmon** 监控线程定期兜底
+- **GC** start / stop the world 时
+
+就绪的 fd 通过 `epoll_event.data` 拿回它绑定的 `pollDesc`，再找到挂在上面的 goroutine，批量 `goready`（`injectglist`）。
+
+> Go 用 **边沿触发（EPOLLET）**：内核只在「从没数据→有数据」那一刻通知一次。所以 Go 收到通知后会**循环 read 到再次 `EAGAIN`**，把数据榨干，避免漏读。
+
+---
+
+## 六、底层数据结构：pollDesc
+
+每个网络 fd 在 runtime 里对应一个 `pollDesc`，它是「fd ↔ 等待的 goroutine」的桥：
+
+```go
+type pollDesc struct {
+    fd     uintptr
+    rg     atomic.Uintptr  // 读：等待的 G（或 pdReady / pdWait 标记）
+    wg     atomic.Uintptr  // 写：等待的 G
+    rt, wt timer           // 读 / 写的 deadline 定时器
+    // ...
+}
+```
+
+- `epoll_ctl(ADD)` 时，把 `pollDesc` 的指针塞进 `epoll_event.data`。
+- `epoll_wait` 返回就绪事件 → 直接拿到 `pollDesc` → 取出 `rg`/`wg` 里的 G → 唤醒。
+
+`rg`/`wg` 是个小状态机：`0`（空闲）/ `pdWait`（准备睡）/ G 指针（正在睡的 G）/ `pdReady`（数据已就绪）。`gopark` 前存进 G 指针，`netpoll` 唤醒时取出来 `goready`。
+
+---
+
+## 七、几个容易混的点
+
+### Q1：非阻塞 fd 会不会一直空转轮询（busy loop）烧 CPU？
+
+**不会。** 收到 `EAGAIN` 后**不是立刻重试**，而是 `gopark` 把 G 睡掉、彻底交出 CPU。只有 `epoll_wait` 报告就绪后才唤醒重试。**全程零空转。**
+
+### Q2：超时 / `SetReadDeadline` 怎么实现？
+
+挂在 epoll 上的 G 同时挂一个 **runtime 定时器**（`pollDesc.rt`）。两条路谁先到谁唤醒：
+
+- fd 先就绪 → 正常读到数据
+- 定时器先到 → 唤醒 G，`Read` 返回 `i/o timeout` 错误
+
+### Q3：所有 IO 都走 netpoller 吗？
+
+**不是。** epoll 只对**网络 socket、pipe、部分设备**有效。**普通磁盘文件不能放进 epoll**（它永远"就绪"），所以**文件 IO 仍是真阻塞 syscall**——靠「多开线程」扛：M 阻塞时 GMP 把 P [hand-off](gpm-scheduler.html) 给别的 M，不连累其他 G。
+
+### Q4：和 GMP 调度器什么关系？
+
+netpoller 就是 GMP `findrunnable` 五级查找里的**第 4 级**。M 找活时顺手 `netpoll()`，把就绪的网络 G 捞回队列——两者是一套东西（详见 [GPM 调度器](gpm-scheduler.html)）。
+
+### Q5：gopark / goready 到底是啥？
+
+- `gopark`：把**当前 G** 置 `_Gwaiting`、与 M 解绑、M 回调度器跑别人。G 不占 CPU 也不占线程，只占自己那几 KB 栈。
+- `goready`：把某个睡着的 G 置回 `_Grunnable`、塞进运行队列，等调度器捡起。
+- channel 阻塞、`sync.Mutex` 等都用这对原语，netpoller 只是其中一个"唤醒源"。
+
+---
+
+## 八、一个类比
+
+```text
+阻塞线程  = 打客服全程举着电话干等  → 电话线(线程)被你一直占着
+netpoller = 留个回拨号码就挂机      → 电话线释放(线程去干别的)
+            客服好了回拨给你         → epoll 报就绪，唤醒你的 goroutine
+```
+
+你的体验都是「打了电话、拿到答复」（同步），但 netpoller 中间没一直占线。
+
+---
+
+## 九、OS 接口对应
+
+| 平台 | 接口 | 备注 |
+|---|---|---|
+| Linux | **epoll** | 边沿触发 EPOLLET |
+| macOS / BSD | **kqueue** | |
+| Windows | **IOCP** | 完成端口，模型略不同（直接拿结果，非"就绪通知"） |
+| 统一封装 | `runtime/netpoll.go` + 各平台 `netpoll_*.go` | 对上层暴露同一套 `netpollopen / netpoll / netpollready` |
+
+---
+
+## 一句话终极总结
+
+> Go 网络代码「看起来同步」，底层是：**非阻塞 fd 试读 → `EAGAIN` 就把 goroutine（不是线程）挂到 epoll、让出 P → 线程去跑别人 → epoll 报告就绪后唤醒 goroutine 重试**。**挂起廉价的 G、复用宝贵的线程**，再配合 GMP 调度，就是 Go 高并发网络的基石。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/netpoller" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,4636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识图谱</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --sidebar-bg: #fafafa;
+  --border: #ececec;
+  --text: #1f2328;
+  --muted: #6e7781;
+  --hint: #9ba1a6;
+  --accent: #10b981;
+  --accent-soft: #e8f7f1;
+  --code-bg: #f6f8fa;
+  --link: #0969da;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --sidebar-bg: #0a0d12;
+    --border: #21262d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --hint: #6e7681;
+    --accent: #2ea27a;
+    --accent-soft: #11281f;
+    --code-bg: #161b22;
+    --link: #4493f8;
+  }
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px; line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+.layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+.sidebar {
+  background: var(--sidebar-bg); border-right: 1px solid var(--border);
+  padding: 24px 0; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+}
+.sidebar-header {
+  padding: 0 24px 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+}
+.site-title { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
+.site-subtitle { font-size: 12px; color: var(--muted); margin: 0; }
+.nav { padding: 0 12px; }
+.nav-group { margin-bottom: 16px; }
+.nav-group-title { font-size: 13px; font-weight: 600; color: var(--text); padding: 8px 12px; margin: 0; }
+.nav-list { list-style: none; padding: 0; margin: 0; }
+.nav-item > a {
+  display: block; padding: 6px 28px 6px 12px; font-size: 13.5px;
+  color: var(--muted); text-decoration: none;
+  border-radius: 6px; border-left: 2px solid transparent;
+  margin-left: -2px; position: relative;
+  transition: color .15s, background .15s;
+}
+.nav-item > a:hover { color: var(--text); background: rgba(0,0,0,0.03); }
+.nav-item.active > a {
+  color: var(--accent); border-left-color: var(--accent);
+  font-weight: 500; background: transparent;
+}
+.nav-item.active > a::after {
+  content: '▾'; position: absolute; right: 10px; top: 50%;
+  transform: translateY(-50%); font-size: 10px; opacity: 0.55;
+}
+.nav-item.active.collapsed > a::after { content: '▸'; }
+.toc { list-style: none; padding: 4px 0 4px 16px; margin: 0; }
+.toc li a {
+  display: block; padding: 4px 12px; font-size: 13px;
+  color: var(--muted); text-decoration: none; border-radius: 4px;
+}
+.toc li a:hover { color: var(--text); }
+.toc li a.active { color: var(--accent); }
+.toc .toc-h3 { padding-left: 16px; font-size: 12.5px; }
+.main { min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 16px; padding: 16px 32px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--bg); z-index: 10;
+}
+.meta { flex: 1; text-align: right; color: var(--muted); font-size: 12px; }
+.lang select {
+  font: inherit; font-size: 13px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; cursor: pointer;
+}
+.article { max-width: 760px; width: 100%; margin: 0 auto; padding: 40px 32px 80px; }
+.placeholder { color: var(--hint); text-align: center; padding: 80px 0; font-size: 14px; }
+.article h1 { font-size: 28px; font-weight: 600; margin: 0 0 24px; letter-spacing: -0.3px; scroll-margin-top: 80px; }
+.article h2 { font-size: 22px; font-weight: 600; margin: 40px 0 16px; letter-spacing: -0.2px; scroll-margin-top: 80px; }
+.article h3 { font-size: 17px; font-weight: 600; margin: 28px 0 12px; scroll-margin-top: 80px; }
+.article p { margin: 12px 0; }
+.article ul, .article ol { margin: 12px 0; padding-left: 28px; }
+.article li { margin: 4px 0; }
+.article a { color: var(--link); }
+.article code {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13.5px; background: var(--code-bg);
+  padding: 2px 6px; border-radius: 4px;
+}
+.article pre {
+  background: var(--code-bg); border-radius: 8px;
+  padding: 16px; overflow-x: auto; font-size: 13.5px; line-height: 1.6;
+}
+.article pre code { background: transparent; padding: 0; font-size: inherit; }
+.article blockquote {
+  margin: 16px 0; padding: 8px 16px;
+  border-left: 3px solid var(--accent); background: var(--accent-soft);
+  color: var(--text); border-radius: 0 6px 6px 0;
+}
+.article blockquote p:first-child { margin-top: 0; }
+.article blockquote p:last-child { margin-bottom: 0; }
+.article table { border-collapse: collapse; margin: 16px 0; font-size: 14px; width: 100%; }
+.article th, .article td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+.article th { background: var(--code-bg); font-weight: 600; }
+.article hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+@media (max-width: 768px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  .article { padding: 24px 20px 60px; }
+  .topbar { padding: 12px 20px; }
+}
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <h1 class="site-title" id="siteTitle">知识图谱</h1>
+      <p class="site-subtitle" id="siteSubtitle"></p>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article">
+      <div class="placeholder">从左侧目录选择一篇文章开始阅读</div>
+    </article>
+  </main>
+</div>
+
+<!-- ============ 目录配置 ============ -->
+<script id="manifest" type="application/json">
+{
+  "site": {
+    "title": "知识图谱",
+    "subtitle": "后端工程师 · 速记 / 速答 / 速过"
+  },
+  "groups": [
+    {
+      "title": "Apache Pulsar",
+      "items": [
+        { "id": "pulsar/deep-dive-overview", "title": "Pulsar 渐进式理解：从简单队列到存算分离" }
+      ]
+    },
+    {
+      "title": "Apache Kafka",
+      "items": [
+        { "id": "kafka/knowledge-graph", "title": "Kafka 知识地图（重排版）" }
+      ]
+    },
+    {
+      "title": "Golang 基础",
+      "items": [
+        { "id": "golang/new-vs-make", "title": "new vs make 的区别" },
+        { "id": "golang/value-vs-reference", "title": "Go 只有值传递？slice/map 像引用是怎么回事" },
+        { "id": "golang/string-internals", "title": "string 底层 & 不可变性" },
+        { "id": "golang/iota", "title": "iota 怎么用？" },
+        { "id": "golang/closure", "title": "闭包 & 变量捕获的坑" },
+        { "id": "golang/panic-recover", "title": "panic / recover 机制" },
+        { "id": "golang/error-handling", "title": "error 处理与 errors.Is/As/Unwrap" },
+        { "id": "golang/init-order", "title": "init 函数与包初始化顺序" },
+        { "id": "golang/equality", "title": "== 能比较哪些类型？" },
+        { "id": "golang/type-assertion", "title": "空 interface & 类型断言" },
+        { "id": "golang/interface", "title": "Interface 底层是怎么实现的？" }
+      ]
+    },
+    {
+      "title": "Golang 进阶",
+      "items": [
+        { "id": "channel/internals", "title": "Channel 是什么？底层怎么实现?" },
+        { "id": "channel/close", "title": "channel 怎么安全关闭？" },
+        { "id": "channel/select", "title": "select 是怎么工作的？" },
+        { "id": "golang/slice", "title": "Slice 底层是怎么实现的？" },
+        { "id": "golang/map", "title": "Map 底层是怎么实现的？" },
+        { "id": "golang/defer", "title": "Defer 是怎么实现的？" },
+        { "id": "golang/escape-analysis", "title": "逃逸分析：什么变量会逃到堆？" },
+        { "id": "golang/struct-alignment", "title": "struct 内存对齐 & 字段顺序优化" },
+        { "id": "golang/sync-mutex", "title": "sync.Mutex / RWMutex 原理" },
+        { "id": "golang/sync-waitgroup-once", "title": "sync.WaitGroup & sync.Once" },
+        { "id": "golang/sync-pool", "title": "sync.Pool 原理与适用场景" },
+        { "id": "golang/sync-map", "title": "sync.Map 实现与适用场景" },
+        { "id": "golang/atomic-cas", "title": "atomic & CAS" },
+        { "id": "golang/context", "title": "context 的设计与使用" },
+        { "id": "golang/timer", "title": "timer / ticker 底层实现" },
+        { "id": "golang/range-gotchas", "title": "range 的几个坑" },
+        { "id": "golang/reflect", "title": "反射 reflect 原理与代价" },
+        { "id": "golang/generics", "title": "Go 泛型（1.18+）" }
+      ]
+    },
+    {
+      "title": "Golang 高级",
+      "items": [
+        { "id": "golang/gpm-scheduler", "title": "Go语言的GPM调度器是什么?" },
+        { "id": "golang/gc", "title": "Golang的垃圾回收机制是如何工作的?" },
+        { "id": "golang/memory-leak", "title": "golang 内存泄漏怎么排查？" },
+        { "id": "golang/netpoller", "title": "netpoller 怎么把同步代码异步化？" },
+        { "id": "golang/syscall-handoff", "title": "syscall 阻塞时 P 怎么 hand-off？" },
+        { "id": "golang/memory-allocator", "title": "内存分配器 mcache / mcentral / mheap" },
+        { "id": "golang/stack-management", "title": "栈管理：分段栈 → 连续栈" },
+        { "id": "golang/pprof", "title": "pprof 实战：5 种 profile 各看什么" },
+        { "id": "golang/trace", "title": "trace 工具实战" },
+        { "id": "golang/unsafe-pointer", "title": "unsafe.Pointer 6 条规则" },
+        { "id": "golang/cgo", "title": "cgo 的开销与坑" }
+      ]
+    },
+    {
+      "title": "Redis 基础",
+      "items": [
+        { "id": "redis/data-structures", "title": "Redis 基础数据结构" },
+        { "id": "redis/internal-structures", "title": "Redis中的底层数据结构" },
+        { "id": "redis/persistence", "title": "Redis持久化的原理及优化" },
+        { "id": "redis/eviction", "title": "Redis中内存淘汰算法实现" },
+        { "id": "redis/replication", "title": "Redis主从复制原理" },
+        { "id": "redis/aof-rdb", "title": "AOF 和 RDB 是什么? AOF 持久化策略" },
+        { "id": "redis/threaded-io", "title": "Redis 6 里的 Threaded I/O 是想解决什么问题?" }
+      ]
+    },
+    {
+      "title": "MySQL 相关",
+      "items": [
+        { "id": "mysql/index", "title": "MySQL 索引原理" },
+        { "id": "mysql/transaction", "title": "事务与隔离级别" }
+      ]
+    }
+  ]
+}
+</script>
+
+<!-- ============ 文章内容（编辑这里）============ -->
+
+<script type="text/markdown" data-id="golang/gpm-scheduler">
+# Go语言的GPM调度器是什么?
+
+> 直接讲 G、M、P 容易让人迷失在术语里。换一个角度——**从"最朴素的方案"开始，每出现一个问题再引入一个机制**。走完这条演化路径，整个 GMP 就装进脑子里了。
+
+## 第 0 版：为什么不能"一个 goroutine 一个线程"？
+
+最朴素的想法：每个 goroutine 直接对应一个 OS 线程。
+
+**为什么不行**：
+
+- 线程栈默认 2MB，**10 万个 = 200GB 虚拟内存**
+- 创建 / 销毁线程要陷入内核，2~10μs 一次
+- 线程切换走内核 schedule，开销巨大
+
+→ 结论：必须做 **M:N 调度**——少量 OS 线程跑大量协程。
+
+由此引入两个抽象：
+
+- **G (Goroutine)**：用户态协程。栈起步 **2KB**（动态扩缩，最大 1GB），切换 ~100ns（只换寄存器，不进内核）。
+- **M (Machine)**：OS 线程，真正在 CPU 上执行的实体。
+
+10 万个 G 跑在 8 个 M 上 → 内存够用、切换够快。
+
+> **遗留问题**：M 怎么知道下一个该跑哪个 G？
+
+---
+
+## 第 1 版：Go 1.0 的 GM 模型——M:N 上了，但锁是瓶颈
+
+Go 1.0 最朴素的解法：**所有 G 放进一个全局队列**，M 来取。
+
+```
+   ┌────────────────────────────────────┐
+   │  全局队列  G G G G G G G G          │  ← 所有 M 共享
+   └────────────────────────────────────┘
+       ↑↑↑
+      M0 M1 M2 ...    每次取 G 都要抢 sched.lock
+```
+
+Dmitry Vyukov 在 2012 年的设计文档里列了它的**四宗罪**：
+
+1. **单点锁**：每次调度都抢同一把 `sched.lock`，多核扩展性差
+2. **缓存抖动**：G 在不同 M 之间频繁搬运，CPU 缓存命中率低
+3. **阻塞传染**：M 陷入系统调用时，新 G 没人跑（要等 M 返回或新建 M）
+4. **创建 / 销毁 M 太频繁**：阻塞场景下要不停 spawn 新 M
+
+10 核机器上，光锁竞争就能吃掉 30%+ CPU。
+
+> **遗留问题**：怎么去掉这把全局锁？
+
+---
+
+## 第 2 版：Go 1.1 加入 P——给每个 M 配一张"私人桌"
+
+2013 年 Vyukov 重写调度器，加入了第三个抽象：
+
+- **P (Processor)**：调度上下文（"逻辑 CPU"）。每个 P 持有一个**本地运行队列**：256 槽环形数组，head/tail 用原子操作管理，**完全无锁**。
+
+新规则：**M 必须先持有一个 P 才能执行 G**。
+
+```
+   ┌──────────┐   ┌──────────┐   ┌──────────┐
+   │    P0    │   │    P1    │   │    P2    │
+   │ local GG │   │ local GG │   │ local G  │   ← 每个 P 一个本地队列（无锁）
+   └────┬─────┘   └────┬─────┘   └────┬─────┘
+        M0             M1             M2
+```
+
+99% 的入队 / 出队走本地队列，无锁。**只有以下情况才碰 `sched.lock`**：
+
+- 本地队列满 256 → 溢出一半到全局
+- 本地队列空 → 从全局拿一批
+- 每跑 61 次调度强制查一次全局（防饿死）
+
+### 这一版有两个关键问题
+
+**问题一：为什么是引入 "P"，不直接给 M 加本地队列？**
+
+如果队列直接挂在 M 上：M 阻塞时队列也跟着冻结，没法转交给别人。把队列挂在独立的"调度位 P"上后，**M 阻塞 ≠ 队列阻塞**——这是后面 hand-off 机制的伏笔。
+
+> P 不是为了抽象 CPU，而是为了给"队列 + 调度状态"找一个**能转移**的载体。
+
+**问题二：为什么 P 数量 = `GOMAXPROCS` = CPU 核数？**
+
+- 多了没用：同一时刻最多 CPU 核数个线程能真正并行
+- 少了浪费：核没用满
+- 等于核数：每个核独占一个调度位，缓存友好，且天然限制了并行度
+
+`GOMAXPROCS` 是 Go 用来表达"想用几个核"的旋钮，运行时可改（Go 1.5+）。
+
+> **遗留问题**：某个 P 的本地队列空了，让 M 立刻睡？那不浪费核了吗？
+
+---
+
+## 第 3 版：work stealing——P 空了别立刻睡，去抢
+
+新规则：M 找下一个 G 时走 5 级查找路径（`runtime/proc.go` 的 `findrunnable`）：
+
+| 顺序 | 来源 | 特点 |
+|---|---|---|
+| 1 | **P.runnext** | 单槽 LIFO，缓存最热（channel ready 的 G 走这里） |
+| 2 | **P 本地队列** | 256 槽，无锁 |
+| 3 | **全局队列** | 拿 `sched.lock`；每跑 61 次强制查一次防饿死 |
+| 4 | **netpoller** | epoll/kqueue 就绪的网络 / 定时器 G |
+| 5 | **从其他 P 偷一半** | work stealing，最多 4 轮 |
+
+第 5 步的细节：**随机**选一个其他 P，偷它本地队列**一半**的 G（向上取整）。随机化避免所有空 P 同时扑向同一个 P 造成二次竞争。
+
+为避免频繁睡 / 醒 M（一次线程切换 2~10μs），runtime 还保留少量 **spinning M**：
+
+| 状态 | 含义 |
+|---|---|
+| 无 P 自旋 | M 在等空闲 P 释放 |
+| 有 P 自旋 | M 持有 P 但没活，正在 work-steal |
+
+自旋有 CPU 成本，但比线程切换便宜。runtime 限制自旋 M ≤ `GOMAXPROCS / 2`。
+
+> **遗留问题**：M 拿着 P 进了系统调用怎么办？P 上其他 G 跟着卡？
+
+---
+
+## 第 4 版：hand-off——syscall 阻塞了，把 P 借走
+
+某个 G 调用 `read()`，M 陷入内核阻塞 10 秒。如果 P 也跟着锁死在这个 M 上，本地队列里其他几百个 G 跟着卡 10 秒。
+
+GMP 的解法：**P 与阻塞的 M 解绑，挂到另一个 M 上继续跑剩下的 G**。
+
+```
+G 进入 syscall
+  ↓
+M 把 P 标为 _Psyscall（赌系统调用能很快返回）
+  ↓ sysmon 监控线程发现 P 处于 _Psyscall 超过 20μs
+强制把 P 摘下来 → 挂到另一个 M 上 → 继续跑队列里剩下的 G
+  ↓ 原 M 系统调用返回
+  ├─ 抢到一个 P：继续跑当前 G
+  └─ 抢不到：把 G 扔回全局队列，自己睡到 sched.midle
+```
+
+**前面"为什么队列要挂在 P 而不是 M"埋下的伏笔，在这一版收回了。**
+
+由此引入一个新角色：
+
+- **sysmon 监控线程**：不绑任何 P 的独立线程，专管"兜底监控"。除了触发 hand-off，还触发 GC、唤醒 netpoller。自身指数退避调度（20μs 起，最多 10ms）。
+
+> **遗留问题**：G 不调用 syscall，纯死循环呢？sysmon 也救不了？
+
+---
+
+## 第 5 版（Go 1.14）：异步抢占——死循环也得让出 P
+
+Go 1.14 之前是**协作式抢占**：抢占点埋在函数 prologue（栈增长检查处）。问题是：
+
+```go
+for {
+    // 没有函数调用，永远没到抢占点
+    // → Go 1.13- 整个 P 被这个 G 锁死
+}
+```
+
+Go 1.14 引入**基于信号的异步抢占**：
+
+1. sysmon 发现某个 G 跑超过 **10ms**
+2. 给对应 M 发 `SIGURG` 信号
+3. 信号处理函数注入抢占点 → G 强制让出 → 回到调度器
+
+**死循环也能被打断**——这是 Go 调度器从"半协作"走向"真抢占"的标志性改变。
+
+---
+
+## 全貌：把五版拼起来
+
+```
+        ┌──────────────────────────────────┐
+        │  全局队列 sched.runq (有锁)        │
+        └──────────────────────────────────┘
+                       ↑↓
+   ┌──────────┐   ┌──────────┐   ┌──────────┐
+   │    P0    │   │    P1    │   │    P2    │
+   │ runnext G│   │ runnext -│   │ runnext G│
+   │ local GG │   │ local GG │   │ local G  │
+   └────┬─────┘   └────┬─────┘   └────┬─────┘
+        M0             M1             M2
+                       ↑
+                 netpoller (epoll/kqueue 就绪 G)
+                       ↑
+                sysmon (10ms 抢占, 20μs hand-off)
+```
+
+每一层都是为了解决前一层的具体问题：
+
+| 抽象 / 机制 | 解决了什么 | 来自 |
+|---|---|---|
+| G、M（M:N 调度） | OS 线程太重 | 第 0 版 |
+| P + 本地队列 | GM 模型的全局锁瓶颈 | 第 1→2 版 |
+| work stealing | 引入 P 后某个 P 空了浪费核 | 第 2→3 版 |
+| spinning M | 频繁睡醒线程开销大 | 第 3 版 |
+| hand-off (P/M 解绑) | M 进 syscall 拖累其他 G | 第 3→4 版 |
+| sysmon | 需要后台监控触发 hand-off | 第 4 版 |
+| 异步抢占（SIGURG） | 死循环 G 霸占 P | 第 4→5 版 |
+
+## 五个数字必须记住
+
+| 数字 | 含义 |
+|---|---|
+| **2KB** | G 初始栈大小 |
+| **256** | P 本地队列容量 |
+| **61** | 每跑 61 次强制查一次全局队列（防饿死） |
+| **20μs** | sysmon 触发 hand-off 的阈值 |
+| **10ms** | sysmon 触发异步抢占的阈值 |
+
+## 一句话终极总结
+
+> **GMP = 把"调度位 P"从"OS 线程 M"里抽出来**——P 持有本地队列消除锁竞争，P 与 M 可解绑让阻塞不传染，sysmon 在后台兜底监控。
+</script>
+
+<script type="text/markdown" data-id="channel/internals">
+# Channel 是什么？底层怎么实现?
+
+> Channel 是 Go 并发的语言级原语。从演化视角看：每出现一个需求，hchan 就长出一个机制。
+
+## 为什么 Go 有 channel — CSP 模型
+
+Go 选了一条不同于"共享内存 + mutex"的路——**CSP（Communicating Sequential Processes）模型**：
+
+> Don't communicate by sharing memory; share memory by communicating.
+
+把数据"所有权"通过 channel 传递出去，每个时刻只有一个 goroutine 持有它。Channel 是 Go 实现 CSP 的载体。
+
+---
+
+## hchan 长这样
+
+`runtime/chan.go` 里的核心结构：
+
+```text
+┌─────────────────────────────────────────────────┐
+│  hchan  (一把锁保护下面所有字段)                  │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│   buf [ slot0 | slot1 | slot2 | ... ]   ← 环形  │
+│           ↑recvx        ↑sendx                  │
+│   qcount / dataqsiz                             │
+│                                                 │
+│   recvq  → G → G → G   (等接收的 goroutine)      │
+│   sendq  → G → G       (等发送的 goroutine)      │
+│                                                 │
+│   closed   uint32                               │
+│   lock     mutex                                │
+└─────────────────────────────────────────────────┘
+```
+
+记住三件套：**一把锁 + 一个环形缓冲 + 两条等待队列**。
+
+---
+
+## 第 1 版：无缓冲 channel — 必须双方碰头
+
+语义：`ch <- x` 和 `<-ch` 必须**同时就绪**，否则先到的一方挂起等候。
+
+> 📌 **下面图里的 G1、G2 共享同一个 channel**——也就是同一个堆上的 hchan。channel 变量本质是一个 `*hchan` 指针，谁持有 ch 谁就能操作那个 hchan，靠 hchan 内的 `lock` 串行化访问。
+
+### 场景 A：接收方先到
+
+```text
+G2 已挂在 recvq:
+    recvq: [ G2 ]   sendq: [ ]
+
+G1 来发送：
+    G1: ch <- x
+        │
+        ① 拿 lock
+        ② 看 recvq 有 G2
+        │
+        ╔═════════════════════════════════════╗
+        ║  ③ 数据从 G1 栈 ──直接拷贝──→ G2 栈 ║   ← 绕过 buf
+        ╚═════════════════════════════════════╝
+        │
+        ④ 唤醒 G2；G1 继续跑
+
+结果:
+    recvq: [ ]      sendq: [ ]   (清空)
+```
+
+> 这个"栈到栈直拷"是无缓冲 channel 的关键优化——比经过 buf 中转少一次拷贝。
+
+### 场景 B：发送方先到
+
+```text
+G1: ch <- x
+    │
+    ① 拿 lock
+    ② recvq 空 → 没人接
+    ③ 把 G1 包成 sudog 进 sendq，gopark 挂起
+
+    recvq: [ ]      sendq: [ G1(挂起,带着 x) ]
+
+       ⋯ 等接收方 ⋯
+
+G2: <- ch
+    │
+    ① 拿 lock
+    ② 看 sendq 有 G1
+    ③ 把 G1 携带的 x 直接拷给 G2，唤醒 G1
+
+    recvq: [ ]      sendq: [ ]
+```
+
+> **遗留问题**：必须同时到场太苛刻——能不能解耦时机？
+
+---
+
+## 第 2 版：有缓冲 channel — 环形队列解耦
+
+`make(chan int, 4)` 给 buf 分配 4 个 slot 的固定数组（不会扩容！）。怎么把"先进先出 + 不挪数据"做出来？答案就是**环形队列**：用两个下标在固定数组上转圈。
+
+### 三个关键字段
+
+| 字段 | 作用 | 类比 |
+|---|---|---|
+| `sendx` | 下一次写入要放到哪个 slot | 写指针：发送方在哪儿"下笔" |
+| `recvx` | 下一次读取要从哪个 slot 拿 | 读指针：接收方该读哪一格 |
+| `qcount` | 当前 buf 里实际有几个元素 | 现在队列里多少东西（决定是否满 / 空） |
+
+> **为什么不挪数据？** 写入只动 `sendx++`，读取只动 `recvx++`。slot 里的内容**原地不动**，从不搬家——这就是 O(1) 入队 O(1) 出队的关键。
+
+### "越界回 0" 怎么算
+
+数组只有 4 个 slot，但发送会一直进行——下标走到 4 时怎么办？
+
+```text
+sendx = (sendx + 1) % dataqsiz    // dataqsiz = 4
+```
+
+也就是说 `sendx` 在 0→1→2→3→0→1→... 永远在 [0, 4) 之间循环。`recvx` 同理。两个指针就这样在固定数组上**转圈追逐**，这就是"环形"。
+
+### 怎么判断满 / 空
+
+光看 sendx 和 recvx **分不清满和空**——它俩重合时可能 qcount=0（空）也可能 qcount=4（满）。所以多了一个 `qcount` 字段直接计数：
+- `qcount == 0` → 空（接收方要挂起）
+- `qcount == dataqsiz` → 满（发送方要挂起）
+
+### 写入演示（4 步动画）
+
+#### 第 0 步：刚 make 出来
+
+```text
+make(chan int, 4)
+─────────────────────────────────────────
+        slot0  slot1  slot2  slot3
+buf:    │     │     │     │     │
+        └─────┴─────┴─────┴─────┘
+        ↑sendx
+        ↑recvx           qcount=0   (空)
+```
+
+> 两个指针都指 slot0，qcount=0，没东西可读。
+
+#### 第 1 步：连发三个
+
+```text
+ch <- a;  ch <- b;  ch <- c
+─────────────────────────────────────────
+        slot0  slot1  slot2  slot3
+buf:    │  a  │  b  │  c  │     │
+        └─────┴─────┴─────┴─────┘
+        ↑recvx              ↑sendx
+                           qcount=3
+```
+
+> 每次 send：把值写到 `buf[sendx]`，然后 `sendx++` 和 `qcount++`。
+> a 进了 slot0、b 进 slot1、c 进 slot2。**recvx 没动**——还没人读。
+> 现在 sendx 指向 slot3（下次写这里），recvx 指向 slot0（下次读这里）。
+
+#### 第 2 步：取一个
+
+```text
+x := <-ch     // 取走 a，recvx 前进
+─────────────────────────────────────────
+        slot0  slot1  slot2  slot3
+buf:    │  ·  │  b  │  c  │     │
+        └─────┴─────┴─────┴─────┘
+              ↑recvx       ↑sendx
+                          qcount=2
+```
+
+> 接收方读 `buf[recvx]`（=a），然后 `recvx++` 和 `qcount--`。
+> slot0 那个 `·` 表示"逻辑上已无效"——但**真实内存没擦**，下次写到 slot0 时直接覆盖。
+> 这就是为什么我们说"FIFO"：先进的 a 先被读走。
+
+#### 第 3 步：再发两个，sendx 绕回去
+
+```text
+ch <- d; ch <- e  // sendx 越界回 0
+─────────────────────────────────────────
+        slot0  slot1  slot2  slot3
+buf:    │  e  │  b  │  c  │  d  │
+        └─────┴─────┴─────┴─────┘
+        ↑sendx ↑recvx
+                          qcount=4   (满)
+```
+
+> ch <- d：sendx=3，把 d 写到 slot3，然后 `sendx = (3+1) % 4 = 0`。指针绕回了。
+> ch <- e：sendx=0，把 e 写到 slot0（**直接覆盖那个 a 留下的"垃圾"**），然后 `sendx = 1`。
+> qcount=4，buf 满。**此时再来一个 send 就会进 sendq 挂起。**
+
+> **关键直觉**：sendx 永远指向"下一个要写的位置"（即使 buf 满，它也指着那个被读出去后空出来的格子）。recvx 永远指向"下一个要读的位置"。两个指针追逐前进，谁也不会越过谁——`qcount` 来卡这个边界。
+
+### 写入的三条优先级
+
+```text
+chansend(ch, x):
+  ① recvq 非空？─→ 直接拷给队首接收者，绕过 buf
+       │ 否
+  ② buf 未满？  ─→ 写到 buf[sendx], sendx++, qcount++
+       │ 否
+  ③ buf 满     ─→ 入 sendq, gopark 挂起
+```
+
+### buf 满时入队
+
+```text
+buf:  [ a │ b │ c │ d ]   ← 满
+sendq: [ G_send1 → G_send2 ]   ← 挂着等
+
+接收方 G_R 来了：
+  ① 从 buf[recvx] 取走 a
+  ② 让 sendq 头 G_send1 把它的值写到这个刚腾出的 slot
+     （保持 FIFO 顺序）
+  ③ 唤醒 G_send1
+```
+
+读取过程对称。
+
+> **遗留问题**：channel 不要了怎么收尾？
+
+---
+
+## 第 3 版：close — 一次广播两边
+
+```text
+                close(ch)
+                    │
+              closed = 1
+                    │
+        ┌───────────┴───────────┐
+        ↓                       ↓
+   recvq 全员唤醒          sendq 全员唤醒
+   (每个收到 零值, ok=false)    (每个直接 panic!)
+```
+
+### 后续操作的行为
+
+| 操作 | 已关闭 channel 的行为 |
+|---|---|
+| `<-ch`（buf 有数据） | 正常取出（缓冲数据保留） |
+| `<-ch`（buf 空） | 立刻返回零值 + ok=false |
+| `ch <- x` | **panic** |
+| `close(ch)` | **panic（重复关闭）** |
+| `for x := range ch` | buf 取完后**自动退出循环** |
+
+### 设计原则
+
+> **谁发送，谁关闭。** 接收方永远不该 close。多生产者场景需要额外协调（`sync.Once` 包 close，或反向 done channel 通知 producer 退出，最后由协调者 close）。
+
+> **遗留问题**：想同时等多个 channel 怎么办？
+
+---
+
+## 第 4 版：select — 多路监听
+
+```go
+select {
+case x := <-chA: ...
+case chB <- v:   ...
+case <-time.After(1 * time.Second): ...
+default: ...
+}
+```
+
+### 多路挂起示意
+
+```text
+   当前 G
+     │
+     │  分别挂上每个 channel 的等待队列
+     ├──→ chA.recvq:  [ ... → G ]
+     ├──→ chB.sendq:  [ ... → G ]
+     └──→ tmrCh.recvq:[ ... → G ]
+
+任一 channel 就绪：
+  唤醒 G → 从其他几个的队列上摘下来 → 走对应 case
+```
+
+### 核心流程（runtime.selectgo）
+
+```text
+1. 把所有 case 顺序打乱（避免某个 case 饿死别人）
+2. 第一轮：对每个 case 尝试非阻塞操作
+     成功 → 走它的分支
+3. 都不行 + 没 default
+     → 把当前 G 挂到所有相关队列上 (gopark)
+4. 任一 channel 就绪
+     → 唤醒 G，从其它队列摘下，走对应分支
+5. 都不行 + 有 default
+     → 立刻走 default（等于 select 完全非阻塞）
+```
+
+`time.After(1s)` 不是魔法，就是一个 1 秒后会被写入的 channel。
+
+---
+
+## 第 5 版：常见陷阱（背下来）
+
+### nil channel 的特殊行为
+
+```go
+var ch chan int  // nil
+<-ch             // 永远阻塞
+ch <- 1          // 永远阻塞
+close(ch)        // panic
+```
+
+**实战用法**：在 select 里把某个 case 的 channel 置 nil，**临时禁用这个分支**——常用于"消费完一个数据源后不再监听它"。
+
+```text
+select {                 select {
+case <-chA: ...          case <-chA: ...    ← chA 还能用
+case <-chB: ...    →     case <-nil: ...    ← chB 永久禁用本轮
+}                        }
+```
+
+### 多生产者关闭难题
+
+```go
+// ❌ 多个 producer 各自 close
+go func() { ...; close(ch) }()
+go func() { ...; close(ch) }()  // 第二个 close 直接 panic
+```
+
+解法：
+- `sync.Once` 包 close
+- 反向 done channel：协调者通知所有 producer 退出 → 等它们都退 → 协调者关 ch
+
+### range 自动收尾
+
+```go
+for x := range ch {
+    // close 后 buf 取完会自动退出，不用手动判 ok
+}
+```
+
+### len/cap 是瞬时值
+
+`len(ch)` / `cap(ch)` 是某一刻的快照；**多 goroutine 下不能用来判断"还有空间吗"**——读完那一行到下一行之间可能已被填满。
+
+---
+
+## 全貌一张表
+
+| 场景 | 路径 |
+|---|---|
+| send + recvq 非空 | 直接交付给队首接收者（绕过 buf） |
+| send + buf 未满 | 入 buf，不阻塞 |
+| send + buf 满 | 入 sendq，挂起 |
+| recv + sendq 非空（无缓冲） | 直接从发送者栈拿 |
+| recv + buf 非空 | 从 buf 取（满时同时让 sendq 头补位） |
+| recv + buf 空 + sendq 空 | 入 recvq，挂起 |
+| close | 唤醒所有 recvq（零值），唤醒所有 sendq（panic） |
+
+---
+
+## 实战选型：无缓冲 vs 有缓冲
+
+理解了内部机制后，回到应用视角——**无缓冲 = 握手，有缓冲 = 队列**。
+
+### 语义对比
+
+| 维度 | 无缓冲 | 有缓冲 (cap N) |
+|---|---|---|
+| 创建 | `make(chan T)` 或 `make(chan T, 0)` | `make(chan T, N)` |
+| 发送语义 | 必须等接收方就绪 | 缓冲未满即可发送 |
+| 接收语义 | 必须等发送方就绪 | 缓冲非空即可接收 |
+| 触发 goroutine 切换 | 几乎一定 | 缓冲未满 / 未空时不切换 |
+| 典型用途 | 同步信号、握手交付 | 解耦生产 / 消费速度差 |
+
+### 选哪种
+
+| 场景 | 选择 | 原因 |
+|---|---|---|
+| 启动信号 / 完成通知 | 无缓冲 | 必须确保对方收到了 |
+| 任务队列 / pipeline | 有缓冲 | 生产消费速度未必匹配，缓冲提升吞吐 |
+| 限流 / 信号量 | 有缓冲（cap = 并发数） | `ch <- struct{}{}` 占位，满了自然阻塞 |
+| 错误传递（多 goroutine） | 有缓冲（cap ≥ goroutine 数） | 防止报错的 goroutine 因没人收而泄漏 |
+
+### 一个常被忽略的陷阱
+
+**无缓冲 channel 只能保证"对方进入了 channel 操作"，不保证"对方处理完了"。**
+
+```go
+done := make(chan struct{})
+go func() {
+    doWork()
+    <-done       // ❌ 用 receive 当退出信号
+}()
+done <- struct{}{}  // 发送方只知道对方收到了信号，不知道 doWork 是否完成
+```
+
+要等"做完"，让 worker 在 `doWork` 之后再 send，或直接用 `sync.WaitGroup`。
+
+---
+
+## 一句话终极总结
+
+> **Channel = 一把锁 + 一个环形缓冲 + 两条等待队列**。hchan 用这三样东西，把"goroutine 间通信"做成了语言级一等公民。
+> 应用层一句话：**无缓冲 = 握手保证同步，有缓冲 = 队列吸收速度差。**
+</script>
+
+<script type="text/markdown" data-id="channel/close">
+# channel 怎么安全关闭？
+
+> 这题考的是 panic 防御 + 多生产者协作的设计能力。
+
+## 三条铁律
+
+1. **谁发送，谁关闭**——接收方关 channel 是反模式
+2. **不要重复关闭**——重复 close 直接 panic
+3. **关闭后不要再发送**——同样 panic
+
+`recover` 能兜住 panic，但 ad-hoc 用 recover 替代设计是糟糕的工程实践。下面看正确做法。
+
+## 场景 1：单生产者单消费者
+
+最简单。生产者完成时 close 即可，消费者 `for range` 自动收尾。
+
+```go
+ch := make(chan Task, 10)
+go func() {
+    defer close(ch)
+    for _, t := range tasks { ch <- t }
+}()
+for t := range ch { process(t) }
+```
+
+## 场景 2：多生产者单消费者
+
+不能让任何一个生产者直接 close（重复 close panic）。
+
+**方法 A：sync.Once**
+
+```go
+var once sync.Once
+closeCh := func() { once.Do(func() { close(ch) }) }
+```
+
+**方法 B：WaitGroup 协调（更推荐）**
+
+```go
+var wg sync.WaitGroup
+for _, p := range producers {
+    wg.Add(1)
+    go func(p Producer) {
+        defer wg.Done()
+        for _, t := range p.Tasks { ch <- t }
+    }(p)
+}
+go func() { wg.Wait(); close(ch) }()  // 协调者关闭
+```
+
+## 场景 3：多生产者 + 提前终止
+
+最复杂。需要一个**反向 done channel**告诉生产者停下：
+
+```go
+done := make(chan struct{})
+ch := make(chan Task, 10)
+
+// 生产者
+for _, p := range producers {
+    go func(p Producer) {
+        for _, t := range p.Tasks {
+            select {
+            case ch <- t:
+            case <-done:
+                return  // 收到停止信号，立即退出
+            }
+        }
+    }(p)
+}
+
+// 消费者发现错误时
+close(done)  // 通知所有生产者退出
+```
+
+ch 本身**不需要 close**——生产者退出后没人再发，消费者不会再收。
+
+## 检测 channel 是否已关闭
+
+```go
+v, ok := <-ch  // ok == false 表示已关闭且 buf 已空
+```
+
+注意：**没有 IsClosed() API**。这是有意为之——能"检测"就一定有 race（你检查时是开的，下一行就关了）。Go 的设计是让你**通过 receive 来观察 close 状态**。
+
+## 一句话终极总结
+
+> Channel close 不是"关掉资源"，而是"广播一个信号"——把它当 broadcast 而不是 cleanup 来理解，所有用法就都自洽了。
+</script>
+
+<script type="text/markdown" data-id="channel/select">
+# select 是怎么工作的？
+
+> select 看着像 switch 但底层完全不同。它是 channel 多路复用的核心，也是 Go 并发原语里最有意思的一块。
+
+## 表面语法
+
+```go
+select {
+case x := <-ch1: ...
+case ch2 <- v: ...
+case <-time.After(1 * time.Second): ...
+default: ...
+}
+```
+
+行为：
+
+- 任意一个 case 就绪 → 执行那个分支
+- 多个就绪 → **随机选一个**
+- 都没就绪 + 有 default → 走 default
+- 都没就绪 + 无 default → 阻塞直到某个就绪
+
+## 编译期到运行期
+
+编译器把每个 select 翻译成 `runtime.selectgo` 调用，传入：
+
+- 每个 case 的类型（send / recv / default）
+- 每个 case 对应的 channel 指针
+- 每个 case 的数据指针
+
+## selectgo 算法
+
+`runtime/select.go` 的核心流程：
+
+### 第一阶段：随机化 + 非阻塞扫描
+
+1. **生成随机 polling order**——避免某个 case 长期饿死
+2. 按这个顺序尝试每个 case 的非阻塞操作
+3. 任意一个成功 → 执行对应分支，结束
+
+### 第二阶段：挂起（如果第一阶段失败且无 default）
+
+1. 拿一个 **lock order**（按 channel 地址排序，避免死锁）
+2. 锁住所有相关 channel
+3. 把当前 goroutine 包装成 `sudog`，**挂到所有相关 channel 的 sendq/recvq 上**
+4. `gopark` 挂起当前 goroutine
+
+### 第三阶段：被唤醒
+
+1. 任意一个 channel 的对端来唤醒这个 goroutine
+2. 从其他几个 channel 的等待队列上**反向解链**自己
+3. 执行被唤醒的 case 分支
+
+## 几个关键设计
+
+### 为什么要随机化？
+
+如果按代码顺序选，多个 case 同时就绪时永远走第一个，**后面的 case 会饥饿**。随机化保证公平。
+
+### 为什么要按地址排序加锁？
+
+挂起阶段要同时锁多个 channel 的 mutex。如果两个 select 用同一组 channel 但加锁顺序不同，会死锁。**按地址排序保证全局唯一的加锁顺序**。
+
+### default 的实现
+
+存在 default → 第一阶段失败后**直接走 default 分支**，不进第二阶段。所以 `select { default: ... }` 是完全非阻塞的探测。
+
+### time.After 的开销
+
+`time.After(d)` 每次调用都**创建一个新 timer + channel**。在循环或高频 select 里反复调用会泄漏 timer（旧 timer 要等触发后才能 GC）。
+
+```go
+// ❌ 高频场景泄漏
+for {
+    select {
+    case <-time.After(1 * time.Second): ...
+    case <-quit: return
+    }
+}
+
+// ✓ 推荐：用 time.NewTimer 复用
+timer := time.NewTimer(1 * time.Second)
+defer timer.Stop()
+for {
+    select {
+    case <-timer.C: ...; timer.Reset(1 * time.Second)
+    case <-quit: return
+    }
+}
+```
+
+## 常见用法
+
+| 场景 | 写法 |
+|---|---|
+| 超时 | `case <-time.After(d):` |
+| 限时阻塞读 | `select { case x := <-ch: ; case <-ctx.Done(): }` |
+| 非阻塞读 | `select { case x := <-ch: ; default: }` |
+| 优雅退出 | 给 worker 一个 `done <-chan struct{}` |
+| 临时禁用 case | 把那个 channel 置为 nil（永远阻塞，select 永远不会选它） |
+
+## 一句话终极总结
+
+> select 是 channel 操作的"原子集合"——一次随机化扫描 + 一次多 channel 挂起，把"同时等多个 channel"做成了语言级原语。
+</script>
+
+<script type="text/markdown" data-id="golang/slice">
+# Slice 底层是怎么实现的？
+
+> Slice 是 Go 里最容易"看起来懂、用起来翻车"的类型。从结构、扩容、共享三个层面讲清楚。
+
+## 第 1 版：slice 长什么样
+
+slice 不是数组，是**指向底层数组的"视图"**。三个字段（`reflect.SliceHeader`）：
+
+```
+sliceHeader {
+    Data uintptr   // 底层数组起始地址
+    Len  int       // 当前元素数
+    Cap  int       // 底层数组从 Data 起的容量
+}
+```
+
+```
+[底层数组]  e0 e1 e2 e3 e4 e5 e6 e7 ...
+            ↑
+           Data
+                    Len=3 (e0..e2)
+                                Cap=8
+```
+
+`s := arr[1:4:6]` → Data 指向 `arr[1]`，Len=3，Cap=5。
+
+## 第 2 版：append 和扩容
+
+```go
+s := []int{1, 2, 3}  // len=3 cap=3
+s = append(s, 4)     // cap 不够 → 触发扩容
+```
+
+扩容规则（Go 1.18+ 的 `growslice`）：
+
+- 旧 cap < 256：新 cap = 旧 cap × 2
+- 旧 cap ≥ 256：新 cap ≈ 旧 cap × 1.25（非线性增长，平滑过渡）
+
+扩容做了什么：
+
+1. 申请新底层数组
+2. 把旧元素**拷贝**过去
+3. slice header 的 Data 指向新数组
+4. **旧数组如果没人引用就交给 GC**
+
+## 第 3 版：共享数组的陷阱
+
+slice 是引用语义。两个 slice 可能共享同一段内存：
+
+```go
+a := []int{1, 2, 3, 4}
+b := a[1:3]  // b 共享 a 的底层数组
+b[0] = 99    // a 也跟着变 → a = [1, 99, 3, 4]
+```
+
+**append 可能"分家"，也可能"不分家"**：
+
+```go
+a := make([]int, 3, 6)  // cap=6
+b := append(a, 1)       // cap 够，b 仍共享 a 的底层数组
+b[0] = 99               // a[0] 也变了！
+
+a := make([]int, 3, 3)  // cap 用完
+b := append(a, 1)       // 触发扩容，b 用新数组
+b[0] = 99               // a[0] 不变
+```
+
+这是 slice 最坑的地方。**任何 append 之后都不应该假设和原 slice 共享数组**——要么完全分家（`copy`），要么把结果赋回同一变量（`s = append(s, ...)`）。
+
+## 第 4 版：常见陷阱
+
+### 陷阱 1：截取后大数组无法被 GC
+
+```go
+data := readBigFile()  // 100MB
+header := data[:32]    // 只想要前 32 字节
+return header
+// 但 data[32:] 不能被 GC，因为 header 还引用着底层数组
+```
+
+解法：**深拷贝**。
+
+```go
+header := make([]byte, 32)
+copy(header, data[:32])
+data = nil  // 现在大数组可被 GC
+```
+
+### 陷阱 2：传 slice 给函数会"修改"
+
+slice 按值传递，但**header 里的 Data 指针指向同一段内存**。函数内对元素的修改会影响外面。append 才可能分家。
+
+### 陷阱 3：nil slice vs 空 slice
+
+```go
+var a []int      // nil slice，Data=nil
+b := []int{}     // 空 slice，Data 非 nil
+a == nil  // true
+b == nil  // false
+len(a)    // 0
+len(b)    // 0
+```
+
+序列化时（如 JSON）两者表现不同：nil → `null`，空 slice → `[]`。
+
+## 一句话总结
+
+> Slice = (Data, Len, Cap)。**它不是值，是个视图**——多人持有同一底层数组时 append 可能分家可能不分家，这是所有诡异行为的源头。
+</script>
+
+<script type="text/markdown" data-id="golang/map">
+# Map 底层是怎么实现的？
+
+## 一、整体结构总览
+
+Go 的 map 在运行时是两个核心结构体：**`hmap`**（map 的头）和 **`bmap`**（bucket，桶）。
+
+```
+                    ┌─────────────────────────────────┐
+   map 变量 m  ───→  │           hmap (头部)            │
+                    │  count     = 元素总数            │
+                    │  flags     = 状态位 (写标志等)   │
+                    │  B         = 2^B 个 bucket       │
+                    │  noverflow = overflow bucket 数  │
+                    │  hash0     = 哈希种子 (防碰撞攻击)│
+                    │  buckets   ──┐                   │
+                    │  oldbuckets──┼─→ 扩容时用         │
+                    │  nevacuate   │                   │
+                    │  extra       │                   │
+                    └──────────────┼──────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │      buckets 数组 (2^B 个)       │
+                    │  ┌──────┬──────┬──────┬──────┐  │
+                    │  │bmap 0│bmap 1│bmap 2│ ...  │  │
+                    │  └──────┴──────┴──────┴──────┘  │
+                    └─────────────────────────────────┘
+```
+
+**关键字段**：
+- `B`：决定 bucket 数组大小，len(buckets) = 2 的 B 次方(2^B)。例如 B=4 就是 16 个 bucket
+- `hash0`：随机哈希种子，每个 map 创建时随机生成，**防止哈希碰撞 DoS 攻击**
+- `oldbuckets`：扩容期间指向旧数组，平时是 `nil`
+
+---
+
+## 二、bucket（bmap）内部结构
+
+每个 bucket **固定装 8 个 key-value 对**。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    bmap (一个 bucket)                │
+├─────────────────────────────────────────────────────┤
+│  tophash [8]uint8   ← 8 个 key 哈希的高 8 位         │
+│  ┌──┬──┬──┬──┬──┬──┬──┬──┐                          │
+│  │h0│h1│h2│h3│h4│h5│h6│h7│   (8 字节,正好一个 word)  │
+│  └──┴──┴──┴──┴──┴──┴──┴──┘                          │
+├─────────────────────────────────────────────────────┤
+│  keys   [8]KeyType  ← 8 个 key 连续存放              │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┐          │
+│  │ k0 │ k1 │ k2 │ k3 │ k4 │ k5 │ k6 │ k7 │          │
+│  └────┴────┴────┴────┴────┴────┴────┴────┘          │
+├─────────────────────────────────────────────────────┤
+│  values [8]ValueType ← 8 个 value 连续存放           │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┐          │
+│  │ v0 │ v1 │ v2 │ v3 │ v4 │ v5 │ v6 │ v7 │          │
+│  └────┴────┴────┴────┴────┴────┴────┴────┘          │
+├─────────────────────────────────────────────────────┤
+│  overflow *bmap     ← 满了就挂下一个 bucket          │
+└─────────────────────────────────────────────────────┘
+```
+
+### 为什么 key 和 value 分开存？
+
+如果 key 和 value 交叉放（`k0,v0,k1,v1,...`），不同类型间会有**对齐 padding**：
+
+```
+按 K/V 交错（差）：              按 K 全部、V 全部（好）：
+┌────┬──────┬────┬──────┐      ┌────┬────┬──────┬──────┐
+│ k:1│ pad7 │ v:8│ ...  │      │ k:1│ k:1│ v:8  │ v:8  │
+└────┴──────┴────┴──────┘      └────┴────┴──────┴──────┘
+浪费很多 padding                key 紧凑、value 紧凑
+```
+
+例如 `map[int8]int64`：交叉存每对要浪费 7 字节对齐 padding；分开存只在两段之间对齐一次。
+
+### tophash 是什么？
+
+`tophash[i]` 存 `keys[i]` 哈希值的**高 8 位**。它有两个作用：
+
+1. **快速过滤**：查找时先比 1 字节的 tophash，不匹配直接跳过，匹配了才比完整 key
+2. **槽位状态标记**：低位的几个特殊值表示槽位状态
+
+```
+tophash 值的含义：
+  0 (emptyRest)     此槽位空,且后面所有槽位都空 → 查找可提前终止
+  1 (emptyOne)      此槽位空,但后面可能还有
+  2 (evacuatedX)    扩容已搬走到新数组前半部分
+  3 (evacuatedY)    扩容已搬走到新数组后半部分
+  4 (evacuatedEmpty) 扩容时发现是空的
+  5 (minTopHash)    真实 tophash 的最小值
+  5~255             真实哈希高 8 位 (< 5 的会被加上 minTopHash)
+```
+
+一个字段同时表达"哈希高位 + 槽位状态"，**省内存**。
+
+---
+
+## 三、写入流程：m[k] = v
+
+```
+                      key
+                       │
+                       ▼
+              ┌────────────────┐
+              │  hash(key, h0) │   ← 用随机种子算哈希
+              └────────┬───────┘
+                       │   64 位 hash
+                       ▼
+        ┌──────────────────────────────┐
+        │ 高 8 位 (tophash)            │
+        │ ┌────────┐                   │
+        │ │  h_top │                   │
+        │ └────────┘                   │
+        │                              │
+        │ 低 B 位 (bucket 索引)        │
+        │ ┌────────────────┐           │
+        │ │ idx = h & 2^B-1│           │
+        │ └────────────────┘           │
+        └──────────────────────────────┘
+                       │
+                       ▼
+              定位到 buckets[idx]
+                       │
+                       ▼
+        ┌──────────────────────────────────┐
+        │ 遍历这个 bucket 的 8 个槽位：     │
+        │  for i = 0..7:                   │
+        │    if tophash[i] == h_top:       │
+        │      if keys[i] == key:          │
+        │        覆盖 values[i] ✓          │
+        │    if tophash[i] == emptyOne:    │
+        │      记下这个空位                 │
+        │                                  │
+        │ 如果有 overflow,继续遍历          │
+        └──────────────────────────────────┘
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+        找到匹配 key       没找到,用空位
+        覆盖 value         写入新 key-value
+                                │
+                          全都满了？
+                                │
+                                ▼
+                       分配 overflow bucket
+                       挂到链尾
+```
+
+### 触发扩容的判断
+
+写入后会检查是否要扩容：
+
+```
+扩容条件 (满足任一即可)：
+  ① 装载因子过高:  count / (2^B) > 6.5    → 翻倍扩容 (B+1)
+  ② overflow 太多:  noverflow ≥ 2^B         → 等量扩容 (B 不变)
+```
+
+- **翻倍扩容**：元素真的多了，bucket 数组扩到 2 倍
+- **等量扩容**：元素不多但 overflow 链很长（频繁插入删除导致碎片），重新整理但不增容
+
+---
+
+## 四、查找流程：v := m[k]
+
+查找比写入简单一点，但要注意**扩容期间要查新旧两边**。
+
+```
+                key
+                 │
+                 ▼
+         hash(key, h0)  → idx (低 B 位), h_top (高 8 位)
+                 │
+                 ▼
+    ┌────────────────────────────┐
+    │  oldbuckets != nil ?       │
+    └────────────┬───────────────┘
+                 │
+        ┌────────┴────────┐
+        │ 在扩容          │ 没扩容
+        ▼                 ▼
+  先查 oldbuckets    直接查 buckets[idx]
+  (如果还没搬走)
+        │
+        ▼
+  没找到再查 buckets[idx]
+        │
+        ▼
+  ┌──────────────────────────────────────┐
+  │ 在 bucket 链上遍历每个 bucket:        │
+  │   for i = 0..7:                      │
+  │     if tophash[i] != h_top: continue │  ← 快速过滤
+  │     if keys[i] == key:               │
+  │       return values[i] ✓             │
+  │                                      │
+  │   bucket = bucket.overflow           │
+  │   (继续下一个)                        │
+  └──────────────────────────────────────┘
+                 │
+                 ▼
+          找不到 → 返回零值
+```
+
+**关键优化**：`tophash[i] != h_top` 时根本不用读 key（key 可能是大结构体），直接跳过。
+
+---
+
+## 五、扩容：渐进式搬迁
+
+这是 Go map 最精妙的设计。
+
+### Step 1：触发扩容
+
+```
+扩容前：
+  hmap:
+    B = 3            (8 个 bucket)
+    buckets    ─→ [b0][b1][b2][b3][b4][b5][b6][b7]
+    oldbuckets = nil
+
+  触发翻倍扩容！
+```
+
+### Step 2：分配新数组，旧数组挂到 oldbuckets
+
+```
+扩容后立刻：
+  hmap:
+    B = 4            (16 个 bucket,但还没搬)
+    buckets    ─→ [n0][n1][n2][n3]...[n15]   ← 新数组,全空
+    oldbuckets ─→ [b0][b1][b2][b3][b4][b5][b6][b7]  ← 旧数组,数据还在
+    nevacuate  = 0   ← 还没搬过任何一个旧 bucket
+```
+
+**注意**：这一步**不搬任何数据**，只是分配空间。
+
+### Step 3：每次写操作顺手搬 1~2 个旧 bucket
+
+```
+比如下次写入触发 evacuate(oldbuckets[0])：
+
+  旧 bucket b0 的 8 个 key 会按新的哈希位重新分配:
+  ┌──────────────────────────────┐
+  │  对每个 key 看 hash 的新高位:│
+  │   = 0 → 搬到新数组的 n0      │   (称为 X 部分)
+  │   = 1 → 搬到新数组的 n8      │   (称为 Y 部分)
+  │                              │
+  │  搬完后 b0 的 tophash 全部置 │
+  │  为 evacuatedX/Y/Empty       │
+  └──────────────────────────────┘
+
+  ┌─────────┐                ┌─────────┐
+  │ old b0  │ ──split──→     │ new n0  │
+  │ 8 keys  │                │ (X 部分)│
+  └─────────┘                └─────────┘
+                              │ new n8  │
+                              │ (Y 部分)│
+                              └─────────┘
+```
+
+为什么是 `n0` 和 `n8`？因为 B 从 3 变 4，新的低 4 位 = 旧的低 3 位 + 新增的那 1 位。多出的那一位 = 0 就还在原位（X），= 1 就到 +2^旧B 的位置（Y）。
+
+### Step 4：全部搬完后释放旧数组
+
+```
+当 nevacuate == 2^旧B 时，全部搬完：
+
+  hmap:
+    B = 4
+    buckets    ─→ [n0]...[n15]
+    oldbuckets = nil    ← 释放掉
+    nevacuate  = 0
+```
+
+### 扩容期间的查找
+
+```
+查找 key:
+  1. 算 idx (按新的 B,16 个 bucket)
+  2. 看 oldbuckets[idx % 旧B] 是否已搬走 (看 tophash 是否是 evacuatedX/Y)
+  3. 没搬走 → 查旧的
+     已搬走 → 查 buckets[idx]
+```
+
+所以**扩容期间查找略慢**（要判断状态），但**没有一次性大停顿**。
+
+---
+
+## 六、并发安全：写检测 panic
+
+```
+hmap.flags 里的位:
+  hashWriting   ← 正在写
+  iterator      ← 正在迭代旧 buckets
+  oldIterator   ← 正在迭代新 buckets
+  sameSizeGrow  ← 等量扩容
+
+写操作:
+  if flags & hashWriting != 0:
+      panic("concurrent map writes")  ← 直接挂
+
+  flags |= hashWriting
+  ... 执行写入 ...
+  flags &^= hashWriting
+```
+
+**注意**：
+- **只检测并发写**，不检测并发读写（读写也会出问题但不一定 panic）
+- 检测**不保证 100% 抓到**（不是用 mutex，只是状态位）；但常见的并发写场景大概率抓到
+- 这是**主动 panic 而非崩溃**，比 C++ 的 UB 强得多
+
+并发场景应使用：
+- `sync.RWMutex` 包一下
+- `sync.Map`（适合读多写少、key 集合相对稳定的场景）
+
+---
+
+## 七、链地址法 vs 开放寻址
+
+```
+开放寻址 (Python dict 等)：
+  buckets: [k0][k1][k2][__][k3][__][__][k4]
+  冲突时往后探测找空位
+
+  优点：内存连续,cache 友好
+  缺点：扩容必须一次性,删除要做墓碑标记
+
+
+链地址法 (Go map)：
+  buckets[0] ─→ [bmap 8 槽] ─→ [overflow 8 槽] ─→ ...
+  buckets[1] ─→ [bmap 8 槽]
+  buckets[2] ─→ [bmap 8 槽] ─→ [overflow 8 槽]
+
+  优点：扩容可渐进,删除直接清掉
+  缺点：overflow 链多了 cache 不友好 → 用等量扩容整理碎片
+```
+
+Go 选链地址法，因为它要支持**渐进式扩容**——开放寻址几乎做不到渐进。
+
+---
+
+## 八、内存模型小例子
+
+`map[string]int`，B=2（4 个 bucket）：
+
+```
+   m ──→ hmap
+            count = 5
+            B = 2
+            hash0 = 0x3a7c9f2e
+            buckets ─┐
+                     │
+                     ▼
+      ┌──────────────────────────────────────────┐
+      │ buckets[0]:                              │
+      │   tophash: [42,17, 0, 0, 0, 0, 0, 0]     │
+      │   keys:    ["apple","kiwi","","","",..]  │
+      │   values:  [1, 4, 0, 0, 0, 0, 0, 0]      │
+      │   overflow: nil                          │
+      ├──────────────────────────────────────────┤
+      │ buckets[1]:                              │
+      │   tophash: [99, 0, 0, 0, 0, 0, 0, 0]     │
+      │   keys:    ["pear","","","","","","",""] │
+      │   values:  [2, 0, 0, 0, 0, 0, 0, 0]      │
+      │   overflow: nil                          │
+      ├──────────────────────────────────────────┤
+      │ buckets[2]:                              │
+      │   ...(空)                                │
+      ├──────────────────────────────────────────┤
+      │ buckets[3]:                              │
+      │   tophash: [55, 88, 0, 0, 0, 0, 0, 0]    │
+      │   keys:    ["mango","grape","","",..]    │
+      │   values:  [3, 5, 0, 0, 0, 0, 0, 0]      │
+      │   overflow: nil                          │
+      └──────────────────────────────────────────┘
+```
+
+查 `m["kiwi"]`：
+1. `hash("kiwi", 0x3a7c9f2e)` 假设结果低 2 位 = `00`，高 8 位 = `17`
+2. 定位到 `buckets[0]`
+3. tophash 数组里找 `17` → 在第 1 槽
+4. 比较 `keys[1] == "kiwi"` ✓
+5. 返回 `values[1] = 4`
+
+---
+
+## 九、能从这些机制推出的性能特性
+
+| 特性 | 推导 |
+|---|---|
+| **迭代顺序随机** | 每次迭代起始 bucket 和槽位随机化（防止依赖顺序的 bug） |
+| **小 map 极快** | 元素 ≤ 8 时只有 1 个 bucket，几乎不算哈希 |
+| **查找 O(1) 摊销** | 单 bucket 8 槽 + tophash 过滤 + 链短 |
+| **删除不缩容** | 缩容要触发新一轮渐进搬迁，得不偿失 |
+| **写慢于读** | 写要算 hash + 找槽 + 可能搬迁 + 设标志位 |
+| **不能取地址 `&m[k]`** | 扩容时元素会被搬到新内存，地址会失效 |
+| **key 必须可哈希** | 链地址法本质就是哈希表，slice/map/func 不能当 key |
+| **大 map 删空后内存不释放** | bucket 数组还在，要 `m = nil` 或新建 map |
+| **并发写 panic** | `hashWriting` 标志位检测，主动 fail-fast |
+
+---
+
+## 十、一图总结
+
+```
+                    ┌──────────────────────────┐
+                    │       Go Map 全景图       │
+                    └──────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+    数据结构              扩容策略              并发模型
+    链地址法             渐进搬迁              写检测 panic
+        │                     │                     │
+        ▼                     ▼                     ▼
+   ┌─────────┐         ┌──────────┐          ┌──────────┐
+   │ hmap    │         │翻倍扩容  │          │hashWriting│
+   │ bmap    │         │等量扩容  │          │标志位    │
+   │ bucket  │         │evacuate  │          │           │
+   │  8 槽   │         │oldbuckets│          │fail-fast │
+   │ tophash │         │X/Y split │          │用 sync.Map│
+   │ overflow│         │          │          │或 mutex  │
+   └─────────┘         └──────────┘          └──────────┘
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              ▼
+                     抓住三大机制:
+                ① bucket 8 槽 (内存布局)
+                ② tophash 快速过滤 (查找性能)
+                ③ 渐进搬迁 (扩容平滑)
+
+                所有 map 行为都能自洽推出
+```
+
+**一句话总结**：Go map = 一个**链地址法哈希表**，用**渐进式搬迁**避免扩容停顿，用**写检测标志位**在并发写时主动 panic；理解 bucket 8 槽 + tophash + 渐进搬迁这三个机制，map 的迭代随机、查找快、不缩容、扩容不卡顿、并发写挂掉等一切特性就都顺理成章了。
+</script>
+
+<script type="text/markdown" data-id="golang/defer">
+# Defer 是怎么实现的？
+
+## 表面行为
+
+```go
+func f() {
+    defer fmt.Println("1")
+    defer fmt.Println("2")
+    defer fmt.Println("3")
+}
+// 输出：3 2 1（LIFO）
+```
+
+## 三版实现演化
+
+### 第 1 版：堆分配 + 链表（Go 1.13 前）
+
+每个 defer 语句运行时：
+
+1. 在堆上分配一个 `_defer` 结构
+2. 链到当前 g 的 `g._defer` 链表头
+3. 函数返回前，runtime 遍历链表，逐个调用，逐个释放
+
+**开销大**：堆分配 + 链表操作 + 间接调用。Go 1.13 之前 defer 比直接调用慢 5-10 倍。
+
+### 第 2 版：栈分配（Go 1.13）
+
+把 `_defer` 结构分配在栈上。少了堆分配，性能提升 ~30%。但仍要进 runtime 走链表。
+
+### 第 3 版：开放编码 (open-coded defer, Go 1.14)
+
+编译器在编译期把 defer **直接展开成函数返回前的普通调用**：
+
+```go
+// 原代码
+func f() {
+    defer cleanup()
+    doWork()
+}
+
+// 编译后大致
+func f() {
+    deferBits := 0
+    deferBits |= 1
+    doWork()
+    if deferBits & 1 != 0 { cleanup() }
+}
+```
+
+**条件**：
+
+- 函数内 defer 数量 ≤ 8
+- defer **不在循环里**
+- 没用到需要 g._defer 链表的特性（如某些 recover 场景）
+
+满足条件时，defer 几乎零开销，和直接调用一样快。
+
+## 几个关键问题
+
+### 参数何时求值？
+
+```go
+i := 0
+defer fmt.Println(i)  // 立即求值，记录 i=0
+i = 1
+// 输出：0
+```
+
+**defer 的参数在 defer 语句执行时求值**，不是函数调用时。
+
+### closure 捕获变量
+
+```go
+i := 0
+defer func() { fmt.Println(i) }()  // 捕获 i 的引用
+i = 1
+// 输出：1
+```
+
+defer 一个闭包时，闭包内引用的变量按引用捕获——和普通闭包一样。
+
+### defer 修改返回值
+
+```go
+func f() (result int) {
+    defer func() { result++ }()
+    return 1
+}
+// 返回 2
+```
+
+`return 1` 实际是"把 1 赋给 result，再执行 defer"。defer 在 return 后、真正返回前运行，**能修改命名返回值**。
+
+### defer 与 panic / recover
+
+```go
+func f() {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Println("recovered:", r)
+        }
+    }()
+    panic("oops")
+}
+```
+
+`recover` 只在 deferred 函数里有效。普通调用 recover 返回 nil。
+
+## 性能对比（Go 1.14+）
+
+| 写法 | 相对开销 |
+|---|---|
+| 直接 cleanup() | 1× |
+| open-coded defer | ~1.0-1.1× |
+| 栈分配 defer（不满足开放编码条件） | ~2× |
+| 堆分配 defer（循环里 defer） | ~5-10× |
+
+**实战建议**：
+
+- 一般用法直接写 defer 就好（Go 1.14+ 几乎零开销）
+- **不要在循环里 defer**——每次循环都加一条到链表，函数结束才执行。改用显式调用或把循环体抽成单独函数
+
+## 一句话总结
+
+> Defer 的语义是 LIFO + 参数立即求值 + 能改命名返回值。**Go 1.14+ 开放编码把开销做到了几乎 0**，但循环里 defer 仍会回退到堆分配，是常见的性能坑。
+</script>
+
+<script type="text/markdown" data-id="golang/interface">
+# Interface 底层是怎么实现的？
+
+## 两种 interface 内部表示
+
+Go 的 interface 在底层有两种结构：
+
+### iface — 带方法的 interface
+
+```
+iface {
+    tab  *itab            // 类型 + 方法表
+    data unsafe.Pointer   // 实际数据指针
+}
+
+itab {
+    inter *interfacetype  // 接口类型描述
+    _type *_type          // 实际类型描述
+    hash  uint32          // 类型 hash（type switch 用）
+    fun   [N]uintptr      // 方法表 — 指向具体方法实现的函数指针
+}
+```
+
+### eface — 空 interface (`interface{}` / `any`)
+
+```
+eface {
+    _type *_type           // 类型描述
+    data  unsafe.Pointer   // 实际数据指针
+}
+```
+
+没有方法表，因为没方法可调。
+
+## 类型断言怎么工作
+
+```go
+var i io.Reader = file
+f, ok := i.(*os.File)
+```
+
+底层做的事：
+
+1. 取 `i.tab._type`（实际类型）
+2. 和 `*os.File` 的 _type 比较
+3. 相等 → ok=true，data 转成 `*os.File`
+4. 不等 → ok=false，f 是零值
+
+## 类型 switch 怎么工作
+
+```go
+switch v := i.(type) {
+case int: ...
+case string: ...
+}
+```
+
+编译器生成的代码会：
+
+1. 取 `i.tab.hash`
+2. 用 hash 在每个 case 类型的 hash 表里快速过滤
+3. 命中后再做完整的类型比较
+
+## interface == nil 的陷阱
+
+**Go 最经典的坑：**
+
+```go
+func mayFail() error {
+    var p *MyErr  // p 是 nil
+    return p
+}
+
+err := mayFail()
+err == nil  // false！但很多人以为是 true
+```
+
+`err` 是 iface（{tab, data}）。**只有 tab=nil 且 data=nil 才等于 nil**。这里 tab 指向 `*MyErr` 的 itab（非 nil），所以 err != nil。
+
+正确写法：
+
+```go
+func mayFail() error {
+    var p *MyErr
+    if cond { p = &MyErr{} }
+    if p == nil {
+        return nil  // 显式返回 nil interface
+    }
+    return p
+}
+```
+
+这个坑出现在"返回值是 error 接口、内部用具体指针"的场景。
+
+## 接口方法调用的开销
+
+```go
+var r io.Reader = file
+r.Read(buf)  // 走 itab.fun 间接跳转
+```
+
+vs 直接调用 `file.Read(buf)`：
+
+- 间接跳转 1 次（`itab.fun[i]`）
+- 不能 inline
+- 可能 cache miss
+
+性能敏感路径上，interface 调用比直接调用慢 2-3×。但优化前先 profile，大多数代码不会受影响。
+
+## 嵌入接口
+
+```go
+type ReadWriter interface {
+    io.Reader
+    io.Writer
+}
+```
+
+`itab.fun` 会拼出所有方法。匿名嵌入实际上是把方法集合并进去。
+
+## 一句话总结
+
+> iface = (itab, data)，itab 包含方法表；eface = (type, data) 空接口没有方法表。**interface == nil 只在 type 和 data 都为 nil 时成立**——是 Go 最常见的"我以为是 nil 但不是"的坑。
+</script>
+
+<script type="text/markdown" data-id="golang/gc">
+# Go 的 GC 是怎么工作的？
+
+> Go 用的是**并发三色标记 + 混合写屏障 + 非分代非压缩**的 mark-sweep GC。下面用演化路径讲清楚每一块为什么这样选。
+
+## 第 0 版：为什么不能 stop-the-world？
+
+最朴素的 GC：暂停整个程序，找出所有不可达对象，清理。
+
+**问题**：百毫秒级 STW 对在线服务不可接受。Go 的目标是**毫秒级 STW**，必须做并发 GC。
+
+## 第 1 版：三色标记法
+
+把对象分三种颜色：
+
+- **白**：未访问（候选回收对象）
+- **灰**：已访问但子对象还没访问完
+- **黑**：自己和所有子对象都访问完
+
+算法：
+
+```
+1. 所有对象初始为白
+2. 从 root（栈、全局变量）出发，标灰
+3. 反复：从灰集合取一个 → 标黑 → 它指向的所有白对象标灰
+4. 灰集合空 → 剩下的白对象就是垃圾
+```
+
+**并发标记**：标记过程中用户 goroutine 可以继续跑，只在开始/结束需要短暂 STW。
+
+## 第 2 版：写屏障 — 解决并发标记的"对象漏标"
+
+并发标记的根本问题：
+
+```
+GC 标记线程：扫到 A，A 是黑色
+用户线程：A.x = newPtr      // newPtr 是白色
+          删掉所有指向 newPtr 的旧引用
+GC 完成 → newPtr 还是白色 → 被错误回收
+```
+
+**解法**：写屏障——指针赋值时让 runtime 拦截一下。
+
+Go 1.8+ 用的是 **混合写屏障（hybrid write barrier）**：
+
+- 创建对象时直接标黑（不标白）
+- 写入指针时，**新值和旧值都标灰**
+
+这样保证：黑对象一旦持有指向白对象的指针，那个白对象就会被标灰，**永远不会漏**。
+
+## 第 3 版：辅助 GC + Pacing — 让 GC 跟上分配速度
+
+**问题**：用户线程分配速度很快，GC 跟不上 → 堆爆掉。
+
+**辅助 GC（mutator assist）**：分配内存的 goroutine 会被强制"协助"做一点 GC 工作，配额按分配量决定。"想分配就得帮忙打扫"。
+
+**GC Pacer**：runtime 根据上一次 GC 的数据估算下一次启动时机，让堆增长保持在 `GOGC` 指定的比例（默认 100% = 堆翻倍触发）。
+
+## 第 4 版：标记终止 + 清扫
+
+标记完后：
+
+1. **STW（< 1ms）**：进入 Mark Termination，最终扫描栈
+2. **并发清扫（sweep）**：把白对象的内存回收到 mcache / mcentral / mheap 三级分配器
+
+清扫也是并发的——清扫和分配同时进行，按需 lazy sweep。
+
+## 第 5 版：为什么不分代？
+
+JVM、V8 都是**分代 GC**（年轻代/老年代），Go 不是。
+
+理由：
+
+- Go 大量使用**栈分配**（逃逸分析），短命对象很多在栈上就回收了，不进堆
+- Go 没有 generational hypothesis 那么强的依赖
+- 分代实现复杂，内存碎片管理难
+- Go 团队选了"简单 + 可预测延迟"路线
+
+代价：吞吐稍逊于分代 GC，但 Go 优先保证延迟。
+
+## 关键参数
+
+| 参数 | 含义 |
+|---|---|
+| `GOGC` | 触发下一次 GC 的堆增长比例。默认 100%，调到 200% 减少 GC 频率（但内存占用 ~1.5×）|
+| `GOMEMLIMIT` (Go 1.19+) | 软内存上限，超过会强制 GC |
+| `runtime.GC()` | 手动触发 GC（测试用，生产不要用） |
+
+## STW 在哪里？
+
+Go GC 不是"完全无 STW"，而是把 STW 做到极短。**有两次 STW**：
+
+1. **GC start (sweep termination → mark setup)**：~10μs
+2. **mark termination**：微秒到亚毫秒
+
+合计每次 GC 通常 < 1ms。生产服务大部分能接受。
+
+## 一句话总结
+
+> Go GC = 并发三色标记 + 混合写屏障 + 辅助 GC + 并发清扫。**牺牲一点吞吐换可预测的低延迟**，用栈分配 + 逃逸分析弥补"非分代"的劣势。
+</script>
+
+<script type="text/markdown" data-id="golang/memory-leak">
+# Go 内存泄漏怎么排查？
+
+> Go 有 GC，但仍然会泄漏——不是"忘记 free"，而是"对象被某条引用链持着不放"。
+
+## 常见泄漏来源（90% 都在这里）
+
+### 1. goroutine 泄漏（最常见）
+
+一个永远不退出的 goroutine = 它持有的所有变量永远不能 GC。
+
+```go
+ch := make(chan int)  // 无缓冲 + 无人读
+go func() {
+    ch <- 1  // 永远阻塞，goroutine 永久存活
+}()
+```
+
+典型场景：
+
+- 没设超时的 channel 读 / 写
+- HTTP 请求没设 timeout
+- worker goroutine 在 select 里等的 channel 永远不会被 close
+- pprof 看 goroutine 数持续上涨
+
+### 2. time.After / time.Ticker 不停
+
+```go
+for {
+    select {
+    case <-time.After(1 * time.Second):  // 每次都创建新 timer + chan
+        ...
+    }
+}
+```
+
+旧 timer 要等触发后才能 GC，高频场景下大量积压。
+
+解法：用 `time.NewTimer` + `Reset` 复用。
+
+### 3. slice 截取后大数组无法 GC
+
+```go
+data := readBigFile()  // 100MB
+header := data[:32]    // header 引用着 100MB 的底层数组
+return header
+```
+
+解法：深拷贝 → `copy(make([]byte, 32), data[:32])`。
+
+### 4. map 只增不减
+
+`delete(m, k)` 不一定释放底层 bucket 内存。如果 map 只增不减、key 是大对象，内存会持续增长。
+
+解法：
+
+- 定期重建（`m = newMap`）
+- 用 LRU cache 替代
+
+### 5. 全局变量持有引用
+
+```go
+var cache = map[string]*BigObject{}
+```
+
+全局 map 不清理就一直增长。
+
+### 6. Context 泄漏
+
+```go
+ctx, _ := context.WithCancel(parent)  // 没拿 cancel
+// 用 ctx
+// 忘了 cancel() → ctx 树持有所有子 ctx
+```
+
+解法：**`WithCancel` / `WithTimeout` 一定要 `defer cancel()`**。
+
+## 排查工具
+
+### 1. pprof（最常用）
+
+```go
+import _ "net/http/pprof"
+go http.ListenAndServe(":6060", nil)
+```
+
+**heap profile**：
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/heap
+> top
+> list <funcName>
+```
+
+**goroutine profile**：
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+```
+
+goroutine 数持续上涨 = goroutine 泄漏。
+
+### 2. runtime.MemStats
+
+```go
+var m runtime.MemStats
+runtime.ReadMemStats(&m)
+log.Printf("HeapAlloc=%d Goroutines=%d", m.HeapAlloc, runtime.NumGoroutine())
+```
+
+定期打印，看趋势。
+
+### 3. trace
+
+```bash
+go tool trace trace.out
+```
+
+看 GC 频率、goroutine 阻塞情况。
+
+## 排查步骤
+
+1. **看 goroutine 数**：`runtime.NumGoroutine()`，持续上涨 → 大概率 goroutine 泄漏
+2. **diff heap profile**：先采一次，10 分钟后再采一次，diff 看哪些对象在涨
+3. **看泄漏的对象在哪 alloc**：pprof `list` 看代码行，往上回溯持有它的引用
+4. **修代码 → 重测**
+
+## 经验法则
+
+- 启动 goroutine **必须有明确的退出条件**——超时、cancel、close channel 三选一
+- channel 操作搭配 `select + ctx.Done()`
+- 任何 cancellable 操作（HTTP、DB、context）必有 timeout
+- 大对象局部用，不要存全局
+- 用 pprof 是常态，不是出事才用
+
+## 一句话总结
+
+> Go 的"内存泄漏"几乎等于"goroutine 泄漏 + 引用泄漏"。**有 GC ≠ 无泄漏**——只要某条引用链通到 root，对象就活着。
+</script>
+
+<script type="text/markdown" data-id="pulsar/deep-dive-overview">
+<!-- [skill: go-team-standards · 技术文档] Pulsar 渐进式理解 -->
+# Pulsar 渐进式理解：从简单队列到存算分离
+
+> 不背概念。从“最朴素的消息队列”开始，每遇到一个具体问题就引入一个机制。这一篇是**地图**，每步只讲“出现了什么问题、Pulsar 怎么答”，深度细节走对应专题。
+
+## 第 1 步：从直接调用到 Producer / Topic / Consumer
+
+服务直接 RPC 互相调用——下游慢就拖上游、下游挂上游就失败、新增订阅就要改代码。
+
+引入一个中间层，把“我要通知谁”变成“我只发布事件”：
+
+```text
+订单服务 Producer
+       │ 发布 OrderCreated
+       ▼
+   Topic: order_created
+       ├─ 支付服务 Consumer
+       ├─ 库存服务 Consumer
+       └─ 通知服务 Consumer
+```
+
+→ 消息放哪里？Broker 重启会不会丢？
+
+---
+
+## 第 2 步：消息要持久化，但 Broker 别既算又存
+
+最直觉的方案是 Broker 把消息写自己本地磁盘——**Kafka 走的就是这条路**。代价是 Broker 既处理网络协议又刷磁盘，CPU/网络/IO 绑死；坏了要靠副本恢复本地日志，扩容要搬数据。
+
+**Pulsar 的选择：把存储拆出去**。Broker 只做服务层，不长期保存消息。
+
+→ 那存储交给谁？
+
+---
+
+## 第 3 步：BookKeeper 接管存储
+
+```text
+Producer / Consumer
+        │
+   Broker（服务层：协议 / 路由 / Subscription / 流控）
+        │
+   BookKeeper（存储层）
+   ├─ Bookie A
+   ├─ Bookie B
+   └─ Bookie C
+```
+
+BookKeeper 不按“队列”存，而是把每个 Topic 看作一条**日志**，由若干 Ledger 串成；每个 Ledger 的 Entry 多副本写到一组 Bookie 上，参数 `E / Qw / Qa` 控制副本池 / 写副本 / Ack 副本。**不等最慢副本**就能返回成功，所以尾延迟可控。
+
+> Managed Ledger / Cursor / 写入链路 / Bookie 内部结构 → 见《Pulsar 存储架构与实现》专题。
+
+---
+
+## 第 4 步：Broker 无状态了，Client 怎么找它
+
+一个 Topic 在某一刻只有一个 Broker 是它的 **Owner**，但这是可迁移的。
+
+```text
+Client → 任意 Broker 做 lookup(topic)
+       → 查 Metadata Store，拿到当前 Topic Owner
+       → 后续读写都连那个 Owner
+
+Owner 挂了
+       → Client 重新 lookup
+       → 新 Broker 接管，从 BookKeeper 继续读写
+```
+
+**这就是“存算分离”真正值钱的地方**：故障迁移搬的是元数据，不是 TB 级数据。
+
+---
+
+## 第 5 步：Topic 多了要治理 → Tenant / Namespace
+
+平铺所有 Topic 很快就乱。Pulsar 把命名做成三层：
+
+```text
+Tenant（租户：谁的）
+  └─ Namespace（策略容器：保留 / 限流 / 复制 / 权限）
+       └─ Topic
+            └─ Subscription
+```
+
+Namespace 是策略的最小单位，也是多租户隔离的关键——保留时间、TTL、Backlog 配额、限流、跨地域复制开关、鉴权，全在 Namespace 上配。
+
+> 字段含义和分层例子 → 见《Pulsar 核心模型》专题。
+
+---
+
+## 第 6 步：订阅是服务端对象
+
+同一 Topic 想被风控、通知、清结算各自独立消费——不能共用一个进度。
+Pulsar 的解法：**每方建一个 Subscription**，Broker 为每个 Subscription 维护独立 Cursor。
+
+```text
+Topic: order_paid
+  ├─ Subscription: risk        → Cursor 在 msg-108
+  ├─ Subscription: notify      → Cursor 在 msg-95
+  └─ Subscription: settlement  → Cursor 在 msg-103
+```
+
+Subscription 内部还能选 4 种模式：
+
+| 模式 | 一句话 |
+|------|------|
+| Exclusive | 只允许一个 Consumer，严格顺序 |
+| Failover | 主备，主挂备接，仍保序 |
+| Shared | 多 Consumer 并发分摊，无序 |
+| Key_Shared | 按 Key 哈希分发，**并发 + 同 Key 保序** |
+
+`Key_Shared` 是 Pulsar 的杀手锏——Kafka Consumer Group 做不到“多 Consumer 并发同时按 Key 保序”。
+
+> 4 种模式的细节、选型、坑点 → 见《Pulsar 订阅模式详解》专题。
+
+---
+
+## 第 7 步：投递闭环 —— 流控 / Ack / 重投
+
+收到消息不等于处理完，所以默认 **至少一次** 语义：
+
+- **Permits 流控**：Consumer 告诉 Broker “我还能接多少”，避免被打爆。
+- **Ack** 推进 Cursor。Shared 模式下消息会乱序完成，Cursor 用 `markDeletePosition + individuallyDeletedMessages` 两段记。
+- **Nack / Ack Timeout / Retry Topic / Dead Letter**：失败链路兜底，最终不行进 DLQ。
+
+代价：消费侧必须做幂等。
+
+---
+
+## 第 8 步：单 Topic 吞吐不够 → Partitioned Topic
+
+把 Topic 切成多个内部分区，分布到不同 Broker 上并行读写：
+
+```text
+Partitioned Topic: order_paid
+├─ partition-0   ┐
+├─ partition-1   ├─ 不同 Broker 持有不同 partition
+├─ partition-2   │
+└─ partition-3   ┘
+```
+
+- 有 key → 哈希到固定分区（保 Key 顺序）
+- 没 key → 轮询 / 单分区
+
+代价：全局顺序难保证、分区数规划不当易热点、连接和元数据开销随分区数增长。
+
+---
+
+## 第 9 步：高级能力（一笔带过）
+
+到这步 Pulsar 已是一个能跑业务的事件平台。剩下的都是“在底座上加层”，按需启用：
+
+| 能力 | 解决什么 |
+|------|--------|
+| Schema | 消息结构契约和兼容性演进 |
+| Batch / Compression / Chunk | 小消息吞吐 / 带宽 / 大消息支持 |
+| 延迟消息 | “30 分钟后检查支付” |
+| 消息去重（ProducerName + SequenceId） | 生产端重发幂等（不等于业务幂等） |
+| Transaction | 跨 Topic 写入 + Ack 的原子性 |
+| Geo-Replication | 跨地域复制（Namespace 级开关） |
+| Functions / IO | 轻量流处理 + 外部系统连接器 |
+
+> 实现细节和取舍 → 见《Pulsar 高级能力》专题。
+
+---
+
+## 第 10 步：消息什么时候能删 —— Retention / TTL / Backlog
+
+一条消息能不能清理，看两件事：
+
+1. **所有 Subscription 的 Cursor 都越过它了吗**（最慢那个说了算）
+2. **Namespace 的 Retention 策略允许删了吗**
+
+未消费的消息看 Backlog 配额和 TTL。
+
+```text
+所有 Cursor 都越过该 Ledger？
+  ├─ 否 → 不能清理
+  └─ 是
+      ├─ 仍在 Retention 内 → 暂不清理
+      └─ 已过 → 删除 / 下沉到 Tiered Storage
+```
+
+> 监控、限流、配额的实操 → 见《Pulsar 运维治理》专题。
+
+---
+
+## 全貌
+
+```text
+        ┌────────────────────────────┐
+        │ Metadata Store（元数据）    │
+        │ Tenant / Namespace / Owner │
+        └──────────────▲─────────────┘
+                       │ lookup
+Producer ──send──► Broker（无状态服务层） ◄──subscribe── Consumer
+                       │
+                       ▼ append
+                ManagedLedger
+                       │
+                       ▼
+                BookKeeper（多副本存储层）
+                ├─ Bookie A
+                ├─ Bookie B
+                └─ Bookie C
+```
+
+## 一句话总结
+
+> Pulsar 不是“又一个 MQ”，而是把传统 MQ 的“Broker 管一切”拆成 **无状态 Broker + 分布式日志 BookKeeper + 元数据中心**，并把“订阅”做成服务端公民——代价是组件多、运维面更宽，回报是弹性扩容、灵活消费、原生多租户、跨地域、冷热分层。
+</script>
+
+<script type="text/markdown" data-id="kafka/knowledge-graph">
+# Kafka 知识地图（重排版）
+
+## 一句话定位
+
+**Kafka = 高吞吐的分布式消息中间件**，核心场景四个字：**削峰、解耦、异步、冗余**。
+
+| 场景 | 解决什么问题 |
+|---|---|
+| 削峰 | 突发流量先进队列，下游按自己节奏消费 |
+| 解耦 | 上下游不直接调用，互不感知 |
+| 异步 | 生产者不等结果，丢进去就走 |
+| 冗余 | 一条消息可被多个消费组各自消费一次 |
+
+---
+
+## 一、先看一张图（核心术语全在这）
+
+```text
+                    ┌──────────────  Kafka 集群（多个 Broker）──────────────┐
+                    │                                                       │
+   Producer ──写──> │  Topic: orders                                        │
+                    │   ├── Partition 0 ──[Leader]── Replica@Broker1        │
+                    │   │                  └─ Follower @Broker2, Broker3    │
+                    │   ├── Partition 1 ──[Leader]── Replica@Broker2        │
+                    │   └── Partition 2 ──[Leader]── Replica@Broker3        │
+                    └───────────────────────────────────────────────────────┘
+                                              │ 拉取
+                                              ▼
+                              Consumer Group A           Consumer Group B
+                              ├ Consumer-1 (P0,P1)       ├ Consumer-1 (P0,P1,P2)
+                              └ Consumer-2 (P2)          (互不影响，各消费各的)
+```
+
+**记住三件事：**
+1. **Topic 是逻辑队列，Partition 才是物理存储单元**。一个 Topic 横向切成多个 Partition，散在不同 Broker 上 → 这就是 Kafka 能并行的根因。
+2. **每个 Partition 有 1 个 Leader + N 个 Follower**。读写都走 Leader，Follower 只负责同步备份（Kafka **不做读写分离**，原因见第四节）。
+3. **Consumer Group 是消费的并行单位**。同一 Group 内：一个 Partition 只能被一个 Consumer 消费；不同 Group 之间互不影响。
+
+---
+
+## 二、为什么 Kafka 这么快？（5 个杀手锏）
+
+| 优化 | 通俗解释 |
+|---|---|
+| **顺序写磁盘** | 顺序写比随机内存写还快（避免磁盘寻道）。Kafka 把消息当流水账往后追加，从不改写。 |
+| **Page Cache** | 不用 JVM 堆内存做缓存，直接用操作系统的 Page Cache，重启不丢、GC 不卡。 |
+| **零拷贝** | 数据从磁盘 → 网卡，跳过用户态拷贝（`sendfile`），少两次内存复制。 |
+| **批量 + 压缩** | Producer 攒一批再发，Broker 批量落盘；支持 GZIP / Snappy / LZ4。 |
+| **分区并行** | N 个 Partition 就能 N 倍并行，受限于 Broker 数和磁盘数。 |
+
+---
+
+## 三、生产者侧：消息怎么"安全又均衡"地写进去
+
+### 3.1 发送模式
+
+- **异步**（默认）：扔进缓冲区就返回，靠回调拿结果 → 吞吐高
+- **同步**：`future.get()` 阻塞等结果 → 吞吐低但确定性强
+
+### 3.2 分区策略（决定消息落到哪个 Partition）
+
+| 策略 | 行为 | 何时用 |
+|---|---|---|
+| 轮询 (RoundRobin) | 按顺序均摊 | 默认，没指定 key |
+| 随机 | 老版本默认，效率差，已淘汰 | — |
+| Hash by Key | 同 key 必落同 Partition | **保证同一类消息有序**（如同一订单 ID） |
+| Sticky（2.4+） | 一段时间内粘住一个 Partition，凑够批再换 | 减少小批次、降低延迟 |
+| 自定义 | 实现 `Partitioner` 接口 | 业务规则路由 |
+
+### 3.3 ACK：决定"消息算写成功"的强度
+
+| acks | 行为 | 风险 |
+|---|---|---|
+| `0` | 发出去就算成功 | 丢得最狠 |
+| `1` | Leader 写入即返回 | Leader 挂了且未同步给 Follower 时丢 |
+| `-1` / `all` | ISR 全部确认才返回 | 几乎不丢；配合 `min.insync.replicas` |
+
+**配套参数：**
+- `min.insync.replicas`：ISR 至少剩几个才允许写。**典型组合：副本=3 + acks=all + min.insync.replicas=2**。
+- `retries`：重试次数（开了幂等才安全重试）。
+- `buffer.memory`：发送缓冲区大小，满了会阻塞。
+
+### 3.4 幂等 & 事务（解决"生产端重复"）
+
+- **幂等（`enable.idempotence=true`）**：靠 `PID + 分区 + Sequence Number`，Broker 端做去重。
+  局限：**单会话、单分区**。Producer 重启 PID 就变了。
+- **事务（`transactional.id`）**：跨分区、跨会话原子写。
+
+```java
+props.put("transactional.id", "tx-1");
+producer.initTransactions();
+producer.beginTransaction();
+producer.send(...);
+producer.commitTransaction();   // 或 abortTransaction()
+```
+
+  消费端配合 `isolation.level=read_committed`，看不到未提交/回滚的消息。
+
+---
+
+## 四、副本机制：AR / ISR / OSR / HW / LEO 一次讲透
+
+### 4.1 三个集合
+
+```text
+AR（全部副本）
+ ├── ISR（同步中的，可被选为 Leader）
+ └── OSR（落后太多的，被踢出）
+```
+
+- 判定标准：`replica.lag.time.max.ms`（0.10 后只看时间，不看消息条数差，避免抖动）。
+- OSR 追上来 → 回到 ISR；ISR 落后 → 掉到 OSR。
+- 默认 OSR **不参与选举**；除非 `unclean.leader.election.enable=true`（会丢数据，慎开）。
+
+### 4.2 两个水位线
+
+```text
+Partition 日志：[m0][m1][m2][m3][m4][m5][m6]
+                              ↑           ↑
+                              HW          LEO
+```
+
+- **LEO (Log End Offset)**：下一条要写入的位置 = 当前最大 offset + 1
+- **HW (High Water Mark)**：所有 ISR 都已确认的位置，**消费者只能看到 HW 之前的消息**
+
+> Follower 拉取 → Leader 收到所有 ISR 的拉取请求 → 推进 HW → 消费者才能看到。这就是"消息何时对外可见"的边界。
+
+### 4.3 ISR 收缩机制（两个后台任务）
+
+- `isr-expiration`：定时扫，谁落后超时谁出 ISR
+- `isr-change-propagation`：变更后写 ZK，但有节流（距上次变更 >5s 且距上次写 ZK >60s）—— 避免频繁写 ZK 把集群拖垮
+
+### 4.4 为什么不做读写分离？
+
+| 原因 | 解释 |
+|---|---|
+| 一致性 | Follower 有同步 lag，可能读到旧数据 |
+| 延迟 | 多走一遍"网络→内存→盘→网络→内存→盘"，反而更慢 |
+
+Kafka 的并发模型是**靠 Partition 数水平扩展**，而不是读写分离。
+
+---
+
+## 五、消费者侧：Rebalance 是绕不开的大坑
+
+### 5.1 Pull vs Push
+
+Kafka 选 **Pull**：消费者按自己节奏拉，避免被压垮。代价是空轮询要靠 `fetch.max.wait.ms` 控制。
+
+### 5.2 分区分配策略
+
+| 策略 | 行为 | 场景 |
+|---|---|---|
+| Range（默认） | 按 Topic 分段切给消费者 | 简单，可能不均 |
+| RoundRobin | 所有 Topic 的 Partition 一起轮询分配 | 均匀，但订阅不一致时混乱 |
+| Sticky | 尽量保留上次分配，减少 Rebalance 抖动 | **推荐** |
+
+### 5.3 Rebalance：消费组的"重新洗牌"
+
+**触发条件：**
+- 组内消费者增减
+- 订阅 Topic 变化
+- Partition 数变化
+
+**两阶段：**
+1. JoinGroup：所有成员上报订阅信息给 Coordinator，选出 Leader Consumer
+2. SyncGroup：Leader 算分配方案，Coordinator 下发
+
+**痛点**：Rebalance 期间**整个消费组停止消费**（STW）。所以要少触发：
+- 调大 `session.timeout.ms`（别让消费者被误判挂了）
+- 调大 `max.poll.interval.ms`（别让长任务超时）
+- 用 Sticky 策略
+
+### 5.4 重复消费怎么办？
+
+**根因：** 消费完没来得及提交 offset 就挂了 / 自动提交在处理前就发生了。
+
+**解决路径：**
+1. 关掉 `enable.auto.commit`，改手动提交（处理完再提交）
+2. 业务层做幂等：唯一 ID + Redis / DB 唯一键去重
+3. 调参：`max.poll.records ↓`、`session.timeout.ms ↑`
+
+---
+
+## 六、高可用：选举 & 防脑裂
+
+### 6.1 三种选举
+
+| 选举对象 | 怎么选 |
+|---|---|
+| **Controller**（管整个集群的 Broker） | 谁先在 ZK 创建 `/controller` 节点谁就是；其他人 watch |
+| **Partition Leader** | Controller 从 ISR 里挑第一个存活的 |
+| **Consumer Group Leader** | Coordinator 从注册的成员 HashMap 里随便挑第一个 |
+
+### 6.2 脑裂 & Epoch
+
+**问题**：老 Controller 长 GC → ZK 会话超时 → 新 Controller 上位 → 老 Controller 恢复后还以为自己是老大，命令全发出去。
+
+**解法**：每次选举 **epoch +1**，Broker 只听更大 epoch 的命令，老 Controller 的命令直接丢弃。
+
+---
+
+## 七、可靠性总账：不丢 + 不重 + 有序 + 恰好一次
+
+### 7.1 消息丢失全场景
+
+| 来源 | 场景 |
+|---|---|
+| **Broker** | `unclean.leader.election=true` 选了 OSR；断电时 Page Cache 还没刷盘 |
+| **Producer** | acks=0/1；不开重试；超 `max.request.size`（默认 1MB）；缓冲区满 |
+| **Consumer** | 自动提交 offset 但还没处理完就挂了 |
+
+### 7.2 三种语义
+
+```text
+At Most Once    = 最多一次（acks=0 / 自动提交在前）→ 可能丢
+At Least Once   = 至少一次（acks=all + 重试 + 手动提交）→ 可能重复
+Exactly Once    = 恰好一次（幂等 Producer + 事务 + 消费端 read_committed）
+```
+
+**EOS 实现 = 多副本持久化 + Producer 重试 + 序列号去重 + 事务**。
+
+### 7.3 顺序消息
+
+- **单分区天然有序**，但要设 `max.in.flight.requests.per.connection=1`（或开幂等）防止重试乱序。
+- **跨分区无全局有序**。要顺序就靠 **同一个 Key 路由到同一 Partition**。
+
+---
+
+## 八、调优常见问答
+
+### 8.1 分区数怎么定？
+
+```text
+Partition 数 ≥ max( 目标吞吐 / 单 Producer 吞吐,
+                    目标吞吐 / 单 Consumer 吞吐 )
+```
+
+经验值：单 Partition 生产 ~10 MB/s。消费侧靠业务实测。
+
+**Consumer 数最好 = Partition 数**（多了闲着，少了不够并行）。
+
+### 8.2 分区数能改吗？
+
+- **能加不能减**：`kafka-topics.sh --alter --partitions N`。
+- 加了之后 Key 路由会变 → **打破原有顺序保证**。
+- 减少不支持，因为要处理已有数据迁移、时间戳、状态，得不偿失。
+
+### 8.3 分区不是越多越好
+
+| 副作用 | 原因 |
+|---|---|
+| 文件句柄爆 | 每个 Partition 都开 index + log |
+| 内存压力 | Producer/Consumer 每分区都有缓存 |
+| 选举变慢 | Leader 选举耗时 ∝ Partition 数 |
+
+### 8.4 怎么提升消费能力？
+
+1. Partition 和 Consumer 同步加（保持 1:1）
+2. 加大 `fetch.min.bytes` / `max.poll.records` 一次拉更多
+3. 优化处理逻辑，必要时上线程池处理（注意提交时机）
+
+---
+
+## 九、按 offset 查消息怎么做到 O(log N)？
+
+每个 Partition 的日志切成 1GB 大小的 **Segment**，每个 Segment 配一个 **稀疏索引**：
+
+```text
+查 offset = 368776
+   ↓ 二分查找索引文件名 → 落到 00000000000368769.index
+   ↓ 二分查找索引 [offset → 物理 position]
+   ↓ 跳到 .log 文件对应 position 顺序读取
+```
+
+---
+
+## 十、ZooKeeper 角色 & 演进
+
+老版本 ZK 管：Broker 注册、Topic 元数据、Consumer 订阅、Offset、Rebalance 协调。
+
+**演进路线：**
+- 0.9 之前：Offset 存 ZK
+- 0.9 之后：Offset 改存 `__consumer_offsets` 这个内置 Topic
+- **3.0+：KRaft 模式可去 ZK**，靠 Raft 自管元数据
+
+---
+
+## 十一、Kafka 的局限性（用之前先知道）
+
+1. 批量机制 → **不适合强实时**（毫秒级）
+2. 不支持 MQTT，**不直接对接 IoT 设备**
+3. 只有**单分区有序**，无全局顺序
+4. 监控生态弱，需要外挂（Kafka Manager / Burrow / Prometheus + JMX）
+5. 老版本强依赖 ZK（3.0 后可解）
+
+---
+
+## 速查口诀
+
+> **写得快**：顺序写 + 零拷贝 + Page Cache + 批量 + 分区并行
+> **不丢**：副本=3 + acks=all + min.insync.replicas=2 + 手动提交
+> **不重**：幂等 Producer + 业务去重
+> **有序**：同 Key 同 Partition + max.in.flight=1
+> **不抖**：Sticky 分配 + 调大 session.timeout
+</script>
+
+<script type="text/markdown" data-id="golang/new-vs-make">
+# new vs make 的区别
+
+> 一句话：`new(T)` 给任意类型分配零值并返回 `*T`；`make` 只能用于 slice/map/chan，做"分配 + 初始化"返回 `T` 本身。
+
+## 行为对比
+
+| 函数 | 用于 | 返回 | 内部 |
+|---|---|---|---|
+| `new(T)` | 任意类型 | `*T`（指向零值） | 仅分配，header 全是 0 |
+| `make(T, ...)` | slice / map / chan | `T` | 分配 + 初始化运行时结构体 |
+
+```go
+p := new(int)              // *int，*p == 0
+s := make([]int, 5)        // []int{0,0,0,0,0}
+m := make(map[string]int)  // 已初始化的 hmap
+```
+
+## 为什么不能 new(map)
+
+```go
+m := new(map[string]int)  // *map，指向 nil map
+(*m)["a"] = 1             // panic: assignment to nil map
+```
+
+map 背后是 `hmap` 结构（buckets、hash seed、状态字段），单纯零值不能用，必须 make。slice 的 nil 反而能 append（append 内部会判 nil 自动分配）；chan 的 nil 永远阻塞。
+
+## 一句话总结
+
+> 只有 slice/map/chan 必须 make；其他场景用 `&T{}` 比 `new(T)` 更直观。
+</script>
+
+<script type="text/markdown" data-id="golang/value-vs-reference">
+# Go 只有值传递？slice/map 看起来像引用是怎么回事
+
+> 一句话：**Go 永远值传递**。slice/map/chan/func/interface 表现像引用，是因为它们的值本身**包含指针**。
+
+## 例子：参数都是拷贝
+
+```go
+func modify(s []int) {
+    s[0] = 99        // ✅ 改到原数组
+    s = append(s, 4) // ❌ 调用方看不到
+}
+```
+
+`s` 是 `(ptr, len, cap)` 的拷贝。`s[0]=99` 通过拷贝里的 ptr 改原底层数组，看得见。append 可能换底层数组，新 ptr 只在拷贝里。
+
+## 哪些类型"自带指针"
+
+| 类型 | 内部结构 |
+|---|---|
+| slice | (ptr, len, cap) |
+| map | *hmap |
+| chan | *hchan |
+| func | (code, captures ptr) |
+| interface | (type, data ptr) |
+| string | (ptr, len)，因不可变所以表现像值 |
+
+## 想"真改"两种姿势
+
+```go
+// 1) 传指针
+func grow(s *[]int) { *s = append(*s, 4) }
+
+// 2) 返回新值（标准库做法，推荐）
+func grow(s []int) []int { return append(s, 4) }
+```
+
+## 一句话总结
+
+> Go 永远值传递；引用感全靠值里那根指针。
+</script>
+
+<script type="text/markdown" data-id="golang/string-internals">
+# string 底层 & 不可变性
+
+> 一句话：string = `(*byte, int)`，指向只读段所以不可变；和 []byte 互转默认会拷贝。
+
+## 内部结构
+
+```go
+type stringHeader struct {
+    Data unsafe.Pointer  // 指向只读段
+    Len  int
+}
+```
+
+`s[0] = 'X'` 直接被语言禁止。
+
+## []byte ↔ string 默认拷贝
+
+```go
+s := "hello"
+b := []byte(s)   // 分配新数组拷贝（[]byte 可改，必须独立）
+s2 := string(b)  // 又一次拷贝
+```
+
+## 编译器零拷贝优化场景
+
+```go
+// map key
+if v, ok := m[string(b)]; ok {}
+// 比较
+if string(b) == "hello" {}
+// range
+for _, c := range string(b) {}
+```
+
+## 真零拷贝（unsafe，慎用）
+
+```go
+// Go 1.20+
+b := unsafe.Slice(unsafe.StringData(s), len(s))  // string→[]byte（别改！）
+s := unsafe.String(unsafe.SliceData(b), len(b))  // []byte→string（之后别改 b）
+```
+
+## 一句话总结
+
+> string 不可变 + 头部 (ptr, len)；常规转换两次拷贝，map key 等场景编译器帮你省。
+</script>
+
+<script type="text/markdown" data-id="golang/iota">
+# iota 怎么用？
+
+> 一句话：iota 是 const 块内的行计数器，从 0 开始，每行 +1，遇到新 const 块归零。
+
+## 基本用法
+
+```go
+const (
+    Red   = iota  // 0
+    Green         // 1（自动复用上一行表达式）
+    Blue          // 2
+)
+```
+
+## 跳过某个值
+
+```go
+const (
+    _  = iota              // 跳过 0
+    KB = 1 << (10 * iota)  // 1<<10
+    MB                     // 1<<20
+    GB                     // 1<<30
+)
+```
+
+## 同行多变量（计数只看行）
+
+```go
+const (
+    a, b = iota, iota * 2  // 0, 0
+    c, d                   // 1, 2
+    e, f                   // 2, 4
+)
+```
+
+## 状态机 / 位掩码
+
+```go
+const (
+    StateIdle = iota  // 0
+    StateRunning      // 1
+    StateDone         // 2
+)
+
+const (
+    FlagRead  = 1 << iota  // 1
+    FlagWrite              // 2
+    FlagExec               // 4
+)
+```
+
+## 一句话总结
+
+> const 块内 iota 是行号，从 0 算起；表达式自动复用，常用来做枚举和位掩码。
+</script>
+
+<script type="text/markdown" data-id="golang/closure">
+# 闭包 & 变量捕获的坑
+
+> 一句话：Go 闭包**按引用捕获**外层变量；for 循环里启 goroutine 是经典坑（Go 1.22 修复）。
+
+## 经典坑：1.22 之前
+
+```go
+for i := 0; i < 3; i++ {
+    go func() { fmt.Println(i) }()  // 1.22 前打印 3,3,3
+}
+```
+
+闭包捕获的是 `i` 这个**变量地址**（同一个），等 goroutine 跑起来，i 已经变 3。
+
+## 1.22 之前的两种修法
+
+```go
+// 1) 入参拷贝
+for i := 0; i < 3; i++ {
+    go func(i int) { fmt.Println(i) }(i)
+}
+
+// 2) 循环内重新声明
+for i := 0; i < 3; i++ {
+    i := i  // 每轮一个新 i
+    go func() { fmt.Println(i) }()
+}
+```
+
+## 1.22+ 新行为
+
+```go
+// 1.22 起 for 的循环变量每轮都是新变量，老坑自动消失
+for i := 0; i < 3; i++ {
+    go func() { fmt.Println(i) }()  // 0, 1, 2（顺序不定）
+}
+```
+
+## defer 也踩过
+
+```go
+for i := 0; i < 3; i++ {
+    defer fmt.Println(i)  // defer 是函数调用，i 立即求值 → 0,1,2
+}
+
+for i := 0; i < 3; i++ {
+    defer func() { fmt.Println(i) }()  // 闭包 → 1.22 前都是 3
+}
+```
+
+## 一句话总结
+
+> 闭包捕获**变量地址**不是值；for + go / defer 是经典踩坑点；Go 1.22 把循环变量改成每轮新变量后大幅缓解。
+</script>
+
+<script type="text/markdown" data-id="golang/panic-recover">
+# panic / recover 机制
+
+> 一句话：panic 沿调用栈向上传播执行 defer；recover **必须在 defer 函数内**调用才能拦下，且不跨 goroutine。
+
+## 行为
+
+```go
+func main() {
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Println("recovered:", r)
+        }
+    }()
+    panic("boom")
+}
+```
+
+panic 触发后：
+1. 当前函数立即停止
+2. 已注册的 defer 按 LIFO 顺序执行
+3. defer 里调 recover() → panic 被止住，函数正常返回
+4. 没 recover → 继续向上层传，直到程序崩
+
+## 关键限制
+
+- **必须在 defer 函数内**：直接调 recover() 永远返 nil
+- **不跨 goroutine**：子 goroutine panic，主 goroutine 的 defer 拦不住
+- **runtime 异常（除零、nil 解引用）也会 panic**，可被 recover
+
+## 跨 goroutine 怎么办
+
+```go
+go func() {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Println("worker panic:", r)
+        }
+    }()
+    work()
+}()
+```
+
+每个 goroutine 自己负责自己。
+
+## 一句话总结
+
+> panic 展开栈跑 defer；recover 必须在 defer 里且只管自己 goroutine。"启动 goroutine 不加 defer recover" 是线上事故的常见配方。
+</script>
+
+<script type="text/markdown" data-id="golang/error-handling">
+# error 处理与 errors.Is / As / Unwrap
+
+> 一句话：error 是接口；从 1.13 起统一用 `fmt.Errorf("...%w", err)` 包装，用 `errors.Is/As` 做语义比较。
+
+## error 接口
+
+```go
+type error interface {
+    Error() string
+}
+```
+
+## 包装与解包
+
+```go
+// 包装
+if _, err := os.Open(path); err != nil {
+    return fmt.Errorf("read config: %w", err)
+}
+
+// errors.Is：比较是不是某个具体值
+if errors.Is(err, os.ErrNotExist) { ... }
+
+// errors.As：取出某个类型
+var pathErr *os.PathError
+if errors.As(err, &pathErr) {
+    fmt.Println(pathErr.Path)
+}
+```
+
+## sentinel error vs 自定义 type
+
+```go
+// sentinel：固定值，errors.Is 比对
+var ErrNotFound = errors.New("not found")
+
+// 自定义类型：携带额外字段，errors.As 取
+type ValidationErr struct {
+    Field, Msg string
+}
+func (v *ValidationErr) Error() string { return v.Field + ": " + v.Msg }
+```
+
+## 别犯的错
+
+- 用 `==` 直接比 wrap 过的 err（拿不到底层）
+- 用 `err.Error() == "xxx"` 字符串比对（破坏抽象）
+- 全部 wrap 但从不 Unwrap → 链路太深还是抓不到
+
+## 一句话总结
+
+> 1.13 后只用 `%w` 包装 + `errors.Is/As` 解包；sentinel 比值，自定义 type 比类型。
+</script>
+
+<script type="text/markdown" data-id="golang/init-order">
+# init 函数与包初始化顺序
+
+> 一句话：包级变量按依赖关系初始化 → init() 按文件名字母序执行 → 最后跑 main()。
+
+## 顺序
+
+```text
+1. 导入的包（深度优先，每个包只跑一次）
+2. 当前包：包级变量按依赖关系
+3. 当前包：init() 函数（多文件按文件名字母序，单文件按声明顺序）
+4. main() / 测试
+```
+
+## 例子
+
+```go
+// a.go
+var A = compute()       // 1. 先算 A
+func init() { ... }     // 3. 再跑 init
+
+// b.go
+var B = A + 1           // 2. 因为依赖 A，A 先算
+func init() { ... }     // 4. b.go 在 a.go 之后（字母序）
+```
+
+## init 的特点
+
+- 没参数没返回
+- 一个文件可多个 init（按声明顺序）
+- 不能手动调用
+- 跑失败（panic）程序无法启动
+
+## 何时用 init
+
+```go
+// 注册（database/sql 驱动）
+func init() {
+    sql.Register("mysql", &mysqlDriver{})
+}
+```
+
+**少用**：增加全局状态、隐藏副作用，难测；尽量挪到显式 New() 里。
+
+## 一句话总结
+
+> 变量 → init → main，跨包按导入图深度优先；少写 init，多写显式构造函数。
+</script>
+
+<script type="text/markdown" data-id="golang/equality">
+# == 能比较哪些类型？
+
+> 一句话：可比类型才能用 ==；slice/map/func **永远不能**；interface 比 (type, value) 两个 tag。
+
+## 速查
+
+| 类型 | == | 备注 |
+|---|---|---|
+| 数字 / bool / string | ✅ | 按值 |
+| 指针 | ✅ | 按地址 |
+| chan | ✅ | 按底层 hchan 地址 |
+| 数组 | ✅ | 元素必须可比；逐元素 |
+| struct | ✅ | 字段必须全可比 |
+| interface | ✅ | (type, value) 都相等 |
+| **slice** | ❌ | 编译错（除非和 nil 比） |
+| **map** | ❌ | 同上 |
+| **func** | ❌ | 同上 |
+
+## interface 的两个坑
+
+```go
+var a interface{} = 1
+var b interface{} = int64(1)
+fmt.Println(a == b)  // false：类型不同
+
+var c interface{} = []int(nil)
+fmt.Println(c == nil)  // false！c 的 type=[]int 不为空
+```
+
+第二个是 Go 经典 nil 陷阱：**只要 type tag 非空，interface 就不等于 nil**。
+
+## 想比 slice / map 怎么办
+
+```go
+reflect.DeepEqual(s1, s2)  // 通用但慢
+slices.Equal(s1, s2)       // 1.21+ 专用，快
+maps.Equal(m1, m2)         // 1.21+
+```
+
+## 一句话总结
+
+> slice/map/func 不可比；interface 比 (type, value) 双 tag，nil 陷阱要记。
+</script>
+
+<script type="text/markdown" data-id="golang/type-assertion">
+# 空 interface & 类型断言
+
+> 一句话：空 interface 能装任何类型；用 `v, ok := x.(T)` 安全取出，type switch 多分支。
+
+## 空 interface
+
+```go
+var x interface{} = 42
+var y any = "hello"  // 1.18+ any = interface{} 别名
+```
+
+## 三种断言写法
+
+```go
+// 1) 单返回（断言失败 panic，慎用）
+n := x.(int)
+
+// 2) 双返回（推荐）
+n, ok := x.(int)
+if !ok { ... }
+
+// 3) type switch
+switch v := x.(type) {
+case int:    fmt.Println("int", v)
+case string: fmt.Println("string", v)
+case nil:    fmt.Println("nil")
+default:     fmt.Println("other")
+}
+```
+
+## 性能代价
+
+- 断言要查 itab（接口表），有 hash 比对
+- 高频热路径里别用 `interface{} → 具体类型` 反复断言
+- 1.18+ 泛型可以替掉一些断言场景
+
+## 易错点
+
+```go
+var p *MyType
+var i interface{} = p
+fmt.Println(i == nil)  // false！type tag 不为空（*MyType）
+```
+
+## 一句话总结
+
+> any 装一切；`v, ok := x.(T)` 安全断言，type switch 多分支；nil interface 那个老坑别忘。
+</script>
+
+<script type="text/markdown" data-id="golang/escape-analysis">
+# 逃逸分析：什么变量会逃到堆？
+
+> 一句话：编译期判断变量是否在函数外被引用；引用了就逃到堆，不引用就栈分配。
+
+## 看逃逸结果
+
+```bash
+go build -gcflags="-m -m" main.go
+# 或
+go run -gcflags="-m" main.go
+```
+
+## 常见逃逸场景
+
+| 场景 | 例子 | 为什么 |
+|---|---|---|
+| 取地址返回 | `return &localVar` | 函数返回后栈帧没了，必须堆 |
+| 闭包捕获 | `f := func(){ use(x) }` | 闭包生命周期 > 函数 |
+| interface 装箱 | `fmt.Println(x)` | 接口要存 (type, value)，value 一般要堆 |
+| 大对象 | 栈上放不下的大数组 | 直接到堆 |
+| 编译期不知大小 | `make([]T, n)` n 是变量 | 大小未知，保守到堆 |
+
+## 例子
+
+```go
+// 不逃逸
+func sum() int {
+    arr := [4]int{1, 2, 3, 4}  // 栈
+    return arr[0] + arr[1]
+}
+
+// 逃逸
+func newPoint() *Point {
+    p := Point{1, 2}  // 取了地址返回，逃到堆
+    return &p
+}
+```
+
+## 优化思路
+
+- 高频路径减少 interface 装箱（`fmt.Println` 比 `print` 慢得多）
+- 别滥用闭包
+- 短生命周期大对象用 sync.Pool 避免反复堆分配
+- struct 拷贝是栈拷贝，一般比堆分配便宜
+
+## 一句话总结
+
+> 只要"函数外可能用到"，就逃到堆；用 `-gcflags="-m"` 看哪些逃了，热路径上避免不必要的逃逸。
+</script>
+
+<script type="text/markdown" data-id="golang/struct-alignment">
+# struct 内存对齐 & 字段顺序优化
+
+> 一句话：CPU 按对齐边界读，编译器会插 padding；按字段大小**从大到小**排可省空间。
+
+## 对齐规则
+
+- 每个字段的偏移量是其大小的整数倍（1/2/4/8 字节）
+- struct 总大小是最大对齐字段的整数倍
+
+## 一个例子省一半
+
+```go
+// 24 字节
+type Bad struct {
+    a bool   // 1 + 7 padding
+    b int64  // 8
+    c bool   // 1 + 7 padding
+}
+
+// 16 字节
+type Good struct {
+    b int64  // 8
+    a bool   // 1
+    c bool   // 1 + 6 padding
+}
+```
+
+## 看对齐
+
+```go
+unsafe.Sizeof(Bad{})        // 24
+unsafe.Alignof(Bad{})       // 8
+unsafe.Offsetof(Bad{}.b)    // 8（前面 a + 7 padding）
+```
+
+## 工具
+
+```bash
+go vet -fieldalignment ./...
+# 或
+go install honnef.co/go/tools/cmd/structlayout@latest
+```
+
+## 例外：刻意 padding
+
+高并发场景为避免**伪共享**（False Sharing），故意填充到 64 字节（CPU 缓存行）：
+
+```go
+type Counter struct {
+    count uint64
+    _     [56]byte  // 凑齐 64
+}
+```
+
+## 一句话总结
+
+> 字段大小从大到小排，省 padding；高并发反过来——padding 到缓存行边界避免伪共享。
+</script>
+
+<script type="text/markdown" data-id="golang/sync-mutex">
+# sync.Mutex / RWMutex 原理
+
+> 一句话：Mutex 只有 8 个字节（一个 int32 + 一个 uint32），靠**位运算 + CAS + 信号量**做出锁；先自旋抢、抢不到再挂；1.9 起加饥饿模式防止老等待者饿死。
+
+## 心智模型：Mutex 在做什么
+
+```text
+              ┌──────────────────────┐
+   多个 G ──→ │  Mutex (8 字节)      │
+              │   state  (32 bit)    │  ← 谁锁着、有几个等
+              │   sema   (32 bit)    │  ← 等待者睡在这儿
+              └──────────────────────┘
+                       │
+                把"互斥"压缩成 1 个 int32：
+                能 CAS 抢就抢，
+                抢不到就到 sema 上睡，
+                持有者放锁时再唤醒一个。
+```
+
+**关键**：能用 CAS 解决就别陷入内核（睡眠/唤醒要 syscall，几千 ns）；只在**真的拿不到锁**时才挂起。
+
+---
+
+## state 字段：把 4 件事塞进 32 bit
+
+```text
+高 29 bit                       低 3 bit
+─────────────────────────────────────────
+   等待者数 N                  S  W  L
+                              │  │  └── Locked   (bit 0)：1=被锁住
+                              │  └───── Woken    (bit 1)：1=有 G 被唤醒去抢
+                              └──────── Starving (bit 2)：1=进入饥饿模式
+
+例：state = 0b...000_010_011 = 等待者 2 个、Starving=0、Woken=1、Locked=1
+```
+
+为什么要塞一起？**一次 CAS 同时改多个位**，比"先改 Locked 再改 waiter 数"少一次原子操作。
+
+---
+
+## Lock 完整流程
+
+```text
+                 G 调 Lock()
+                     │
+                     ▼
+        ┌────────────────────────┐
+        │ ① CAS: Locked 0→1?     │
+        └────────┬───────────────┘
+              成功│ 失败
+        拿到锁返回│
+                  ▼
+        ┌────────────────────────┐
+        │ ② 自旋（仅满足条件时）   │   多核 + 自旋 <4 次 + Mutex 还没被 Woken
+        │    PAUSE 指令空转       │   自旋途中 Locked 变 0 → 立刻抢
+        └────────┬───────────────┘
+              失败│
+                  ▼
+        ┌────────────────────────┐
+        │ ③ state.waiter++       │   原子操作；登记"我也在等"
+        │    runtime_SemacquireMutex(&sema)  ← 真正睡到 sema 上
+        └────────┬───────────────┘
+            被唤醒│
+                  ▼
+        ┌────────────────────────┐
+        │ ④ 醒来后看等了多久      │
+        │    >1ms → 进入饥饿模式  │
+        │    回到 ① 重抢          │
+        └────────────────────────┘
+```
+
+### 为什么要自旋
+
+**上下文切换太贵**——syscall + 调度 大概几千 ns。如果锁马上就被释放，自旋几十 ns 就拿到了。所以多核环境下宁可空转一会儿。
+
+### 为什么不能一直自旋
+
+单核机器上自旋永远抢不到（持有者跑不到代码释放锁）；自旋次数也要限制（4 次），否则白烧 CPU。
+
+---
+
+## Unlock 流程
+
+```text
+                Unlock()
+                    │
+                    ▼
+       ┌──────────────────────────┐
+       │ ① CAS: Locked 1→0        │
+       │    state -= mutexLocked  │
+       └────────┬─────────────────┘
+                │
+            还有等待者？
+            ├─ 没 → 完事
+            └─ 有 →
+                  ▼
+            正常模式：唤醒一个 G，让它去和新 G 抢
+            饥饿模式：直接把锁交给队首 G
+                       （不解 Locked 位，避免新 G 来抢）
+```
+
+---
+
+## 正常 vs 饥饿：为什么需要两种模式
+
+### 没有饥饿模式会怎样
+
+只有正常模式时：
+
+```text
+时间线（持锁 G 释放后）：
+
+  G_old 醒来，从 sema 出队           新 G_new 刚到 Lock()
+        │                                    │
+        └────────┬───────────────────────────┘
+                 ▼
+         同时去 CAS state
+
+  G_new 在 CPU 上跑得正热（缓存预热）
+  G_old 才刚被唤醒（缓存冷、延迟高）
+                 ↓
+         G_new 抢赢的概率远大于 G_old
+```
+
+老 G 等了一轮、被叫醒、又输给新 G、再睡一轮——**可能永远抢不到**。
+
+### 饥饿模式怎么救
+
+```text
+G_old 在队列里等 >1ms    →    把 state.Starving 置 1
+                                       │
+                                       ▼
+                          切到饥饿模式：
+                          - 新来的 G_new 直接进队尾，不许抢
+                          - Unlock 时锁直接交给队首 G_old
+                          - G_old 拿到锁后看自己等待时间 <1ms → 复位 Starving
+```
+
+| 模式 | 新到的 G | 等待队列里的 G |
+|---|---|---|
+| 正常 | 自旋抢锁（缓存热，常赢） | 醒来跟新 G 抢 |
+| 饥饿 | 不能抢，必须排队 | 队首直接拿，不用抢 |
+
+**正常模式**优先吞吐（让在 CPU 上的 G 拿锁，缓存利用好）；
+**饥饿模式**保证公平（老 G 一定拿得到）。两种模式动态切换。
+
+---
+
+## RWMutex 怎么实现
+
+```go
+type RWMutex struct {
+    w           Mutex   // 写锁（互斥）
+    writerSem   uint32  // 写者等读者退出
+    readerSem   uint32  // 读者等写者放锁
+    readerCount atomic.Int32  // 当前读者数（>=0 正常；<0 表示有写者待入）
+    readerWait  atomic.Int32  // 写者待入时还剩多少个读者
+}
+```
+
+### 读流程（RLock / RUnlock）
+
+```text
+RLock():
+  readerCount++             ← 原子加
+  if readerCount < 0:        ← 说明有写者已经在等
+       挂到 readerSem 上等
+  否则直接返回（读并发，没锁开销除了原子加）
+
+RUnlock():
+  readerCount--
+  if readerCount < 0:        ← 写者在等
+       readerWait--
+       readerWait == 0 → 唤醒写者
+```
+
+### 写流程（Lock / Unlock）
+
+```text
+Lock():
+  ① w.Lock()                    ← 写者之间串行（用内嵌 Mutex）
+  ② readerCount -= rwmutexMaxReaders   ← 让 readerCount 变负，宣告"我要写了"
+                                          新读者看到负数 → 来等
+  ③ readerWait = 当前活跃读者数
+  ④ 如果还有读者 → 挂在 writerSem 上等所有读者 RUnlock
+
+Unlock():
+  ① readerCount += rwmutexMaxReaders   ← 加回去；新读者放行
+  ② 唤醒所有挂在 readerSem 的读者
+  ③ w.Unlock()
+```
+
+### 关键设计
+
+- 用 `readerCount < 0` 这一个字段，同时表达"有读者"和"写者待入" → 一次原子读判完
+- 写者来了立刻把读者计数变负，**新读者全部排队**——避免新读者源源不断进来让写者饿死
+
+### 性能取舍
+
+| 场景 | RWMutex vs Mutex |
+|---|---|
+| 读多写少（>10:1） | RWMutex 优 |
+| 读写各半 | **Mutex 反而快**（RWMutex 自身开销大：原子加 + 多个信号量协调） |
+| 临界区极短（几十 ns） | **Mutex** 总是赢——RW 的协调成本超过临界区本身 |
+| 写多 | Mutex 优（RW 写要等所有读 + 通知所有读，链路更长） |
+
+---
+
+## 全貌
+
+```text
+┌────────── Mutex ──────────┐
+│  state (32 bit)           │
+│   ├─ Locked  (1 bit)      │
+│   ├─ Woken   (1 bit)      │
+│   ├─ Starving(1 bit)      │
+│   └─ waiterN (29 bit)     │
+│  sema  (32 bit)           │ ← 等待者睡在这里
+└───────────────────────────┘
+   抢锁: CAS → 自旋 → 挂起
+   放锁: CAS → 唤醒 / 直接交付（饥饿）
+
+┌────────── RWMutex ────────┐
+│  w (Mutex)                │ ← 写者之间互斥
+│  writerSem / readerSem    │
+│  readerCount  (int32)     │ ← <0 表示写者在等
+│  readerWait   (int32)     │
+└───────────────────────────┘
+   读: readerCount++（≥0 直接走）
+   写: 让 readerCount 变负 → 等所有读完 → 拿锁
+```
+
+## 一句话总结
+
+> Mutex = state 位运算 + CAS + 信号量；先自旋后挂起；正常模式追吞吐、饥饿模式保公平。RWMutex 只在**读多写少 + 临界区够大**时才比 Mutex 划算。
+</script>
+
+<script type="text/markdown" data-id="golang/sync-waitgroup-once">
+# sync.WaitGroup & sync.Once
+
+> 一句话：WaitGroup 用 counter + 信号量等所有任务结束；Once 用 atomic + 锁双检保证只跑一次。
+
+## WaitGroup 用法
+
+```go
+var wg sync.WaitGroup
+for _, url := range urls {
+    wg.Add(1)
+    go func(u string) {
+        defer wg.Done()
+        fetch(u)
+    }(url)
+}
+wg.Wait()
+```
+
+## 内部
+
+```go
+type WaitGroup struct {
+    state atomic.Uint64  // 高 32 位 counter，低 32 位 waiter 数
+    sema  uint32
+}
+```
+
+- `Add(n)`：counter += n
+- `Done()`：counter--（==Add(-1)）
+- `Wait()`：counter > 0 → waiter++ 阻塞在 sema；counter == 0 → 唤醒所有 waiter
+
+## 经典误用
+
+```go
+// ❌ Add 在 goroutine 内
+for _, u := range urls {
+    go func(u string) {
+        wg.Add(1)  // 主 goroutine 的 Wait 可能先跑到 → counter==0 直接返回
+        defer wg.Done()
+        fetch(u)
+    }(u)
+}
+
+// ❌ counter 变负
+wg.Done()  // counter 已是 0 → panic
+```
+
+## sync.Once
+
+```go
+var once sync.Once
+once.Do(func() { initStuff() })
+```
+
+```go
+type Once struct {
+    done atomic.Uint32
+    m    Mutex
+}
+
+func (o *Once) Do(f func()) {
+    if o.done.Load() == 0 {  // 快路径：原子读
+        o.doSlow(f)
+    }
+}
+
+func (o *Once) doSlow(f func()) {
+    o.m.Lock()
+    defer o.m.Unlock()
+    if o.done.Load() == 0 {  // 锁内再检查（双检）
+        defer o.done.Store(1)
+        f()
+    }
+}
+```
+
+**坑**：f panic 也算"已执行"，下次 Do 不会再跑。
+
+## 一句话总结
+
+> WaitGroup = counter + 信号量，Add 必须在 go 之前；Once = 双检锁，panic 也算跑过。
+</script>
+
+<script type="text/markdown" data-id="golang/sync-pool">
+# sync.Pool 原理与适用场景
+
+> 一句话：每 P 一个本地池 + victim cache，用来缓存"短期可丢"的对象；GC 会清空，不能拿来管生命周期。
+
+## 用法
+
+```go
+var bufPool = sync.Pool{
+    New: func() any { return new(bytes.Buffer) },
+}
+
+func handle() {
+    buf := bufPool.Get().(*bytes.Buffer)
+    defer bufPool.Put(buf)
+    buf.Reset()  // 一定要 Reset
+    // 用 buf...
+}
+```
+
+## 内部结构
+
+```text
+Pool
+├── local      [P 个本地池]：每个 P 一个，private + shared
+│                  - private: 单槽，最快
+│                  - shared:  双向队列，可被偷
+└── victim     上一轮 GC 残留的对象（再用一次再扔）
+```
+
+Get 顺序：private → 当前 P 的 shared → 偷别的 P 的 shared → victim → New。
+
+Put：放到当前 P 的 private（满了进 shared）。
+
+## GC 行为（关键）
+
+每次 GC 把 local → victim，再清空 victim。所以**对象在 pool 里最多活两个 GC 周期**。
+
+## 用 vs 不用
+
+| 场景 | 适合 | 原因 |
+|---|---|---|
+| HTTP handler 里的临时 buf | ✅ | 高频复用 |
+| protobuf marshal 缓冲 | ✅ | 同上 |
+| 数据库连接 | ❌ | 生命周期需自己管 |
+| 大对象但偶尔用 | ❌ | 占着 GC 不利 |
+
+## 易错
+
+- Put 之前忘 Reset → 残留数据外泄
+- 大对象塞进去 → GC 压力反而更大
+- 把 Pool 当连接池用 → 时间一长全没了
+
+## 一句话总结
+
+> sync.Pool 是"GC 周期内的本地缓存"，Get/Put 几乎无锁；Reset 要做好，长生命周期对象别用它。
+</script>
+
+<script type="text/markdown" data-id="golang/sync-map">
+# sync.Map 实现与适用场景
+
+> 一句话：双 store（read 只读 + dirty 读写）+ 原子操作；只在**读多写少 / key 写一次后只读**才比 Mutex+map 快。
+
+## 内部
+
+```go
+type Map struct {
+    mu     Mutex
+    read   atomic.Pointer[readOnly]  // 只读副本，原子读
+    dirty  map[any]*entry            // 可写
+    misses int                       // read 没命中次数
+}
+```
+
+## 读流程
+
+```text
+1. 原子读 read（无锁）
+2. 命中 → 返回
+3. 没命中 → 加锁去 dirty 找
+4. misses 累计够多 → dirty 提升为新 read
+```
+
+## 写流程
+
+```text
+1. 命中 read 且 entry 没被删 → CAS 改值（无锁）
+2. 否则加锁，写 dirty
+```
+
+## 典型用法
+
+```go
+var m sync.Map
+m.Store("k", 1)
+v, ok := m.Load("k")
+m.Range(func(k, v any) bool { return true })
+```
+
+## 性能取舍
+
+| 场景 | 选谁 |
+|---|---|
+| 读多写少（缓存、配置） | sync.Map ✅ |
+| 一次写后只读 | sync.Map ✅ |
+| 读写各半 | Mutex + map ✅（sync.Map 反而慢） |
+| 大量删除 | Mutex + map ✅ |
+
+## 缺点
+
+- 没泛型（值是 `any`，访问要断言）
+- 内存占用比普通 map 大
+- 没 Len()（Range 可能漏未提升的 dirty）
+
+## 一句话总结
+
+> 只在"读多写少 / 一写后只读"占优；其他场景普通 Mutex+map 又快又省内存。
+</script>
+
+<script type="text/markdown" data-id="golang/atomic-cas">
+# atomic & CAS
+
+> 一句话：atomic 是 CPU 指令级原子操作（lock 前缀 / LL-SC），CAS 是其中最重要的"比较并交换"原语，无锁数据结构的基石。
+
+## 基本操作
+
+```go
+var n atomic.Int64
+n.Add(1)
+n.Load()
+n.Store(10)
+n.CompareAndSwap(old, new)  // CAS
+n.Swap(new)
+```
+
+## CAS 是什么
+
+```go
+// 伪代码
+func CAS(ptr *T, old, new T) bool {
+    if *ptr == old { *ptr = new; return true }
+    return false
+}
+```
+
+CPU 一条指令完成"比较 + 写"，期间不被打断。
+
+## 自旋 CAS 实现 lock-free 计数
+
+```go
+for {
+    old := n.Load()
+    if n.CompareAndSwap(old, old+1) { break }
+}
+// 等价于 n.Add(1)，但展示了 CAS 思路
+```
+
+## atomic.Value
+
+```go
+var cfg atomic.Value
+cfg.Store(&Config{...})
+c := cfg.Load().(*Config)
+```
+
+注意：每次 Store 类型必须一致。
+
+## ABA 问题
+
+```text
+线程 1 读到 A，准备 CAS(A, B)
+线程 2 期间把 A 改到 X 再改回 A
+线程 1 CAS(A, B) 成功——但中间状态丢了
+```
+
+解法：加版本号（带 tag 的指针 / DCAS）。Go 标准库没直接支持，用 sync.Mutex 一刀切常常更香。
+
+## 一句话总结
+
+> atomic 是单条指令级原子；CAS 适合做 lock-free 数据结构，但要警惕 ABA 和"自旋打满 CPU"。
+</script>
+
+<script type="text/markdown" data-id="golang/context">
+# context 的设计与使用
+
+> 一句话：context 是携带"取消信号 + 截止时间 + KV"的树形结构，沿调用链向下传，父取消则所有子一起取消。
+
+## 4 种构造
+
+```go
+ctx := context.Background()                           // 根
+ctx, cancel := context.WithCancel(ctx)                // 手动取消
+ctx, cancel := context.WithTimeout(ctx, 3*time.Second) // 超时
+ctx, cancel := context.WithDeadline(ctx, t)           // 截止时间
+ctx = context.WithValue(ctx, key, val)                // KV
+```
+
+## 内部树形
+
+```text
+Background
+   └── WithCancel (ctx1, cancel1)
+          └── WithTimeout (ctx2, cancel2)
+                 └── WithValue (ctx3)
+```
+
+cancel1 → ctx2、ctx3 都连带取消（通过监听父的 Done()）。
+
+## 标准签名
+
+```go
+func DoSomething(ctx context.Context, ...) error
+```
+
+ctx 必须**第一个参数**，团队约定。
+
+## 监听取消
+
+```go
+select {
+case <-ctx.Done():
+    return ctx.Err()  // canceled / deadline exceeded
+case res := <-ch:
+    return res, nil
+}
+```
+
+## 几条铁律
+
+1. **ctx 不要存到 struct 里**（短生命周期信号，不该跟着对象长跑）
+2. **WithValue 只放跨切面数据**（traceID、用户 ID），别当参数传
+3. **cancel 一定要调用**（哪怕 timeout 自然过了），用 `defer cancel()`
+4. **不传 nil ctx**，至少传 `context.TODO()`
+
+## 一句话总结
+
+> 树形传播取消信号，cancel 必 defer，ctx 第一个参数；别滥用 WithValue 当全局变量。
+</script>
+
+<script type="text/markdown" data-id="golang/timer">
+# timer / ticker 底层实现
+
+> 一句话：1.14+ 改成**每 P 一个四叉小顶堆**，调度器顺手 check，过期 timer 触发对应回调（一般是给 chan 发个值）。
+
+## 用法
+
+```go
+t := time.NewTimer(2 * time.Second)
+<-t.C  // 2 秒后
+
+tk := time.NewTicker(1 * time.Second)
+for range tk.C { /* 每秒一次 */ }
+```
+
+## 演进
+
+| 版本 | 实现 |
+|---|---|
+| 1.10 之前 | 全局一个堆，争锁严重 |
+| 1.10 ~ 1.13 | 64 个堆 |
+| **1.14+** | **每 P 一个四叉堆**，跟 G 一起调度，无全局锁 |
+
+## 核心数据结构
+
+```go
+type timer struct {
+    when     int64  // 触发时间 (ns)
+    period   int64  // 周期（Ticker 用）
+    f        func(any, uintptr)
+    arg      any
+    seq      uintptr
+    status   atomic.Uint32
+    pp       puintptr  // 挂在哪个 P
+}
+```
+
+## 调度时机
+
+每次进入调度循环（findRunnable）会先 check timer 堆顶。这样 timer 的精度受调度延迟影响——**不是硬实时**。
+
+## 几个坑
+
+```go
+// 1) Reset 前要 Stop + drain
+if !t.Stop() {
+    select { case <-t.C: default: }
+}
+t.Reset(d)
+
+// 2) Ticker 不 Stop 会泄漏
+tk := time.NewTicker(1 * time.Second)
+defer tk.Stop()
+
+// 3) time.After 在循环里反复用 → 每次都建 timer，泄漏
+for {
+    select {
+    case <-time.After(1 * time.Second): ...  // 改用 NewTimer + Reset
+    }
+}
+```
+
+## 一句话总结
+
+> 每 P 一堆，调度顺便 check；Ticker / 长跑 timer 必须 Stop，循环里别用 `time.After`。
+</script>
+
+<script type="text/markdown" data-id="golang/range-gotchas">
+# range 的几个坑
+
+> 一句话：range 遍历的是**值的拷贝**；map 顺序随机；channel 关闭后才退出；切片边遍历边改要小心。
+
+## 坑 1：range 是拷贝
+
+```go
+type Big struct { data [1024]byte }
+arr := []Big{{}, {}, {}}
+
+for _, v := range arr {  // v 是 Big 的拷贝（每次拷 1KB！）
+    use(&v)
+}
+
+// 改用索引
+for i := range arr {
+    use(&arr[i])
+}
+```
+
+## 坑 2：循环变量复用（1.22 前）
+
+```go
+var ps []*int
+for _, v := range []int{1, 2, 3} {
+    ps = append(ps, &v)  // 1.22 前所有指针指向同一个 v
+}
+```
+
+1.22+ 自动每轮新变量，老坑修了。
+
+## 坑 3：map 遍历顺序随机
+
+```go
+for k, v := range m { ... }  // 每次顺序不同（runtime 故意打乱）
+```
+
+需要顺序：抽出 keys 排序后遍历。
+
+## 坑 4：边遍历边改 map
+
+```go
+for k := range m {
+    if cond(k) {
+        m[k+"new"] = ...  // 可能多遍历一次也可能不遍历到
+    }
+}
+```
+
+Go spec 说"未定义行为"。要么先收集要改的 key，要么遍历后批量改。
+
+## 坑 5：range channel 何时退出
+
+```go
+for v := range ch {
+    // 直到 ch 被 close 才退出；没人 close 就永远阻塞
+}
+```
+
+## 一句话总结
+
+> range = 拷贝；1.22 前循环变量同一个；map 随机序、边改要小心；range chan 等 close。
+</script>
+
+<script type="text/markdown" data-id="golang/reflect">
+# 反射 reflect 原理与代价
+
+> 一句话：reflect 通过 interface 的 (type, data) 元数据动态解析类型；功能强但慢——能不用就别用。
+
+## 三件套
+
+```go
+v := reflect.ValueOf(x)
+t := reflect.TypeOf(x)
+k := t.Kind()  // Bool / Int / Slice / Struct ...
+```
+
+## 结构体字段访问
+
+```go
+type User struct {
+    Name string `json:"name"`
+}
+
+u := User{"alice"}
+v := reflect.ValueOf(u)
+t := v.Type()
+for i := 0; i < t.NumField(); i++ {
+    f := t.Field(i)
+    fmt.Println(f.Name, f.Tag.Get("json"), v.Field(i).Interface())
+}
+```
+
+## 修改值（必须可寻址）
+
+```go
+v := reflect.ValueOf(&u).Elem()  // 必须传指针然后 Elem
+v.FieldByName("Name").SetString("bob")
+```
+
+## 性能代价
+
+| 操作 | 相对开销 |
+|---|---|
+| 直接调用 | 1× |
+| interface 断言 | ~5× |
+| reflect 字段读 | ~50× |
+| reflect 调用方法 | ~100× |
+
+## 何时不得不用
+
+- 通用序列化（json / yaml / protobuf reflection）
+- ORM
+- 配置注入 / DI
+- 测试框架（assert）
+
+## 1.18+ 的替代
+
+```go
+// 类型已知 → 用泛型，代价 ~ 直接调用
+func Sum[T int | float64](s []T) T { ... }
+```
+
+## 一句话总结
+
+> reflect 是"运行时拿类型信息"的逃生通道；慢、丑、易错；能用泛型/代码生成解决就别走这条路。
+</script>
+
+<script type="text/markdown" data-id="golang/generics">
+# Go 泛型（1.18+）
+
+> 一句话：1.18 引入类型参数，靠"GC shape 字典"实现；不是 Java 擦除，也不是 C++ 全特化，是中间路线。
+
+## 基本语法
+
+```go
+func Map[T, U any](s []T, f func(T) U) []U {
+    r := make([]U, len(s))
+    for i, v := range s { r[i] = f(v) }
+    return r
+}
+
+doubled := Map([]int{1, 2, 3}, func(i int) int { return i * 2 })
+```
+
+## 类型约束（constraint）
+
+```go
+type Number interface {
+    ~int | ~int64 | ~float32 | ~float64
+}
+// ~int 表示 int 及其底层类型为 int 的类型
+
+func Sum[T Number](s []T) T {
+    var r T
+    for _, v := range s { r += v }
+    return r
+}
+```
+
+## 标准库内置
+
+```go
+// constraints 包
+constraints.Ordered  // 可比大小：int/float/string
+
+// 自带泛型工具（1.21+）
+slices.Sort
+slices.Contains
+maps.Keys
+maps.Values
+```
+
+## 实现：GC shape stenciling
+
+不像 C++ 给每个类型生成独立代码，也不像 Java 完全擦除：
+- 同 GC shape（指针/不是指针、大小相同）共享一份代码
+- 通过运行时 dictionary 传类型信息
+- 性能略慢于纯模板，但二进制不爆炸
+
+## 不能做的事
+
+- 不支持泛型方法（接收者不能引入新类型参数）
+- 不支持类型参数做 map key（要等 comparable 改进）
+- 反射对泛型支持有限
+
+## 何时用
+
+| 场景 | 用泛型 vs 反射 / interface |
+|---|---|
+| 容器（slice/map 工具） | 泛型完胜 |
+| 算法（sort/binsearch） | 泛型 |
+| 业务逻辑 | 别炫技 |
+| 序列化 | 还是反射或代码生成 |
+
+## 一句话总结
+
+> 1.18+ 给容器/算法用，靠 GC shape 字典实现；业务代码别滥用，可读性优先。
+</script>
+
+<script type="text/markdown" data-id="golang/netpoller">
+# netpoller 怎么把同步代码异步化？
+
+> 一句话：每次"看似阻塞"的 net IO，其实把 G 挂到 epoll/kqueue 上去睡，G 让出 P 给别人跑，IO 就绪后再唤醒。
+
+## 我们看到的"同步代码"
+
+```go
+conn, _ := net.Dial("tcp", "x")
+buf := make([]byte, 1024)
+n, _ := conn.Read(buf)  // 看起来阻塞，其实没占线程
+```
+
+## 背后流程
+
+```text
+1. conn.Read 调底层 syscall
+2. 数据没就绪（EAGAIN）
+3. runtime 把 fd + 当前 G 注册到 epoll
+4. G 状态置 Gwaiting，从 P 摘下，挂上 sudog
+5. P 立刻找下一个可运行 G 跑
+6. 后台 sysmon / netpoll 调用 epoll_wait
+7. fd 就绪 → 找回对应 G，置 Grunnable，入队
+8. 调度循环捡起这个 G 继续 read
+```
+
+## 为什么这么设计
+
+C/Java 习惯"线程 + 阻塞 IO"，IO 等多久线程就闲多久。Go 把"等"剥离到 epoll，**只占一个 G 的栈（KB 级）**，10 万并发不靠 10 万线程。
+
+## OS 接口对应
+
+| 平台 | 接口 |
+|---|---|
+| Linux | epoll |
+| macOS / BSD | kqueue |
+| Windows | IOCP |
+
+## 一句话总结
+
+> Go 网络代码"看起来同步"，背后是 G 挂 epoll 让出 P；这是 Go 高并发网络的基石。
+</script>
+
+<script type="text/markdown" data-id="golang/syscall-handoff">
+# syscall 阻塞时 P 怎么 hand-off？
+
+> 一句话：阻塞型 syscall 让 M 陷入内核，runtime 把 P 从它身上摘下来交给别的 M，等 syscall 返回再尝试拿回 P。
+
+## entersyscall / exitsyscall
+
+```text
+进 syscall:
+  M.curg = G
+  M 标记 _Psyscall
+  → 陷入内核
+
+阻塞超过 ~10ms（sysmon 检测）:
+  把 P 摘下来 (handoffp)
+  找一个空闲 M 接管 P，继续跑别的 G
+
+syscall 返回:
+  exitsyscall 尝试拿回原 P
+  失败（被别人拿走了）→ G 进全局队列，M 自己睡
+```
+
+## 为什么 hand-off 有意义
+
+如果 syscall 卡很久（如磁盘 IO 写满）：
+- 不 hand-off：这个 P 上的本地队列全卡住，相关的 G 都跑不了
+- hand-off：P 立刻交别人，G 继续运行，整体吞吐不受单线程阻塞影响
+
+## sysmon
+
+后台线程 ~每 20μs 唤醒一次：
+- 检查超时的 syscall（>10ms 就 hand-off）
+- 抢占长跑 G（>10ms 没让出）
+- 触发 GC、netpoll、forcegc
+
+## 关键：非阻塞 syscall 不 hand-off
+
+netpoll 类（epoll_wait）走的是异步流程，不会触发 hand-off——M 上很快就回来。
+
+## 一句话总结
+
+> 阻塞 syscall + sysmon 监控 → 把 P 让给别的 M 接管，避免一个慢 syscall 拖死整个 P 上的所有 G。
+</script>
+
+<script type="text/markdown" data-id="golang/memory-allocator">
+# 内存分配器 mcache / mcentral / mheap
+
+> 一句话：派生自 Google TCMalloc 的三级分配器；按 67 个 size class 切分，小对象走每 P 的 mcache（无锁），大对象直接走 mheap。
+
+## 三级缓存
+
+```text
+mcache  (每 P 一份，68 类 span)            ← 无锁，最快
+   ↓ 没空闲对象
+mcentral (全局，按 size class 分组)         ← 有锁
+   ↓ span 用完
+mheap   (整个进程的堆)                     ← 大锁
+   ↓ 不够
+sysmem  (向 OS 申请)
+```
+
+## size class
+
+68 类（含 0），从 8B 起步：8 / 16 / 32 / 48 / 64 / ... / 32768。每类一种 span（一组连续页）。
+
+## 分配流程（小对象 ≤32KB）
+
+```text
+1. 算 size class（编译期或查表）
+2. 从 mcache 对应 class 拿一个对象（O(1)）
+3. mcache 没了 → 找 mcentral（加锁，拿一整 span）
+4. mcentral 没了 → 从 mheap 切一段
+```
+
+## 大对象（>32KB）
+
+直接 mheap 分配，跳过 mcache/mcentral。
+
+## tiny allocator
+
+<16B 且不含指针的对象（如 byte、小 string）合并到一个 16 字节的 tiny 块里，减少碎片。
+
+## 与 GC 协作
+
+- 每个 span 带 bitmap 标记哪些字段是指针（GC 扫描用）
+- 对象释放：mcache/mcentral 内部回收，不立刻还 OS
+- 大对象 GC 后可能 madvise 还 OS（受 GOGC / GOMEMLIMIT 影响）
+
+## 一句话总结
+
+> 派生 TCMalloc，三级 mcache→mcentral→mheap；小对象无锁路径极快，大对象直走 heap。
+</script>
+
+<script type="text/markdown" data-id="golang/stack-management">
+# 栈管理：分段栈 → 连续栈
+
+> 一句话：每个 G 起步 2KB 栈；栈不够时**整个栈拷贝**到更大的新栈，遍历指针修正——这是 Go 1.4 之后的设计。
+
+## 演进
+
+| 版本 | 方案 | 痛点 |
+|---|---|---|
+| 1.0~1.3 | 分段栈（不够就 malloc 一段，链表） | 频繁切换有 hot split 问题 |
+| **1.4+** | **连续栈**：栈拷贝 + 指针修正 | 拷贝有成本但更稳定 |
+
+## 栈增长流程
+
+```text
+1. 函数序言（prologue）检查 SP 离栈底是否够
+2. 不够 → 调 morestack
+3. 分配 2× 大小新栈
+4. 拷贝旧栈数据到新栈
+5. 遍历栈中所有指针，重写指向新栈的偏移
+6. 切到新栈继续执行
+```
+
+最大栈 1GB（1.2+），超出 panic。
+
+## 栈缩
+
+GC 时看活跃使用量；用得少就缩回去（一般半数）。
+
+## 为什么 G 能这么轻
+
+- 起步 2KB（线程是 2MB）
+- 拷贝栈是 G 的事，跟 OS 无关
+- 没 syscall 也没系统调度
+
+## 写代码注意
+
+- 别取栈上变量地址保存太久（逃逸到堆），但**栈上指针在拷贝时会被自动修正**，不用担心移动后失效
+- 大数组别放栈上（动辄触发栈增长 + 拷贝）
+
+## 一句话总结
+
+> 连续栈：起步 2KB，2× 增长，拷贝旧栈+修正指针；这是 G 能像协程一样轻的根本。
+</script>
+
+<script type="text/markdown" data-id="golang/pprof">
+# pprof 实战：5 种 profile 各看什么
+
+> 一句话：pprof 是 Go 性能分析瑞士军刀；CPU/Heap/Goroutine/Block/Mutex 五种 profile 分别对应五类问题。
+
+## 引入
+
+```go
+import _ "net/http/pprof"
+go http.ListenAndServe(":6060", nil)
+```
+
+## 5 种 profile
+
+| Profile | URL / 命令 | 看什么 |
+|---|---|---|
+| **CPU** | `/debug/pprof/profile?seconds=30` | 哪些函数最吃 CPU |
+| **Heap** | `/debug/pprof/heap` | 内存分配在哪、当前在用多少 |
+| **Goroutine** | `/debug/pprof/goroutine` | 哪些 G 在哪卡着（goroutine 泄漏） |
+| **Block** | `/debug/pprof/block` | 谁在等锁/chan/sync 原语 |
+| **Mutex** | `/debug/pprof/mutex` | 哪些 Mutex 持锁/争锁严重 |
+
+block 和 mutex 默认关，要 `runtime.SetBlockProfileRate / SetMutexProfileFraction` 打开。
+
+## CPU 怎么用
+
+```bash
+# 采 30s
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+
+# 交互
+(pprof) top10              # 自身耗时 Top
+(pprof) top10 -cum         # 累计耗时 Top
+(pprof) list FuncName      # 看具体函数行级
+(pprof) web                # 浏览器看火焰图（要 graphviz）
+
+# 一步火焰图
+go tool pprof -http=:8080 cpu.pprof
+```
+
+## Heap 两种视角
+
+```bash
+# 默认 inuse_space：当前还在用的
+go tool pprof -inuse_space http://.../heap
+
+# alloc_space：累积分配（找"高频小对象"）
+go tool pprof -alloc_space http://.../heap
+```
+
+## Goroutine 泄漏
+
+```bash
+# 看每个调用栈现在有多少 G
+curl http://localhost:6060/debug/pprof/goroutine?debug=1 | head -50
+```
+
+## 一句话总结
+
+> CPU 找热点、Heap 找内存源、Goroutine 找泄漏、Block/Mutex 找锁竞争；别等线上烧了才学。
+</script>
+
+<script type="text/markdown" data-id="golang/trace">
+# trace 工具实战
+
+> 一句话：runtime/trace 记录调度器、GC、syscall、网络的精细事件；适合看"延迟尖峰、GC pause、并发瓶颈"。
+
+## 采集
+
+```go
+import "runtime/trace"
+
+f, _ := os.Create("trace.out")
+trace.Start(f)
+defer trace.Stop()
+// ... 跑要观察的逻辑
+```
+
+或线上用 pprof 端点：
+
+```bash
+curl 'http://localhost:6060/debug/pprof/trace?seconds=10' > trace.out
+go tool trace trace.out
+```
+
+## 浏览器界面看什么
+
+| 视图 | 用途 |
+|---|---|
+| **View trace** | 总览：每个 P 的时间线，G 切换、syscall、GC |
+| **Goroutine analysis** | 按 G 看延迟构成（执行/等待/syscall/GC） |
+| **Network blocking profile** | 网络 IO 等待 |
+| **Synchronization blocking** | chan / Mutex 等待 |
+| **Syscall blocking** | syscall 等待 |
+| **Scheduler latency** | G 从 ready 到真正跑的延迟（关键指标） |
+| **GC** | 每次 STW 时长、并发标记区间 |
+
+## 典型问题对应
+
+| 现象 | 看哪 |
+|---|---|
+| 偶发延迟尖峰 | scheduler latency / GC |
+| GC 拖慢业务 | GC 视图，看 STW 时长 |
+| 一个 G 卡很久 | goroutine analysis |
+| 锁竞争严重 | sync blocking |
+
+## trace vs pprof
+
+- pprof：**统计**，告诉你"哪里花时间"
+- trace：**时间线**，告诉你"什么时候发生了什么"
+
+两者互补；先 pprof 找热点，再 trace 看时序。
+
+## 一句话总结
+
+> trace 是细粒度时间线，专治"为什么偶尔慢一下"——GC pause、调度延迟、锁等待都能看到。
+</script>
+
+<script type="text/markdown" data-id="golang/unsafe-pointer">
+# unsafe.Pointer 6 条规则
+
+> 一句话：unsafe.Pointer 能在指针类型间转换，但只有 6 种合法用法；用错就是未定义行为，GC 也可能搬走对象。
+
+## 6 条规则（官方文档原话精简）
+
+1. **`*T1 ↔ *T2`**（通过 unsafe.Pointer 中转）
+2. **`uintptr ← unsafe.Pointer`**（看一下数值，不能反向）
+3. **`unsafe.Pointer ← uintptr` 算偏移要立即用**：
+
+   ```go
+   p := unsafe.Pointer(uintptr(unsafe.Pointer(&s)) + offsetA)  // ✅
+   // 不能拆成两行存 uintptr
+   ```
+
+4. **syscall.Syscall 接受 uintptr 参数**（编译器特殊处理保活）
+5. **reflect.Value.Pointer / UnsafeAddr**（同上）
+6. **reflect.SliceHeader / StringHeader**（已不推荐，1.20+ 用 unsafe.Slice/String/SliceData/StringData）
+
+## 为什么 uintptr 不能存
+
+GC 移动对象时只识别 unsafe.Pointer 类型；uintptr 在 GC 看来只是个数字，对象搬了 uintptr 还指向旧地址。
+
+```go
+// ❌ 错误
+addr := uintptr(unsafe.Pointer(&x))
+// GC 来了，x 可能搬家
+y := *(*int)(unsafe.Pointer(addr))  // 野指针
+
+// ✅ 算偏移要单语句完成
+y := *(*int)(unsafe.Pointer(uintptr(unsafe.Pointer(&x)) + 8))
+```
+
+## 1.20+ 安全工具
+
+```go
+unsafe.Slice(p, n)        // ptr → []T，自动加保活
+unsafe.SliceData(s)       // []T → ptr
+unsafe.String(p, n)
+unsafe.StringData(s)
+```
+
+## 何时不得不用
+
+- 序列化（避免拷贝大 buffer）
+- mmap 对接 C 结构
+- 极端性能场景的 string ↔ []byte
+
+## 一句话总结
+
+> 6 条规则记牢，uintptr 不能跨语句存；1.20+ 的 unsafe.Slice / String 比手写更安全。
+</script>
+
+<script type="text/markdown" data-id="golang/cgo">
+# cgo 的开销与坑
+
+> 一句话：cgo 让 Go 调 C，但每次调用要切到 g0 栈、跨调度器边界，开销 ~50ns~200ns；高频路径上慎用。
+
+## 用法
+
+```go
+/*
+#include <stdio.h>
+void hello() { printf("hi\n"); }
+*/
+import "C"
+
+func main() {
+    C.hello()
+}
+```
+
+## 调用一次发生什么
+
+```text
+Go 函数
+  ↓
+cgo 包装函数
+  ↓ 切到 g0（系统栈）
+  ↓ 调度器把当前 G 标记 _Gsyscall（C 期间不让 GC 移栈）
+  ↓
+C 函数
+  ↓
+返回 → 切回 G 栈 → 检查抢占 → 继续
+```
+
+每次调用：**切栈 + 调度器登记 + 屏蔽 GC**。开销远大于普通函数（ns 级 → 几十 ns 级）。
+
+## 5 个坑
+
+1. **C 栈不会增长**：默认 8MB；C 内部递归深要小心
+2. **goroutine 不能在 C 里被抢占**：sysmon 看不到，长跑 C 影响 GC
+3. **指针传递要小心**：Go 指针传给 C 必须保证 C 调用期间不动；Go 1.6+ 有 cgocheck
+4. **C 函数不能持有 Go 指针超过返回**：否则 GC 后野指针
+5. **跨语言 panic / signal 处理混乱**：C 里 SIGSEGV 别指望 Go recover
+
+## 怎么减少开销
+
+- 批量调用：一次调 C 处理 1000 个，比调 1000 次便宜
+- 别在热路径上 cgo
+- 能用纯 Go 库（即使略慢）就别 cgo
+
+## 编译影响
+
+- 触发 cgo 的项目编译要 gcc/clang
+- 交叉编译变难
+- 二进制依赖 libc（不再是纯静态）
+
+## 一句话总结
+
+> cgo = 切栈 + 调度边界 + GC 屏蔽，开销几十 ns；批量化 + 避开热路径，能不用就别用。
+</script>
+
+<!-- ============ 渲染逻辑 ============ -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script>
+const state = { manifest: null, articles: {}, currentId: null, headings: [], tocCollapsed: new Set() };
+
+function loadManifest() {
+  const el = document.getElementById('manifest');
+  state.manifest = JSON.parse(el.textContent);
+  document.title = state.manifest.site.title;
+  document.getElementById('siteTitle').textContent = state.manifest.site.title;
+  document.getElementById('siteSubtitle').textContent = state.manifest.site.subtitle || '';
+}
+
+function loadArticles() {
+  const blocks = document.querySelectorAll('script[type="text/markdown"][data-id]');
+  blocks.forEach(b => {
+    const id = b.dataset.id;
+    let text = b.textContent;
+    text = text.replace(/^\n/, '').replace(/\s+$/, '');
+    state.articles[id] = text;
+  });
+}
+
+function stripHtml(s) {
+  const d = document.createElement('div');
+  d.innerHTML = s;
+  return d.textContent || '';
+}
+
+function renderMarkdown(md) {
+  marked.setOptions({ gfm: true, breaks: false });
+  let html = marked.parse(md);
+  let i = 0;
+  state.headings = [];
+  html = html.replace(/<(h[1-3])([^>]*)>([\s\S]*?)<\/\1>/g, (m, tag, attrs, inner) => {
+    const id = `h-${i++}`;
+    const level = parseInt(tag[1], 10);
+    state.headings.push({ id, text: stripHtml(inner), level });
+    return `<${tag} id="${id}"${attrs}>${inner}</${tag}>`;
+  });
+  return html;
+}
+
+function countWords(text) {
+  const cjk = (text.match(/[一-鿿㐀-䶿]/g) || []).length;
+  const ascii = (text.match(/[A-Za-z0-9_]+/g) || []).length;
+  return cjk + ascii;
+}
+
+function readingMinutes(words) {
+  return Math.max(1, Math.round(words / 400));
+}
+
+function renderSidebar() {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = '';
+  for (const group of state.manifest.groups) {
+    const wrap = document.createElement('div');
+    wrap.className = 'nav-group';
+    const title = document.createElement('h3');
+    title.className = 'nav-group-title';
+    title.textContent = group.title;
+    wrap.appendChild(title);
+    const ul = document.createElement('ul');
+    ul.className = 'nav-list';
+    for (const item of group.items) {
+      const li = document.createElement('li');
+      li.className = 'nav-item';
+      li.dataset.id = item.id;
+      const a = document.createElement('a');
+      a.href = `#${item.id}`;
+      a.textContent = item.title;
+      a.addEventListener('click', (e) => {
+        if (state.currentId === item.id) {
+          e.preventDefault();
+          if (state.tocCollapsed.has(item.id)) state.tocCollapsed.delete(item.id);
+          else state.tocCollapsed.add(item.id);
+          highlightActive();
+        }
+      });
+      li.appendChild(a);
+      ul.appendChild(li);
+    }
+    wrap.appendChild(ul);
+    nav.appendChild(wrap);
+  }
+}
+
+function highlightActive() {
+  document.querySelectorAll('.nav-item').forEach(li => {
+    const isActive = li.dataset.id === state.currentId;
+    li.classList.toggle('active', isActive);
+    li.classList.toggle('collapsed', isActive && state.tocCollapsed.has(li.dataset.id));
+    const existing = li.querySelector('.toc');
+    if (existing) existing.remove();
+    if (isActive && state.headings.length && !state.tocCollapsed.has(li.dataset.id)) {
+      const toc = document.createElement('ul');
+      toc.className = 'toc';
+      for (const h of state.headings) {
+        if (h.level !== 2) continue;
+        const tli = document.createElement('li');
+        const ta = document.createElement('a');
+        ta.href = '#';
+        ta.textContent = '- ' + h.text;
+        ta.addEventListener('click', (e) => {
+          e.preventDefault();
+          const el = document.getElementById(h.id);
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+        tli.appendChild(ta);
+        toc.appendChild(tli);
+      }
+      li.appendChild(toc);
+    }
+  });
+}
+
+function showArticle(id) {
+  const article = document.getElementById('article');
+  const meta = document.getElementById('meta');
+  const md = state.articles[id];
+
+  if (!md) {
+    article.innerHTML = `<div class="placeholder">⚠️ 文章 <code>${id}</code> 尚未编写。<br><span style="font-size:12px">在 index.html 中添加一个 &lt;script type="text/markdown" data-id="${id}"&gt; 块即可。</span></div>`;
+    meta.textContent = '';
+    state.currentId = id;
+    state.headings = [];
+    highlightActive();
+    return;
+  }
+
+  article.innerHTML = renderMarkdown(md);
+  const words = countWords(md);
+  meta.textContent = `${words} 字 · ${readingMinutes(words)} 分钟`;
+  state.currentId = id;
+  highlightActive();
+  window.scrollTo({ top: 0 });
+}
+
+function handleHash() {
+  const id = location.hash.replace(/^#/, '');
+  if (!id) {
+    const first = state.manifest.groups[0]?.items[0];
+    if (first) location.hash = first.id;
+    return;
+  }
+  if (id !== state.currentId) showArticle(id);
+}
+
+(function init() {
+  loadManifest();
+  loadArticles();
+  renderSidebar();
+  window.addEventListener('hashchange', handleHash);
+  handleHash();
+})();
+</script>
+
+</body>
+</html>

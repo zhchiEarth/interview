@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>反射 reflect 原理与代价 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 反射 reflect 原理与代价
+
+## 一、reflect 是干嘛用的
+
+Go 是**静态强类型**——编译期就定死类型。但有些场景**编译时不知道类型**，只在**运行时**才能确定：
+
+```go
+// 写一个通用的 JSON 编码器:
+// 输入是任何类型, 怎么知道有几个字段? 字段叫啥? 类型是啥?
+func Marshal(v any) ([]byte, error) {
+    // 不能写 v.Name, v.Age, 不知道字段名
+    // 只能"在运行时检查 v 到底是什么"
+}
+```
+
+`reflect` 包就是**运行时检查/操作类型信息的逃生通道**。
+
+适用场景：
+
+| 场景 | 例子 |
+|---|---|
+| 通用序列化 | `encoding/json`、`yaml`、protobuf |
+| ORM | gorm / ent 把 struct 映射到数据库 |
+| 配置注入 / DI | 自动把环境变量装到 struct |
+| 测试断言 | `assert.Equal`（深度比较任意类型） |
+| RPC 框架 | 把 struct 序列化成调用参数 |
+
+**不适用**：
+
+- 普通业务代码（用泛型 / 代码生成）
+- 性能敏感的热路径（reflect 比直接调用慢 **50 ~ 100 倍**）
+
+---
+
+## 二、reflect 的底层：从 interface 来
+
+reflect 不是魔法——它本质上是 **`interface{}` 元数据的 API**。
+
+### interface 的内存结构
+
+回顾 [Interface 底层实现](../01-basic/interface.html)：
+
+```
+var i any = 42
+
+interface 在内存里:
+  ┌──────────────────────┐
+  │ type: *_type          │ ← 类型信息 (告诉别人"我是 int")
+  ├──────────────────────┤
+  │ data: unsafe.Pointer ─┼──→ 真实值 42
+  └──────────────────────┘
+```
+
+`*_type` 指向**类型描述符**——里面包含类型名、Kind、大小、字段列表、方法集等所有元信息。
+
+### reflect 干的事
+
+```go
+v := reflect.ValueOf(x)     // 把 x 拆成 (type, data) 暴露出来
+t := reflect.TypeOf(x)      // 拿 type 部分
+```
+
+→ `reflect.Value` / `reflect.Type` 就是把 interface 内部那个 `(type, data)` **包装成 Go 用户可操作的结构**。
+
+**没什么神秘**——reflect 能做的事，都是 interface 内部数据本来就有的。
+
+---
+
+## 三、reflect 三件套
+
+```go
+v := reflect.ValueOf(x)   // reflect.Value — 操作"值"
+t := reflect.TypeOf(x)    // reflect.Type  — 查"类型"
+k := t.Kind()              // reflect.Kind  — 类型分类 (Int / Slice / Struct ...)
+```
+
+### Type vs Kind
+
+容易混淆：
+
+```go
+type UserID int
+
+var u UserID = 1
+t := reflect.TypeOf(u)
+fmt.Println(t.Name())   // "UserID"   ← 完整类型名
+fmt.Println(t.Kind())   // "int"      ← 底层类型分类
+```
+
+| | Type | Kind |
+|---|---|---|
+| 含义 | **具体类型**（用户定义的名字） | **类型分类**（26 种之一） |
+| 例 `type X int` | `X` | `int` |
+| 例 `[]string` | `[]string` | `Slice` |
+| 例 `struct{...}` | 完整 struct 描述 | `Struct` |
+
+**写反射代码时一般用 Kind 做 switch**：
+
+```go
+switch v.Kind() {
+case reflect.Int, reflect.Int8, ..., reflect.Int64:
+    n := v.Int()    // 拿 int64
+case reflect.String:
+    s := v.String()
+case reflect.Slice:
+    for i := 0; i < v.Len(); i++ { ... }
+case reflect.Struct:
+    for i := 0; i < v.NumField(); i++ { ... }
+}
+```
+
+---
+
+## 四、读 struct 字段 + tag
+
+```go
+type User struct {
+    Name string `json:"name" validate:"required"`
+    Age  int    `json:"age"`
+}
+
+u := User{Name: "alice", Age: 30}
+v := reflect.ValueOf(u)
+t := v.Type()
+
+for i := 0; i < t.NumField(); i++ {
+    f := t.Field(i)                          // reflect.StructField (元信息)
+    val := v.Field(i)                         // reflect.Value (值)
+
+    fmt.Println(
+        f.Name,                               // "Name", "Age"
+        f.Tag.Get("json"),                    // "name", "age"
+        f.Tag.Get("validate"),                // "required", ""
+        val.Interface(),                      // alice, 30
+    )
+}
+```
+
+**`StructField` 携带字段元数据**（名字、类型、tag、offset）；**`Value.Field(i)` 给具体值**。这是 JSON 编码器的核心逻辑。
+
+---
+
+## 五、修改值：可寻址性
+
+```go
+u := User{Name: "alice"}
+v := reflect.ValueOf(u)
+v.FieldByName("Name").SetString("bob")   // ❌ panic: reflect.Value.SetString using unaddressable value
+```
+
+为什么？因为 `reflect.ValueOf(u)` 拿到的是 **u 的拷贝**——改这个拷贝没意义，所以 Go 直接禁止。
+
+**修法：传指针然后 Elem()**
+
+```go
+v := reflect.ValueOf(&u).Elem()           // &u 是指针, Elem() 解引用
+v.FieldByName("Name").SetString("bob")    // ✓
+fmt.Println(u.Name)                        // "bob"
+```
+
+### 三条修改规则
+
+```go
+v.CanSet()         // 能不能改? false 时 SetXxx 会 panic
+v.CanAddr()        // 能不能取地址? false 时 Addr() panic
+```
+
+可改的条件：
+
+1. 必须是**指针通过 Elem() 拿到的 Value**（不能是值拷贝）
+2. 字段必须**导出**（首字母大写）——不导出的字段反射也改不了
+
+---
+
+## 六、调用方法
+
+```go
+type Greeter struct{ Name string }
+func (g Greeter) Greet(msg string) string {
+    return msg + " " + g.Name
+}
+
+g := Greeter{Name: "Go"}
+v := reflect.ValueOf(g)
+m := v.MethodByName("Greet")
+
+result := m.Call([]reflect.Value{
+    reflect.ValueOf("hello"),
+})
+fmt.Println(result[0].String())   // "hello Go"
+```
+
+**`Method.Call`** 是 reflect 最贵的操作——每次 Call 要：
+
+1. 检查参数类型
+2. 把 `[]reflect.Value` 解开成实际参数
+3. 走通用调用栈准备
+4. 真正调用
+5. 把返回值包成 `[]reflect.Value`
+
+性能比直接调用慢 **100 倍** 以上。
+
+---
+
+## 七、性能代价
+
+| 操作 | 相对开销 | 直觉值 |
+|---|---|---|
+| 直接调用 / 字段访问 | **1×** | ~1 ns |
+| interface 方法调用 | ~5× | ~5 ns |
+| **reflect 字段读** | **~50×** | ~50 ns |
+| **reflect 方法调用** | **~100×** | ~100 ns |
+| **reflect 创建实例** | ~200× | ~200 ns |
+
+### 为什么慢
+
+1. **每次都查类型描述符**——没编译期优化，运行时遍历字段表
+2. **逃逸到堆**——`reflect.Value` 通常逃逸（interface 装箱）
+3. **检查多**——CanSet / Kind / 类型一致性都要查
+4. **`Method.Call` 走通用反射调用路径**——参数解包/打包开销大
+
+### 怎么优化（如果必须用）
+
+1. **缓存 `reflect.Type` / `StructField`**——同一个类型只查一次
+
+```go
+var typeCache sync.Map  // type → []FieldInfo
+
+func getFields(t reflect.Type) []FieldInfo {
+    if cached, ok := typeCache.Load(t); ok {
+        return cached.([]FieldInfo)
+    }
+    // 慢路径: 第一次, 用 reflect 扫描后缓存
+    ...
+}
+```
+
+`encoding/json` 内部就这么做。
+
+2. **绕过 `Value.Interface()`**——这一步会装箱，开销大。能用 `.Int()` / `.String()` 等就别 `.Interface()`。
+
+3. **必要时降级到 `unsafe.Pointer`**——直接根据 offset 读字段，绕开 reflect。例如 mongo-driver、easyjson 这么做。
+
+---
+
+## 八、什么时候不得不用 reflect
+
+| 场景 | 替代方案？ |
+|---|---|
+| `encoding/json` | 代码生成（easyjson）/ Sonic 库 |
+| ORM 映射 | 代码生成（sqlc / ent） |
+| 配置注入 | 静态映射 / 泛型 |
+| **类型完全未知** | **只能 reflect**（无替代） |
+| 测试 assert | 凑合用，反正不是热路径 |
+
+→ 大多数 reflect 场景**有更快的替代方案**——只是开发成本高。
+
+---
+
+## 九、Go 1.18+ 泛型：reflect 的最大对手
+
+```go
+// 以前用 reflect:
+func Contains(slice any, v any) bool {
+    s := reflect.ValueOf(slice)
+    for i := 0; i < s.Len(); i++ {
+        if reflect.DeepEqual(s.Index(i).Interface(), v) {
+            return true
+        }
+    }
+    return false
+}
+// 慢 50×, 类型不安全
+
+// Go 1.18+ 用泛型:
+func Contains[T comparable](s []T, v T) bool {
+    for _, x := range s {
+        if x == v { return true }
+    }
+    return false
+}
+// 跟直接写一样快, 编译期类型检查
+```
+
+**结论**：**类型在编译期已知 → 用泛型**；**只在运行时知道（如 JSON 解码任意 struct）→ 仍需 reflect**。
+
+---
+
+## 十、典型陷阱
+
+### ① ValueOf 拿到拷贝，改不了
+
+如前述，要 `reflect.ValueOf(&x).Elem()`。
+
+### ② Interface() 装箱导致逃逸
+
+```go
+v := reflect.ValueOf(x)
+i := v.Interface()    // 这一步可能让 x 逃到堆
+```
+
+热路径上要警惕。
+
+### ③ Type 比较用 `==`，不用 reflect.DeepEqual
+
+```go
+t1 := reflect.TypeOf(x)
+t2 := reflect.TypeOf(y)
+t1 == t2            // ✓ 比较类型描述符指针, 快
+reflect.DeepEqual(t1, t2)  // ❌ 比较内部字段, 慢
+```
+
+### ④ FieldByName 慢，缓存索引
+
+```go
+// ❌ 高频路径
+for _, u := range users {
+    v := reflect.ValueOf(&u).Elem()
+    v.FieldByName("Name").SetString(...)   // 每次都按名字查
+}
+
+// ✓ 缓存索引
+t := reflect.TypeOf(User{})
+nameField, _ := t.FieldByName("Name")
+idx := nameField.Index   // [0] 之类的索引
+for _, u := range users {
+    v := reflect.ValueOf(&u).Elem()
+    v.FieldByIndex(idx).SetString(...)
+}
+```
+
+### ⑤ Kind 判断写死，新类型遗漏
+
+```go
+switch v.Kind() {
+case reflect.Int, reflect.Int64:
+    ...
+// 漏了 Int8, Int16, Int32 → 那些类型走不到, 静默失败
+}
+```
+
+要么处理所有 Int*，要么用 `v.CanInt()`（Go 1.18+）。
+
+---
+
+## 十一、一图总结
+
+```
+                  reflect 的本质
+                        │
+              "运行时拿到 interface (type, data) 元数据"
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+     reflect.Type                   reflect.Value
+     类型元信息                      值 + 类型
+     字段列表 / 方法表               .Int() / .String() / .Field()
+     .Name() / .Kind()
+        │
+        ▼
+   Kind 分类 (26 种):
+     Bool / Int / Int8.. / Uint / Float / String /
+     Slice / Map / Chan / Func / Interface / Struct / Ptr ...
+
+   读: v := reflect.ValueOf(x)         + v.Field(i) / FieldByName
+       t := reflect.TypeOf(x)          + t.Field(i).Tag.Get("json")
+   写: v := reflect.ValueOf(&x).Elem() + v.FieldByName("Name").SetString(...)
+       (必须传指针, 字段必须导出)
+   调: m := v.MethodByName("F")        + m.Call([]reflect.Value{...})
+
+   性能档位:
+     直接调用:      1×    (~1 ns)
+     interface:    5×    (~5 ns)
+     reflect 读:   50×   (~50 ns)
+     reflect 调:  100×   (~100 ns)
+
+   什么时候用:
+     ✅ JSON 编码 / ORM / DI / 测试断言
+     ✅ 类型完全未知 (运行时才确定)
+     ❌ 普通业务 (用泛型)
+     ❌ 热路径 (慢 50×)
+
+   优化:
+     缓存 reflect.Type / 字段索引
+     避免 .Interface() 装箱
+     考虑代码生成 (easyjson / sqlc)
+     极致场景用 unsafe.Pointer
+```
+
+**一句话**：reflect 是 **interface (type, data) 元数据的 API**——把运行时类型信息暴露给用户代码。**功能强但慢** 50~100 倍——只在"**编译时类型未知**"时不得不用（JSON / ORM 等），其它场景**优先泛型 + 代码生成**。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/reflect" data-base="../../"></script>
+</body>
+</html>

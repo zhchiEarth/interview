@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>高可用：Controller 选举与防脑裂 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 高可用：Controller 选举与防脑裂
+
+> 一句话：集群里要选出一个 **Controller** 来统管元数据和分区 Leader 选举；选 Controller、选分区 Leader、选消费组 Leader 是三件**完全不同**的事；而防止"老 Controller / 老 Leader 复活后乱发命令"靠的是 **Controller Epoch + Leader Epoch** 两个单调递增的版本号。
+
+## 一、先分清三种"选举"（最容易混）
+
+面试里一说"选举"经常把这三个搅在一起，先用一张表钉死：
+
+| 选举对象 | 选什么 | 谁来选 / 怎么选 | 作用范围 |
+|---|---|---|---|
+| **Controller 选举** | 从所有 Broker 里选**一个**当 Controller | **ZK 模式**：抢着注册 ZK 临时节点 `/controller`，谁先创建成功谁当；<br>**KRaft 模式**：controller quorum 用 **Raft** 选出 leader | 整个集群一个 |
+| **Partition Leader 选举** | 某个分区的新 Leader | **Controller** 从该分区的 **ISR** 里选（默认按 ISR 中的顺序挑第一个存活的） | 每个分区各选各的 |
+| **Consumer Group Leader** | 消费组内负责"分区分配方案"的那个 consumer | 消费组内**第一个加入**的 consumer 当 Leader（由 Group Coordinator 指定） | 与上面两个**毫无关系** |
+
+```text
+   ┌── Controller 选举 ──┐    选出 1 个 Broker 当总管
+   │                      │
+   │   Controller         │──触发──► Partition Leader 选举（从 ISR 里选）
+   │   （集群级）          │
+   └──────────────────────┘
+
+   ┌── Consumer Group Leader ──┐  消费组内部的事，跟上面两个无关
+   │  第一个进组的 consumer    │  只负责算"哪个 consumer 消费哪些分区"
+   └───────────────────────────┘
+```
+
+> 一句话区分：**Controller 选举**选"集群总管"；**Partition Leader 选举**由总管从 ISR 里选"分区主副本"；**Consumer Group Leader** 只是消费组内部用来做分区分配的角色，**别和前两个混**。
+
+下面重点讲前两个（高可用相关），消费组的 Rebalance 不在本篇展开。
+
+## 二、Controller 是干什么的
+
+Controller 是从 Broker 中选出来的"集群大脑"，**职责**：
+
+- **管理分区 / 副本的状态机**：记录每个分区、每个副本处于什么状态（在线 / 下线 / Leader / Follower 等）。
+- **触发 Partition Leader 选举**：当某分区 Leader 所在 Broker 宕机，Controller 负责从该分区 ISR 里选出新 Leader。
+- **把元数据变更下发给各 Broker**：Leader 变了、副本分配变了，Controller 通过控制类请求广播给相关 Broker，让全集群视图一致。
+
+```text
+        ┌─────────────── Controller (某个 Broker) ───────────────┐
+        │  · 维护分区/副本状态机                                  │
+        │  · 监听 Broker 上下线                                   │
+        │  · Leader 挂了 → 从 ISR 选新 Leader                    │
+        │  · 元数据变更 → 下发给相关 Broker                      │
+        └───────────────────────┬────────────────────────────────┘
+                                 │ 下发元数据 / Leader 变更
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+          Broker-1           Broker-2           Broker-3
+```
+
+## 三、Partition Leader 选举与 Unclean Leader Election
+
+当某分区的 Leader 宕机，Controller 默认**从该分区 ISR 里**选新 Leader（按 ISR 顺序挑第一个存活的）。但如果 **ISR 里的副本全挂了**怎么办？这就是 `unclean.leader.election.enable` 要回答的问题：
+
+```text
+   ISR 全部挂掉，只剩 OSR（落后副本）还活着
+              │
+   ┌──────────┴──────────────────────────────────┐
+   │                                              │
+ unclean=true                              unclean=false（默认）
+   │ 允许从 OSR 选一个落后副本当 Leader            │ 不允许，分区直接不可用
+   ▼                                              ▼
+ ✅ 保可用（分区能继续读写）                  ✅ 保一致（绝不丢已提交数据）
+ ❌ 丢数据（OSR 落后，HW 之后的消息没了）      ❌ 分区不可用，直到某个 ISR 副本恢复
+```
+
+| `unclean.leader.election.enable` | 含义 | 取舍（CAP） |
+|---|---|---|
+| **true** | ISR 全挂时，允许从 OSR（落后副本）选 Leader | 偏 **AP**：保可用，但 OSR 落后 → **丢数据** |
+| **false**（默认） | 只从 ISR 选；ISR 全挂则该分区不可用 | 偏 **CP**：保一致 / 不丢，但**分区可能不可用** |
+
+> 这是典型的 CAP 取舍：要可用就可能丢数据，要一致就可能不可用。生产环境对数据强一致要求高时保持默认 `false`。关于 ISR / OSR 的定义见 [副本机制：AR / ISR / OSR / HW / LEO](replica.html)。
+
+## 四、防脑裂：两个 Epoch
+
+**脑裂**：老 Controller / 老 Leader 因长时间 GC、网络分区被判定"死亡"，集群已选出新的；但老节点恢复后**还以为自己是老大**，继续对外发命令 —— 一旦被执行就会数据错乱。Kafka 用两个单调递增的版本号 **Epoch** 来识别并拒绝"过气节点"。
+
+### 4.1 Controller Epoch —— 防老 Controller 乱发命令
+
+每产生一个新的 Controller，**Controller Epoch +1**。Broker 收到控制命令时会比对 epoch，**只认更大的 epoch，直接丢弃旧 epoch 的命令**。
+
+```text
+   时刻 T0  Controller-A（epoch=5）长时间 GC，被判定下线
+   时刻 T1  集群选出 Controller-B（epoch=6），开始正常工作
+   时刻 T2  Controller-A 的 GC 结束"复活"，仍以为自己是 Controller(epoch=5)
+            │
+            ▼  A 向 Broker 发命令，携带 epoch=5
+   ┌─────────────────────────────────────────────┐
+   │  Broker：我已知最新 Controller epoch = 6     │
+   │  收到 epoch=5 的命令 < 6  →  ❌ 拒绝/丢弃     │
+   └─────────────────────────────────────────────┘
+   → 老 Controller 被隔离后回来，命令一律被拒，脑裂被消除
+```
+
+### 4.2 Leader Epoch —— 防老 Leader 复活后乱写 / 截断不一致
+
+每个分区的 Leader 也有自己的 **Leader Epoch**，每次该分区重新选 Leader 时 +1。它解决两个问题：
+
+1. **老 Leader 复活后乱写**：老 Leader 带着旧 Leader Epoch 回来，Follower / 新 Leader 据 epoch 识别它已过气，拒绝其写入。
+2. **日志截断不一致**：Follower 重启后不再简单地"按 HW 截断"（这在主从切换时会误删/错留数据），而是带上自己的 Leader Epoch 向 Leader 查询该 epoch 的起始 offset，按更精确的位置做截断，避免副本间数据分叉。
+
+```text
+   分区 P0 历史：epoch 0 → epoch 1 → epoch 2（每次换 Leader +1）
+
+   老 Leader（epoch=1）网络分区后复活，试图继续追加写：
+            │
+            ▼
+   ┌─────────────────────────────────────────────┐
+   │  当前 Leader / Follower 已在 epoch=2          │
+   │  收到 epoch=1 的写/同步请求  →  ❌ 拒绝       │
+   └─────────────────────────────────────────────┘
+   → 老 Leader 无法写入，避免脏数据；截断也按 epoch 精确对齐
+```
+
+| Epoch | 范围 | 防的是什么 |
+|---|---|---|
+| **Controller Epoch** | 集群级 | 老 **Controller** 复活后乱发控制命令（Broker 拒绝旧 epoch） |
+| **Leader Epoch** | 分区级 | 老 **Leader** 复活后乱写；以及主从切换时按 HW 截断导致的日志不一致 |
+
+## 五、ZK 模式 vs KRaft 模式（Controller 选举的演进）
+
+| 维度 | ZK 模式（老） | KRaft 模式（3.x+） |
+|---|---|---|
+| Controller 怎么选 | 抢注册 ZK 临时节点 `/controller`，谁先谁当 | controller quorum 内用 **Raft** 选 leader |
+| 元数据存哪 | ZooKeeper | 内置 metadata 日志（`__cluster_metadata`），Raft 复制 |
+| 防脑裂 | Controller Epoch（写在 ZK） | Raft 任期（term）天然防脑裂 + epoch |
+
+> 详细对比见 [ZooKeeper vs KRaft](kraft.html)。
+
+## 六、一句话总结
+
+> 三种"选举"别混：**Controller 选举**选集群总管（ZK 抢节点 / KRaft 用 Raft），**Partition Leader 选举**由 Controller 从 **ISR** 里选，**Consumer Group Leader** 只是消费组内部分配角色；ISR 全挂时 `unclean.leader.election.enable` 决定"从 OSR 选(可用但丢数据)还是不选(一致但不可用)"；而 **Controller Epoch + Leader Epoch** 两个单调递增版本号让 Broker 拒绝过气节点的命令/写入，从根上防住脑裂。
+
+---
+
+**相关：** [副本机制：AR / ISR / OSR / HW / LEO](replica.html) · [可靠性](reliability.html) · [ZooKeeper vs KRaft](kraft.html) · [Kafka 知识地图](knowledge-graph.html)
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/election" data-base="../"></script>
+</body>
+</html>

@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CSP 模型：channel + select 的理论根基 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# CSP 模型：channel + select 的理论根基
+
+> 本篇是 channel / select 的**理论入口**——读完会理解为什么 Go 把这两个东西做成语言关键字，而不是库。
+>
+> 后续深入：
+> - 实现细节 → [Channel 底层实现与安全关闭](internals.html)
+> - select 算法 → [select 是怎么工作的？](select.html)
+
+## 一、为什么要先理解 CSP
+
+很多人学 Go 并发是这样的路径：
+
+```
+学语法 → 写 chan ← v / <- chan → 学 select → 学 goroutine → 写出能跑的代码
+                                  ↑
+                              停在这里
+                              不知道为什么是这样
+```
+
+会用，但不知道**为什么 Go 把 channel 和 select 做成语言级关键字**——而不是像 Java/Python 那样放在标准库里。
+
+答案：**这两个东西不是孤立的设计，它们一起实现了一个叫 CSP 的并发理论**。把 CSP 这个理论框架装进脑子，channel + select 立刻自洽：
+
+- **channel** = CSP 里的"通信管道"
+- **select** = CSP 里的"多路通信选择"
+- **goroutine** = CSP 里的"进程"
+- 三者合起来 = Go 把 CSP 理论落到工程上
+
+---
+
+## 二、CSP 是什么——一句话和来历
+
+**CSP（Communicating Sequential Processes）** 是计算机科学家 **Tony Hoare** 在 **1978 年**论文里提出的并发理论。1985 年他写了同名书，成为并发编程的经典理论之一。
+
+核心思想一句话：
+
+> **并发的多个进程，靠在 channel 上互相收发消息来协作——不共享内存，只交换信息。**
+
+Go 官方口号直接表达了这个思想：
+
+> **"Don't communicate by sharing memory; share memory by communicating."**
+>
+> 不要通过共享内存来通信，要通过通信来共享内存。
+
+### 对比传统并发模型
+
+| 维度 | 共享内存 + 锁 | CSP（channel） |
+|---|---|---|
+| **怎么传数据** | 多线程读写同一块内存，靠锁同步 | 通过 channel 显式发/收 |
+| **数据所有权** | 模糊（谁都能访问） | 明确（一发即转移） |
+| **容易出 bug 的点** | 死锁、数据竞争、内存可见性 | 一般不会数据竞争 |
+| **代表语言** | Java / C++ / Python | **Go / Erlang / Occam** |
+
+---
+
+## 三、CSP 的五大组成
+
+Hoare 的 CSP 理论里，并发系统由**五个核心概念**构成。理解这五件套，就理解了 CSP。
+
+### ① Process（进程）
+
+CSP 里的"进程"是**顺序执行的独立计算单元**——可以理解为一个独立的执行流。每个 Process 内部按顺序执行代码，多个 Process 并发存在。
+
+> 不是操作系统的 process，是 CSP 理论里的抽象单位。
+
+### ② Channel（通道）
+
+进程之间唯一的通信方式——**有命名、有类型的消息管道**。
+
+```
+Process A          Channel c          Process B
+   │ ─── send v ──→  │  ─── recv ──→   │
+```
+
+进程之间**没有共享变量**——所有协作只通过 channel 收发。
+
+### ③ Send / Receive（收发原语）
+
+CSP 用两个原语在 channel 上通信：
+
+```
+c ! v   表示"在 channel c 上发送 v"   (! 是 send)
+c ? x   表示"从 channel c 接收, 存到 x" (? 是recv)
+```
+
+**关键性质：同步**。CSP 原版的 channel 是**同步 channel**：
+
+- 发送方 `c ! v` 必须等到接收方就绪才能返回（"碰头" / rendezvous）
+- 反之亦然
+
+这种同步通信叫 **"rendezvous"**——交付的瞬间双方都在线，**数据所有权完成转移**。
+
+### ④ Alternative（多路选择，ALT）
+
+CSP 的核心运算之一——**同时等多条通信，谁先就绪走谁**：
+
+```
+ALT
+  c1 ? x → P1     // 收到 c1 就跑 P1
+  c2 ! v → P2     // 能发 c2 就跑 P2
+  c3 ? y → P3     // 收到 c3 就跑 P3
+```
+
+这是 CSP 让并发协调变优雅的关键——一个进程能"**同时盯多条管道**"，不会被某条管道阻塞而错过其它。
+
+### ⑤ Composition（组合）
+
+CSP 用**进程代数**把简单进程组合成复杂系统：
+
+| 运算 | 语义 |
+|---|---|
+| `P ; Q` | 顺序：先跑 P，跑完跑 Q |
+| `P \|\| Q` | 并行：P 和 Q 并发执行 |
+| `P [] Q` | 外部选择：看外部输入选 P 或 Q |
+| `P \|~\| Q` | 内部选择：进程自己非确定选 |
+
+理论里很优雅；实践中 Go 只取了 `;`（普通代码）和 `||`（go 关键字）这两个最实用的。
+
+---
+
+## 四、Go 怎么实现这五大件——一对一映射
+
+Go 把 CSP 五件套**直接映射成语言关键字 / 内置类型**：
+
+| # | CSP 概念 | Go 实现 | Go 语法 |
+|---|---|---|---|
+| ① | **Process** | **goroutine** | `go func() { ... }()` |
+| ② | **Channel** | **`chan T`** 内置类型 | `make(chan int)` |
+| ③ | **Send / Receive** | **`<-`** 操作符 | `ch <- v` / `<-ch` |
+| ④ | **Alternative (ALT)** | **`select`** 关键字 | `select { case <-ch1: ... }` |
+| ⑤ | **Composition** | 顺序代码 + `go` 关键字 | `; ` 顺序、`go` 并行 |
+
+**每个 CSP 概念都对应 Go 的一个语言层 feature**——这就是为什么 channel/select 是关键字，不是库。
+
+### 详解每个映射
+
+#### Process → goroutine
+
+CSP 里的 process 在原文是个抽象——接近线程的重量级单位。Go 把它做成了**用户态轻量协程**：
+
+```
+CSP process:    ~ 接近 OS 线程, 2MB 栈
+goroutine:     用户态调度, 2KB 起步栈, 100 万个轻松跑
+```
+
+这是 Go 工程化的**最大改进**——CSP 理论上要 1 万个 process，操作系统会爆；Go 1 万个 goroutine 没事。
+
+#### Channel → `chan T`
+
+Go 的 channel 实现了 CSP channel 的所有核心性质：
+
+```go
+ch := make(chan int)         // 类型化
+ch := make(chan int, 10)     // 加缓冲 (CSP 扩展, 见第六节)
+
+func worker(in <-chan int) { ... }  // 只读端
+func emit(out chan<- int) { ... }   // 只写端
+```
+
+#### Send / Receive → `<-` 操作符
+
+```
+CSP            Go
+c ! v          ch <- v
+c ? x          x := <-ch
+```
+
+无缓冲 channel 时**保留同步 rendezvous 语义**——见 [channel/internals 第 1 版](internals.html)的"栈到栈直拷"。
+
+#### ALT → `select`
+
+```
+CSP ALT:                    Go select:
+
+ALT                          select {
+  c1 ? x → P1                case x := <-c1: P1()
+  c2 ! v → P2                case c2 <- v:   P2()
+  c3 ? y → P3                case y := <-c3: P3()
+                             }
+```
+
+**几乎一一映射**。Go 还加了 `default` 实现非阻塞 select，CSP 原版没有。
+
+#### Composition → 顺序代码 + `go`
+
+```go
+foo()      // P
+bar()      // ; Q (顺序)
+
+go foo()   // || (并行启动一个 process)
+go bar()
+```
+
+Go 没有 CSP 那种正式的"进程代数语法"——但够用。
+
+---
+
+## 五、把 channel 和 select 连起来看
+
+理解了五件套和映射后，再看 channel + select 就豁然开朗：
+
+> **channel 是单管道通信，select 是多管道协调——两者一起才构成完整的 CSP 实践。**
+
+### channel 单独用：单管道通信
+
+```go
+ch := make(chan int)
+go producer(ch)
+v := <-ch          // 等单一管道
+process(v)
+```
+
+只能"线性等单一管道"——遇到"想同时等多个事件"就抓瞎。
+
+### select 单独用：没意义
+
+select 必须配合 channel——它本身就是"**多个 channel 之间选一个**"。没有 channel，select 无对象可选。
+
+### 一起用：完整的 CSP 实践
+
+下面这个例子把**所有 CSP 五件套都用上了**：
+
+```go
+func server(ctx context.Context) {
+    requests := make(chan Request)   // ② channel
+    responses := make(chan Response) // ② channel
+
+    // ⑤ 启动并行 process
+    go acceptor(requests)            // ① process: 接收请求
+    go worker(requests, responses)   // ① process: 处理
+    go logger(responses)             // ① process: 输出日志
+
+    // ④ ALT: 同时等多种事件
+    for {
+        select {
+        case req := <-requests:       // ③ recv from c1
+            log.Printf("got: %v", req)
+        case resp := <-responses:     // ③ recv from c2
+            log.Printf("done: %v", resp)
+        case <-time.After(time.Minute):
+            log.Println("idle")
+        case <-ctx.Done():            // ③ recv from cancel channel
+            return                    // ⑤ ; (顺序: 退出后续代码)
+        }
+    }
+}
+```
+
+**对照五件套**：
+
+| CSP 元素 | 这段代码里 |
+|---|---|
+| ① Process | 3 个 goroutine 各跑一段顺序逻辑 |
+| ② Channel | `requests`、`responses`、`ctx.Done()` |
+| ③ Send/Receive | `<-requests` / `<-responses` 等 |
+| ④ ALT | 整个 `select` 块 |
+| ⑤ Composition | 顺序 + `go` 启动 |
+
+→ **整个服务 = CSP 五件套的组合**。这就是 Go 程序的"骨架"。
+
+### 没有 select 的 channel 是残废
+
+如果 Go 只有 channel 没有 select，复杂场景没法写：
+
+```go
+// 假设没有 select, 想实现"等 ch1 或 ch2, 谁先来"
+// → 只能开 3 个 goroutine:
+v1 := <-ch1
+// ... 但 ch2 可能已经先来了, 错过了
+```
+
+→ channel 提供**单点通信能力**，select 提供**多点协调能力**——**缺一不可**。
+
+### CSP 视角下的"思考模型"
+
+写并发代码时，按 CSP 思考会很自然：
+
+```
+1. 我有几个独立的"角色"?            → 每个角色一个 goroutine
+2. 它们之间需要传什么消息?            → 每种消息一个 channel
+3. 谁需要同时等多个事件?              → 那里用 select
+4. 信号怎么停 / 怎么超时?             → 加 ctx.Done() / time.After 到 select
+```
+
+→ **不是先想"哪里加锁"，是先想"谁跟谁说话"**——这就是 CSP 思维方式。
+
+---
+
+## 六、Go 加进来的扩展（实用主义）
+
+CSP 是个**理论模型**，Go 为了**工程实用**加了几样东西：
+
+| 扩展 | CSP 原版 | Go 加了什么 |
+|---|---|---|
+| **缓冲 channel** | 只有同步 channel（rendezvous） | `make(chan T, N)`——缓冲未满即可发送 |
+| **close 操作** | 没有显式关闭 | `close(ch)` 广播"没数据了"，receive 收到零值 |
+| **default 分支** | ALT 没有"都没就绪就跑别的" | `select { default: ... }` 实现非阻塞 |
+| **nil channel** | 没这个概念 | `nil` channel 永远阻塞，用于动态启停 case |
+| **select 随机化** | ALT 不保证哪个被选 | Go 强制随机化，防 case 饥饿 |
+| **死锁防护** | 不涉及实现 | runtime 按 channel 地址排序加锁 |
+
+**核心**：保留 CSP 的理论纯度，加足够的工程优化。
+
+---
+
+## 七、Go 不严格的地方
+
+CSP 是个**纯通信模型**——理论上进程间**只能**通过 channel 交流，**不共享内存**。
+
+但 Go **没强制这一点**：
+
+```go
+// Go 完全允许这样写
+var globalMap map[string]int
+var mu sync.Mutex
+
+func work() {
+    mu.Lock()
+    globalMap["key"] = 1   // 共享内存 + 锁! 不是 CSP 风格
+    mu.Unlock()
+}
+```
+
+Go 标准库里有 `sync.Mutex` / `sync.RWMutex` / `sync.Map` / `atomic`——**全是"共享内存 + 锁"的工具**。
+
+### Go 的态度
+
+- **官方推荐用 channel**（CSP 风格）
+- **但允许混用共享内存**（实用主义）
+- **"Choose the right tool for the job"**——不强制
+
+→ Go 是 **"实用主义版 CSP"**——理论根基是 CSP，工程上则是混合范式。
+
+---
+
+## 八、什么时候用 channel，什么时候用 mutex
+
+既然 Go 两个都允许，那什么时候用哪个？官方 wiki 有一段建议：
+
+| 用 channel 当... | 用 mutex 当... |
+|---|---|
+| 传递数据所有权（生产-消费） | 保护内部状态（计数器、缓存） |
+| 协调多个工作者（pipeline） | 状态变化频繁、临界区很短 |
+| 等待事件 / 信号通知 | 多个 reader + 偶尔 writer（RWMutex） |
+| 控制并发数（限流） | 数据本身不需要"传给别人" |
+
+**决策启发**：
+
+```
+我要"告诉别人某件事发生了" / "把数据交给别人处理"  → channel
+我只是"防止两个 G 同时改一个内存"                  → mutex
+```
+
+或者更简单：
+
+> 如果数据要在 goroutine **之间流动** → channel
+>
+> 如果数据**留在原地**多 goroutine 都要访问 → mutex
+
+---
+
+## 九、对比其它 CSP 系语言
+
+| 语言 | 实现方式 | 跟 Go 对比 |
+|---|---|---|
+| **Occam**（原始 CSP 落地） | 严格 CSP，无共享内存 | 学术性强，工程少见 |
+| **Erlang** | actor 模型（CSP 变种） | 每个 actor 有 mailbox，无 channel 概念 |
+| **Go** | CSP + 共享内存（实用混合） | 工程化最好，理论纯度低 |
+| **Rust** | `std::sync::mpsc` channel | 受 CSP 影响，但所有权系统是主线 |
+| **Clojure core.async** | 库形式提供 channel + go-block | 跟 Go 几乎一样的语义 |
+
+Go 的位置：**理论上是 CSP 的简化版，工程上是落地最成功的 CSP 实现**。
+
+---
+
+## 十、一图总结
+
+```
+                  CSP 理论 (Hoare 1978/1985)
+                        │
+        ┌──────┬────────┼────────┬──────────┐
+        ▼      ▼        ▼        ▼          ▼
+     Process Channel Send/Recv  ALT     Composition
+        │      │        │        │          │
+        │      │        │        │          │
+        ▼      ▼        ▼        ▼          ▼
+     ───── Go 的语言级实现 (一对一映射) ─────
+        │      │        │        │          │
+     goroutine chan T  ch<-/<-ch select   顺序 + go
+        │      │        │        │
+        ▼      ▼        ▼        ▼
+        2KB    类型化   <-       随机化
+        起步   buf      操作符   按地址锁
+        100ns  close             sudog 兄弟链
+
+   channel + select 一起用 = 完整 CSP 实践
+   ┌──────────────────────────────────────┐
+   │  channel: 单管道通信                  │
+   │  select : 多管道协调                  │
+   │  goroutine: 独立 process              │
+   │                                       │
+   │  缺 select → 不能多路等               │
+   │  缺 channel → select 无对象           │
+   │  缺 goroutine → 没有并发主体          │
+   └──────────────────────────────────────┘
+
+   Go 加的扩展 (CSP 原版没有):
+     - 缓冲 channel
+     - close 广播
+     - default 分支
+     - nil channel 用作开关
+     - select 强制随机化
+     - 锁地址排序防死锁
+
+   Go 没强制的纯 CSP:
+     - 允许 sync.Mutex / atomic / 共享内存
+     - "Choose the right tool"
+
+   写并发代码的 CSP 思维:
+     1. 有几个角色?         → 每角色一个 goroutine
+     2. 互相传什么消息?      → 每种消息一个 channel
+     3. 谁要等多事件?        → 那里用 select
+     4. 怎么取消 / 超时?     → ctx.Done() / time.After
+```
+
+---
+
+## 一句话终极总结
+
+> CSP 是个由 **Process / Channel / Send-Receive / ALT / Composition** 五件套构成的并发理论。Go 把这五件套**一对一**做成了 **goroutine / chan / `<-` / `select` / go 关键字**，并加了缓冲 channel、close、default 等工程化扩展。
+>
+> **channel 是单管道通信，select 是多管道协调——两者一起才能实现 CSP 完整语义**。
+>
+> Go 没强制纯 CSP（允许 sync.Mutex 共享内存）——是"**实用主义版 CSP**"，理论根基是 CSP，工程上是混合范式，但**写复杂并发时仍然应该按 CSP 思考**：先想"谁跟谁说话"，再想"怎么协调"。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="channel/csp" data-base="../"></script>
+</body>
+</html>

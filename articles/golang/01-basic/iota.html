@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>iota 怎么用？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# iota 怎么用？
+
+## 一、iota 是干嘛的
+
+Go 没有 enum 关键字——`iota` 是**生成连续常量的工具**。
+
+```go
+// 没 iota 的写法 (繁琐, 容易写错)
+const (
+    Red   = 0
+    Green = 1
+    Blue  = 2
+)
+
+// 用 iota
+const (
+    Red   = iota   // 0
+    Green          // 1 (自动复用上一行表达式)
+    Blue           // 2
+)
+```
+
+iota 让你**写一遍表达式，自动按行号生成连续值**——常用于枚举、状态机、位掩码。
+
+---
+
+## 二、核心规则：iota 是 const 块内的行计数器
+
+**两条铁律**：
+
+1. **iota 是行号**，从 const 块的 **第 1 行开始（值 0）**
+2. **每行 +1**，遇到新的 `const ( ... )` 块**归零**
+
+```go
+const (
+    A = iota   // 0  (第 1 行)
+    B          // 1  (复用上一行表达式 "iota")
+    C          // 2
+)
+
+const (
+    X = iota   // 0  (新 const 块, 归零)
+    Y          // 1
+)
+```
+
+### 关键细节：**复用上一行的表达式**
+
+```go
+const (
+    A = iota * 2   // 0 * 2 = 0
+    B              // 1 * 2 = 2  (复用 "iota * 2")
+    C              // 2 * 2 = 4
+)
+```
+
+第二行没写表达式时，**Go 用上一行的同一表达式**——只是 iota 的值不同。
+
+---
+
+## 三、典型用法
+
+### ① 普通枚举（从 0 开始）
+
+```go
+const (
+    Pending = iota   // 0
+    Running          // 1
+    Done             // 2
+    Failed           // 3
+)
+```
+
+### ② 跳过 0
+
+```go
+const (
+    _ = iota          // 跳过 0
+    Sunday            // 1
+    Monday            // 2
+    Tuesday           // 3
+)
+```
+
+### ③ 位掩码（每位代表一个 flag）
+
+```go
+const (
+    FlagRead  = 1 << iota   // 1 << 0 = 1   (0001)
+    FlagWrite               // 1 << 1 = 2   (0010)
+    FlagExec                // 1 << 2 = 4   (0100)
+    FlagAll = FlagRead | FlagWrite | FlagExec   // 7
+)
+
+perms := FlagRead | FlagWrite      // 3
+if perms & FlagWrite != 0 { ... }  // 检查某 flag
+```
+
+→ flag 用 `1 << iota` 是**最经典的位掩码模式**。
+
+### ④ 单位换算（KB / MB / GB）
+
+```go
+const (
+    _  = iota             // 跳过 0
+    KB = 1 << (10 * iota)  // 1 << 10 = 1024
+    MB                     // 1 << 20 = 1048576
+    GB                     // 1 << 30
+    TB                     // 1 << 40
+    PB                     // 1 << 50
+)
+```
+
+### ⑤ 中间插一个固定值
+
+```go
+const (
+    A = iota   // 0
+    B          // 1
+    C = 100    // 100  (打断 iota 表达式)
+    D          // 100  (复用上一行 "100"!)
+    E = iota   // 4    (iota 仍然是 4, 因为行号)
+    F          // 5
+)
+```
+
+⚠️ **iota 不归零，只是表达式被"切换"了**——D 重复 100 是因为它复用了 "100"，**不是因为 iota 重置**。
+
+---
+
+## 四、同一行的 iota：值相同
+
+iota **看的是行，不是字段**——同一行多个 iota 值一样：
+
+```go
+const (
+    a, b = iota, iota * 2   // 0, 0     (iota 都是 0)
+    c, d                    // 1, 2     (复用上一行表达式)
+    e, f                    // 2, 4
+)
+```
+
+| 行 | iota | 表达式 | 值 |
+|---|---|---|---|
+| 1 | 0 | `iota, iota*2` | a=0, b=0 |
+| 2 | 1 | （复用）| c=1, d=2 |
+| 3 | 2 | （复用）| e=2, f=4 |
+
+---
+
+## 五、给枚举加上 String() 方法（标准做法）
+
+Go 枚举默认打印是数字——给它 `String()` 方法变得可读：
+
+```go
+type Status int
+
+const (
+    Pending Status = iota
+    Running
+    Done
+)
+
+func (s Status) String() string {
+    return [...]string{"Pending", "Running", "Done"}[s]
+}
+
+fmt.Println(Pending)   // "Pending" (不是 0)
+```
+
+或者用 `stringer` 工具自动生成：
+
+```go
+//go:generate stringer -type=Status
+type Status int
+
+const (
+    Pending Status = iota
+    Running
+    Done
+)
+```
+
+```bash
+go generate    # 生成 Status_string.go
+```
+
+---
+
+## 六、常见踩坑
+
+### ① 以为 iota 跨 const 块累积
+
+```go
+const (
+    A = iota   // 0
+    B          // 1
+)
+const (
+    C = iota   // 0  ← 新 const 块, 归零!
+    D          // 1
+)
+```
+
+iota **每个 const 块独立**——不是全局计数器。
+
+### ② 中间换表达式，iota 仍递增
+
+```go
+const (
+    A = iota         // 0
+    B = "hello"      // "hello"  ← 这一行 iota 是 1, 但被无视了
+    C = iota         // 2  ← iota 仍然是 2!
+)
+```
+
+**iota 永远等于"在 const 块里的行号"**——不管这行写了什么。
+
+### ③ 类型化 iota 的坑
+
+```go
+const (
+    A = iota         // 0 (无类型 int)
+    B = uint8(iota)  // 1 (uint8)
+    C                // C 复用 "uint8(iota)" → uint8(2)
+)
+```
+
+类型转换会沿"复用表达式"传染——一般无害但要意识到。
+
+### ④ iota 不是运行时变量
+
+```go
+var x = 5
+const (
+    A = iota   // ✓ 0
+    B = x      // ❌ 编译错: x 不是常量
+)
+```
+
+iota 是**编译期常量**——const 块里只能用 const、字面量、其它常量。
+
+---
+
+## 七、什么时候用 / 不用
+
+| 场景 | 用 iota? |
+|---|---|
+| 简单枚举（连续整数） | ✅ |
+| 位掩码（`1 << iota`） | ✅ |
+| 单位换算（KB/MB/GB） | ✅ |
+| 状态机 | ✅ |
+| **持久化到外部**（DB、JSON、protobuf） | ❌ 改顺序会改值，破坏兼容！显式写数字 |
+| **数字有业务含义**（HTTP 状态码 200/404） | ❌ 直接写数字更清楚 |
+
+### 持久化的反模式
+
+```go
+// ❌ 改 const 顺序就改值, 持久化到 DB 后兼容性炸
+const (
+    StatusActive = iota   // 0
+    StatusBanned          // 1
+    StatusDeleted         // 2
+)
+// 后来发现要加个 StatusPending 在中间:
+const (
+    StatusActive  = iota  // 0
+    StatusPending         // 1 ← 新增
+    StatusBanned          // 2 ← 原来是 1, DB 里全错!
+    StatusDeleted         // 3
+)
+```
+
+→ **持久化场景显式写数字**，不要让 iota 自动算：
+
+```go
+const (
+    StatusActive  = 0
+    StatusBanned  = 1
+    StatusDeleted = 2
+    StatusPending = 10   // 新增的放最后, 不打乱
+)
+```
+
+---
+
+## 八、一图总结
+
+```
+            iota = const 块的行计数器
+                    │
+              第 1 行 = 0, 每行 +1
+              新 const 块归零
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+     表达式复用              典型用法
+     上一行写啥           ① 枚举: A=iota / B / C
+     下一行复用同一表达式   ② 位掩码: 1 << iota
+     只是 iota 值不同      ③ 单位: 1<<(10*iota)
+                          ④ 状态机
+                          ⑤ 跳过用 _ = iota
+
+   常见坑:
+   ❌ 以为跨块累积 (实际每块归零)
+   ❌ 中间换表达式 iota 仍递增 (iota = 行号)
+   ❌ 持久化到外部 (改顺序就改值, 不要)
+   ❌ HTTP 状态码 / 业务有意义的数字 → 直接写
+
+   配套工具:
+   String() 方法手写
+   //go:generate stringer -type=X 自动生成
+
+   原则:
+   ✅ 仅用于"我不在乎具体数字" 的场景
+   ❌ 一旦数字有业务含义/外部可见 → 显式写
+```
+
+**一句话**：iota = **const 块内的"行号"**——从 0 开始，每行 +1，遇新 const 块归零；**新行没写表达式时复用上一行的表达式**。适合枚举 / 位掩码 / 单位换算这种"我不在乎具体数字"的场景；**持久化到外部 / 数字有业务含义时一律显式写数字**——避免改顺序炸兼容性。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/iota" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redis中的底层数据结构 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Redis中的底层数据结构
+
+> 一句话：[基础数据结构](data-structures.html) 里的 5 大类型只是**对外的逻辑类型**，底层都由 **redisObject** 包装，每种类型都有**多种编码（encoding）**，由 SDS / listpack / quicklist / hashtable / intset / skiplist 这些底层结构实现，并按数据规模在编码间自动切换——这是 Redis「又快又省内存」的核心。
+
+## 一、redisObject：所有 value 的统一外壳
+
+每个 key 的 value 在内部都不是裸数据，而是一个 **redisObject** 对象。它记录「逻辑类型 + 实际编码 + 指向底层结构的指针」。
+
+```text
+                redisObject
+  ┌────────────────────────────────────────┐
+  │ type     : OBJ_STRING / LIST / HASH...  │  ← 对外逻辑类型(5 大类)
+  │ encoding : int / embstr / listpack...   │  ← 实际用的底层编码
+  │ lru      : LRU/LFU 时钟(内存淘汰用)      │
+  │ refcount : 引用计数(共享对象/回收)        │
+  │ ptr      ─────────────────────┐         │  ← 指向真正的底层数据结构
+  └───────────────────────────────┼─────────┘
+                                  ▼
+                    SDS / quicklist / dict / intset / skiplist ...
+```
+
+- `type` 是 `TYPE` 命令看到的（string/list/hash/set/zset）；
+- `encoding` 是 `OBJECT ENCODING key` 看到的（真正决定性能与内存的东西）；
+- 同一个 type，可以对应**不同 encoding**——这正是本篇主题。
+
+```bash
+TYPE mykey                # 看逻辑类型
+OBJECT ENCODING mykey     # 看底层编码（面试常考的实操命令）
+```
+
+---
+
+## 二、SDS：简单动态字符串
+
+Redis 没有直接用 C 的 `char*`，而是自己实现了 **SDS（Simple Dynamic String）**。所有字符串（包括 key 本身、String 类型的 value）底层都是 SDS。
+
+```text
+  SDS 结构（以 sdshdr8 为例，5.0+ 按长度分 hdr5/8/16/32/64 省头部）
+  ┌──────┬───────┬───────┬──────────────────────┐
+  │ len  │ alloc │ flags │ buf[] = "redis\0"     │
+  │ 已用 │ 总容量│ 类型  │ 实际字节 + 末尾兼容\0 │
+  └──────┴───────┴───────┴──────────────────────┘
+```
+
+### 为什么不用 C 字符串
+
+| 维度 | C 字符串 (`char*`) | SDS |
+|---|---|---|
+| 取长度 | 遍历到 `\0`，**O(n)** | 读 `len` 字段，**O(1)** |
+| 二进制安全 | 以 `\0` 为结尾，**存不了含 \0 的数据** | 用 `len` 界定长度，**可存任意字节**（图片、序列化数据） |
+| 缓冲区溢出 | `strcat` 不检查空间，会越界 | 操作前检查 `alloc - len`，不够先扩容，**杜绝溢出** |
+| 修改时的内存分配 | 每次增减都可能 realloc | **空间预分配 + 惰性释放**，减少 realloc 次数 |
+
+- **空间预分配**：扩容时不止分配刚好需要的，会多分配（小于 1MB 时翻倍，≥1MB 时多分配 1MB），减少后续 append 的内存重分配。
+- **惰性释放**：字符串缩短时不立刻 free 多出的空间，先留着（记在 `alloc` 里），后续可复用。
+- 末尾仍保留一个 `\0`，是为了**兼容部分 C 字符串函数**（如可直接 `printf`），但长度判断从不靠它。
+
+---
+
+## 三、String 的三种编码：int / embstr / raw
+
+String 类型在底层根据内容选择三种编码之一：
+
+```text
+  SET n 12345        → OBJECT ENCODING → "int"
+  SET s "hello"      → OBJECT ENCODING → "embstr"
+  SET s "很长的文本…"  → OBJECT ENCODING → "raw"
+```
+
+| 编码 | 触发条件 | 内存布局 | 特点 |
+|---|---|---|---|
+| **int** | value 是能用 long 表示的整数 | redisObject.ptr **直接存这个整数**（不另开 SDS） | 最省，且 0~9999 的小整数 Redis 启动时预创建共享 |
+| **embstr** | 字符串字节数 **≤ 44**（Redis **3.2+** 阈值） | redisObject 和 SDS **一次性连续分配**在同一块内存 | 1 次 malloc / 1 次 free，cache 友好，适合短串 |
+| **raw** | 字符串字节数 **> 44** | redisObject 和 SDS **分两次分配**，ptr 指向独立 SDS | 适合长串，可独立扩容 |
+
+```text
+  embstr（短串，一整块连续内存）：
+  ┌──────────────┬─────────────────┐
+  │ redisObject  │ SDS(buf)        │   ← 一次 malloc
+  └──────────────┴─────────────────┘
+
+  raw（长串，两块内存）：
+  ┌──────────────┐      ┌─────────────────┐
+  │ redisObject  │ ──→  │ SDS(buf)        │   ← 两次 malloc
+  └──────────────┘      └─────────────────┘
+```
+
+> 注意：embstr 是**只读优化**，一旦对它做 `APPEND`/`SETRANGE` 等修改，会被转成 raw，之后不再变回 embstr。embstr 阈值 44 字节是 Redis 3.2 起的值（3.2 之前是 39）。
+
+---
+
+## 四、ziplist / listpack：紧凑连续的小集合载体
+
+为了节省小集合的内存，Redis 用一段**连续内存**存多个元素，避免链表那样每个节点都带指针开销。
+
+- **ziplist（压缩列表）**：早期实现，每个 entry 里存有 `prevlen`（前一个 entry 的长度），用于反向遍历。
+- **listpack（紧凑列表）**：Redis **7.0** 起全面替代 ziplist，**用于 Hash / ZSet / List（小数据时）**。设计上去掉了 ziplist 的 `prevlen` 依赖，从根本上**解决连锁更新问题**。
+
+```text
+  listpack 大致布局
+  ┌────────┬───────┬───────┬─────┬───────┬─────┐
+  │ 总字节 │ 元素数│ entry │entry│ ...   │ 0xFF│  ← 末尾结束标记
+  └────────┴───────┴───────┴─────┴───────┴─────┘
+```
+
+### 连锁更新（ziplist 的痛点，listpack 已解决）
+
+ziplist 每个 entry 用 `prevlen` 记前一项长度：前项 **< 254 字节用 1 字节** 存，**≥ 254 字节用 5 字节** 存。
+
+```text
+  假设一串 entry 长度都恰好接近 254 的边界：
+  在头部插入一个大 entry →
+    后一个 entry 的 prevlen 需从 1 字节涨到 5 字节 →
+    它自己变长，可能又越过 254 边界 →
+    再后一个 entry 的 prevlen 又要扩 →  ……连锁
+  最坏 O(n²) 的连续内存搬动（罕见但存在）
+```
+
+listpack 的每个 entry **只记自身长度、不记前项长度**，反向遍历靠 entry 尾部的「本元素总长」字段，因此**插入/更新不会引发连锁**——这是 7.0 切换的主要动机。
+
+---
+
+## 五、quicklist：List 的实现
+
+List 类型底层是 **quicklist**：一个**双向链表**，但每个链表节点不是单个元素，而是一个 **listpack（旧版本是 ziplist）**。等于「链表 + 紧凑块」的混合体。
+
+```text
+  quicklist（List 的底层）
+  head                                              tail
+   │                                                 │
+   ▼                                                 ▼
+  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+  │ quicklistNode│◄──►│ quicklistNode│◄──►│ quicklistNode│
+  │  listpack    │    │  listpack    │    │  listpack    │
+  │ [a,b,c,d,e]  │    │ [f,g,h,i]    │    │ [j,k,l]      │
+  └──────────────┘    └──────────────┘    └──────────────┘
+```
+
+- **为什么这样设计**：纯双向链表每个元素都要存两个指针，内存浪费且 cache 不友好；纯 ziplist 单块在大列表上插入/删除要搬大量内存。quicklist 折中——**块内紧凑省内存，块间用链表保证两端 O(1) 操作**。
+- 单个节点的大小由 `list-max-listpack-size`（旧名 `list-max-ziplist-size`）控制；还可对中间节点做 LZF 压缩（`list-compress-depth`）。
+- 早期版本（3.2 之前）小 List 直接用 ziplist，大 List 用 linkedlist；3.2 起统一为 quicklist。
+
+---
+
+## 六、hashtable + 渐进式 rehash
+
+Hash / Set（大数据时）的底层是 **dict（字典 / 哈希表）**，用**链地址法**解决冲突。
+
+```text
+  dict
+  ┌──────────────────────────────────────────┐
+  │ ht[0]  ─→  桶数组(正在用)                 │
+  │ ht[1]  ─→  桶数组(rehash 时的新表,平时空) │
+  │ rehashidx = -1 (没在 rehash) / ≥0 (进度)  │
+  └──────────────────────────────────────────┘
+
+  某个桶（链地址法）：
+   ht[0][3] ─→ [k1,v1] ─→ [k7,v7] ─→ NULL
+```
+
+### 渐进式 rehash
+
+当负载因子过高（元素多到一定程度）需要扩容时，Redis **不会一次性把所有 entry 搬到新表**（那会长时间阻塞），而是**渐进式**迁移：
+
+```text
+  1. 给 ht[1] 分配新桶数组（通常是 ht[0] 容量的 2 倍）
+  2. rehashidx 置 0，进入 rehash 状态
+  3. 之后每次对该 dict 的增删改查，顺手把 ht[0][rehashidx]
+     这一桶的所有 entry 迁到 ht[1]，然后 rehashidx++
+  4. （另有后台定时任务也会推进迁移，避免 dict 长期不被访问而卡住）
+  5. 迁完后 ht[1] 变成 ht[0]，rehashidx 置 -1，结束
+```
+
+```text
+  rehash 期间的读写规则：
+    查找：先查 ht[0]，没找到再查 ht[1]
+    新增：一律写入 ht[1]（保证 ht[0] 只减不增，最终被搬空）
+```
+
+核心思想和 Go map 的渐进搬迁一致——**把一次大停顿摊分到多次小操作里**。
+
+---
+
+## 七、intset：整数集合
+
+当 Set **只包含整数**且元素**不太多**时，用 **intset**：一段**有序、连续**的整数数组（便于二分查找和去重）。
+
+```text
+  intset
+  ┌──────────┬─────────────────────────────┐
+  │ encoding │ contents[] (升序排列的整数)  │
+  │ 16/32/64 │ [ -3, 1, 7, 42, 1000 ]      │
+  └──────────┴─────────────────────────────┘
+```
+
+### 升级机制
+
+intset 用 `encoding` 统一记录当前所有元素的位宽（int16 / int32 / int64）。当插入一个**超出当前位宽**的整数时，触发**升级**：
+
+```text
+  原本是 int16 数组（每个 2 字节）
+  插入 50000（超过 int16 范围）→
+    整个数组升级为 int32（每个 4 字节），
+    所有旧元素重新按 int32 摆放，再插入新元素
+```
+
+- **只升级不降级**：删掉那个大整数后，编码不会退回去。
+- 升级是为了「平时用最省的位宽，遇到大数才扩」，兼顾内存与通用性。
+
+---
+
+## 八、skiplist + dict：ZSet 的实现
+
+ZSet 在数据量大时由**两个结构组合**实现：
+
+```text
+  ZSet（大数据时）
+  ┌───────────────────────────────────────────┐
+  │ dict      : member → score                │  ← 按成员查分数 O(1)
+  │ skiplist  : 按 score 排序的跳表           │  ← 范围/排名查询 O(logN)
+  └───────────────────────────────────────────┘
+   两者共享同一份 member/score 数据（指针），不重复存
+```
+
+- **dict**：解决「给定 member 求 score / 判断是否存在」，O(1)。例如 `ZSCORE`。
+- **skiplist（跳表）**：解决「按分数排序、范围查询、排名查询」，O(logN)。例如 `ZRANGEBYSCORE` / `ZRANK`。
+
+```text
+  skiplist：多层链表，高层是低层的「快速通道」
+  L3: head ─────────────────────────→ 99 ─→ NULL
+  L2: head ───────→ 30 ──────────────→ 99 ─→ NULL
+  L1: head ─→ 10 ─→ 30 ─→ 55 ─→ 77 ─→ 99 ─→ NULL
+              查找时从高层往下「跳」，跳过大段节点
+```
+
+### 为什么 ZSet 用跳表而不用红黑树
+
+| 维度 | 跳表 (Redis 选它) | 红黑树 |
+|---|---|---|
+| **范围查询** | 底层就是有序链表，找到起点后**顺着走**即可，对 `ZRANGEBYSCORE` 极友好 | 范围查询要中序遍历，实现更绕 |
+| **实现复杂度** | 插入/删除只需调整少量指针，代码简单好维护 | 旋转、变色逻辑复杂，易写错 |
+| **并发/局部修改** | 改动只影响局部节点，无需全局旋转 | 平衡调整可能波及较大范围 |
+| **平均复杂度** | 查找/插入/删除均 O(logN) | 同为 O(logN) |
+| **额外能力** | 节点带 span 字段，**O(logN) 算排名**（ZRANK） | 需额外维护子树大小 |
+
+一句话：**跳表对范围查询天然友好、实现简单、改动局部**，正好契合 ZSet 的核心需求，所以作者 antirez 选了它。
+
+---
+
+## 九、数据类型 → 底层编码 + 切换阈值对照表
+
+每种逻辑类型都有「小数据用紧凑编码、超阈值转通用编码」两态。阈值由配置项控制（下面是常见默认值，**以你实际版本的 redis.conf 为准**）。
+
+| 逻辑类型 | 紧凑编码（小） | 通用编码（大） | 切换阈值（配置项 / 默认） |
+|---|---|---|---|
+| **String** | `int`（整数） / `embstr`（≤44B） | `raw`（>44B） | embstr↔raw 以 44 字节为界（3.2+）；整数走 int |
+| **List** | quicklist 节点内为 `listpack` | quicklist（始终是 quicklist） | 单节点上限 `list-max-listpack-size`（默认 128 项 / 单元素 64B 级别） |
+| **Hash** | `listpack` | `hashtable` | `hash-max-listpack-entries`（默认 128）或单值 `hash-max-listpack-value`（默认 64B），任一超限即转 |
+| **Set** | `intset`（全整数）/ `listpack`（7.2+，含非整数小集合） | `hashtable` | `set-max-intset-entries`（默认 512）；`set-max-listpack-entries`（默认 128，7.2+）/ value 64B |
+| **ZSet** | `listpack` | `skiplist` | `zset-max-listpack-entries`（默认 128）或 `zset-max-listpack-value`（默认 64B），任一超限即转 |
+
+```text
+  通用规律（记这条就够了）：
+    元素数 ≤ 阈值 且 单元素 ≤ 字节阈值
+        → 用紧凑编码（listpack / intset），省内存
+    任一超阈值
+        → 转成 hashtable / skiplist / quicklist，保证大数据下的性能
+    且大多数转换是单向的（转上去不会自动转回来）
+```
+
+> 版本提示：listpack 自 **7.0** 起替代 ziplist 用于 Hash/ZSet/quicklist 节点；Set 的 `listpack` 编码（小的非整数集合）是 **7.2** 引入。老版本里对应的配置项名是 `*-ziplist-*`，新版改为 `*-listpack-*`，多数保留了旧名作别名。
+
+---
+
+## 十、一图总结
+
+```text
+            redisObject (type + encoding + ptr)
+                          │
+   ┌──────────┬──────────┼──────────┬──────────────┐
+   ▼          ▼          ▼          ▼              ▼
+ String      List       Hash       Set            ZSet
+   │          │          │          │              │
+ int          quicklist  listpack   intset/listpack listpack
+ embstr(≤44)  (节点=     ↓超阈值     ↓超阈值         ↓超阈值
+ raw           listpack)  hashtable  hashtable      skiplist+dict
+   │                         │                         │
+ SDS(O(1)长度·            渐进式 rehash            跳表(范围/排名友好)
+ 二进制安全·              (ht[0]/ht[1]+            +dict(O(1)查分)
+ 预分配/惰性释放)          rehashidx 摊分迁移)
+
+  贯穿全局：listpack(7.0+) 取代 ziplist，根除「连锁更新」
+```
+
+---
+
+## 一句话总结
+
+> Redis 每个 value 都被 **redisObject** 包成「type + encoding + ptr」，底层由 **SDS（O(1) 长度、二进制安全、预分配/惰性释放）、listpack（7.0 起取代 ziplist、根除连锁更新）、quicklist（链表挂紧凑块做 List）、hashtable + 渐进式 rehash、intset（整数集合带升级）、skiplist + dict（ZSet，跳表对范围/排名友好故不用红黑树）** 实现，并按「小用紧凑、大转通用」的阈值自动切换编码——这套机制就是 Redis 在内存与速度间取最优的根本。回到应用层怎么用，见 [基础数据结构](data-structures.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="redis/internal-structures" data-base="../"></script>
+</body>
+</html>

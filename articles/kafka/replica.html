@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>副本机制：AR / ISR / OSR / HW / LEO · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 副本机制：AR / ISR / OSR / HW / LEO
+
+> 一句话：副本机制把一个分区的数据复制到多个 Broker 上，用 **AR / ISR / OSR** 三个集合描述"谁在同步"，用 **LEO / HW** 两条水位线描述"写到哪、能读到哪"，从而在 Leader 挂掉时还能不丢数据地选出新 Leader。
+
+## 一、三个集合：AR / ISR / OSR
+
+每个分区有 1 个 Leader + N 个 Follower，它们合起来就是这个分区的全部副本。按"是否跟得上 Leader"把这些副本分成三个集合：
+
+```text
+            AR（Assigned Replicas，全部副本）
+   ┌──────────────────────────────────────────────┐
+   │                                                │
+   │   ISR（In-Sync Replicas，同步中）              │
+   │   ┌────────────────────────────────────┐      │
+   │   │  Leader + 跟得上 Leader 的 Follower │      │
+   │   └────────────────────────────────────┘      │
+   │                                                │
+   │   OSR（Out-of-Sync Replicas，落后的）          │
+   │   ┌────────────────────────────────────┐      │
+   │   │  落后太多、被踢出去的 Follower      │      │
+   │   └────────────────────────────────────┘      │
+   │                                                │
+   └────────────────────────────────────────────────┘
+
+   关系：AR = ISR + OSR
+```
+
+| 集合 | 全称 | 含义 |
+|---|---|---|
+| **AR** | Assigned Replicas | 分区被分配的**全部**副本（Leader + 所有 Follower） |
+| **ISR** | In-Sync Replicas | 与 Leader **保持同步**的副本集合，**含 Leader 自己** |
+| **OSR** | Out-of-Sync Replicas | 落后 Leader 太多、被踢出同步队伍的副本 |
+
+记忆要点：
+
+- **AR = ISR + OSR**，是恒等式。
+- **ISR 包含 Leader**：Leader 永远跟自己同步，所以 ISR 至少有 1 个成员（Leader）。
+- 正常情况下 OSR 为空（所有 Follower 都跟得上），AR == ISR。
+- **只有 ISR 里的副本才有资格被选为新 Leader**（默认配置下），这是不丢数据的关键 —— 详见 [Controller 选举与防脑裂](election.html)。
+
+## 二、两条水位线：LEO 与 HW
+
+```text
+分区日志（offset 从 0 递增，每条消息一格）：
+
+   offset:  0    1    2    3    4    5    6    7
+          ┌────┬────┬────┬────┬────┬────┬────┬┄┄┄
+          │ m0 │ m1 │ m2 │ m3 │ m4 │ m5 │    │
+          └────┴────┴────┴────┴────┴────┴────┴┄┄┄
+                              ↑              ↑
+                              HW=5           LEO=6
+          └────── 消费者可见 ──────┘
+          （只能读到 HW 之前 = m0..m4）       └ 下一条要写的位置
+```
+
+| 水位线 | 全称 | 含义 |
+|---|---|---|
+| **LEO** | Log End Offset | 该副本日志中**下一条要写入**的位置 = 当前最后一条消息的 offset + 1 |
+| **HW** | High Watermark | **高水位**，= ISR 中**最小的 LEO**；消费者**只能读到 HW 之前**的消息 |
+
+关键结论：
+
+- **LEO 是"写到哪了"**，每个副本各有自己的 LEO，Leader 的 LEO 通常最大。
+- **HW 是"能读到哪"**，HW 之前的消息叫**已提交（committed）**消息 —— 因为它们已被 ISR 全部确认，即使 Leader 挂了也不会丢。
+- **HW 及之后的消息消费者看不到**：哪怕 Leader 已经写到 LEO=6，只要还没被 ISR 全部确认（HW 还停在 5），消费者就只能读到 offset 4 为止。这就是"消息何时对外可见"的边界。
+
+## 三、HW 是怎么推进的
+
+Follower 不停地向 Leader 发 **fetch 请求**拉数据，每次 fetch **都会带上自己当前的 LEO**，告诉 Leader"我已经同步到哪了"。Leader 据此推进 HW。
+
+```text
+            Follower-B (LEO=6)            Follower-C (LEO=5)
+                  │  fetch(我的LEO=6)          │  fetch(我的LEO=5)
+                  ▼                            ▼
+         ┌─────────────────────────────────────────────┐
+         │  Leader (LEO=7)                               │
+         │  收集 ISR 各副本 LEO：                         │
+         │     Leader=7, B=6, C=5                        │
+         │  HW = min(ISR 所有 LEO) = min(7,6,5) = 5      │
+         └─────────────────────────────────────────────┘
+                  │  fetch 响应里带回 Leader HW=5
+                  ▼
+         Follower 的 HW = min(自己 LEO, Leader HW)
+            B: min(6, 5) = 5      C: min(5, 5) = 5
+```
+
+两条更新规则：
+
+1. **Leader 的 HW** = **ISR 中所有副本 LEO 的最小值**。某个 Follower 落后，HW 就被它拖住，不会前进 —— 保证 HW 之前的数据"人人都有"。
+2. **Follower 的 HW** = `min(自己的 LEO, fetch 响应里带回的 Leader HW)`。Follower 的 HW 永远不会超过 Leader 的 HW。
+
+> 一句话理解：HW 是 ISR 的"木桶短板"。只有当所有 ISR 副本都同步到某个位置，这个位置之前的消息才算"已提交"、才对消费者可见。
+
+## 四、ISR 的收缩与扩张
+
+ISR 不是固定的，会随 Follower 的同步状态动态收缩、扩张。判定标准是一个时间参数：
+
+```text
+replica.lag.time.max.ms（默认 30000ms = 30s）
+
+   Follower 距离上次"追上 Leader LEO"超过这个时间还没追上
+        │
+        ▼
+   被踢出 ISR  ──────────►  进入 OSR（落后队伍）
+        ▲
+        │  后续又追上 Leader
+        └──────────  重新加回 ISR
+```
+
+| 动作 | 触发条件 | 结果 |
+|---|---|---|
+| **收缩**（ISR → OSR） | Follower 超过 `replica.lag.time.max.ms` 没追上 Leader 的 LEO | 该 Follower 被踢出 ISR，进入 OSR |
+| **扩张**（OSR → ISR） | OSR 中的 Follower 重新追上 Leader 的进度 | 重新加回 ISR |
+
+补充：
+
+- **老版本**曾用"落后的**消息条数**"（`replica.lag.max.messages`）作为判定，但流量突增时会把正常 Follower 误判踢出，引发 ISR 抖动，**已废弃**；现在**只看时间**。
+- ISR 收缩到只剩 Leader 时仍可写，但写入的可靠性下降（结合 `acks=all` + `min.insync.replicas` 才有意义，详见 [可靠性](reliability.html)）。
+
+## 五、为什么 Kafka 不做读写分离（主写从读）
+
+很多存储系统（如 MySQL）用"主写从读"分担读压力，但 **Kafka 读写都只走 Leader**，Follower 只负责同步备份、不对外提供读。原因有三：
+
+| # | 原因 | 解释 |
+|---|---|---|
+| 1 | **从副本有同步延迟** | Follower 落后于 Leader，且 Follower 的 HW 永远 ≤ Leader HW。若允许从从副本读，按各自 HW 读会读到**滞后甚至不同副本间不一致**的数据。 |
+| 2 | **本来就靠 Partition 打散负载** | Kafka 把一个 Topic 切成多个 Partition，**不同 Partition 的 Leader 天然分布在不同 Broker** 上。负载已经被水平摊开，根本不需要"从读"来分担。 |
+| 3 | **从读不是为扩读而生** | 2.4+ 引入了 follower fetch（消费者就近从同机房副本读），但目的是**跨机房省流量/降延迟**，**不是为了扩展读能力**，更不是主写从读。 |
+
+```text
+传统主从（主写从读）              Kafka（读写都走 Leader，靠分区打散）
+   Master ── 写                      Broker1: P0-Leader  P3-Follower
+     │  └ 同步                       Broker2: P1-Leader  P0-Follower
+   Slave ── 读（有延迟）             Broker3: P2-Leader  P1-Follower
+                                     → 读写都打到各自 P 的 Leader，
+                                       Leader 已分散，负载天然均衡
+```
+
+> 结论：Kafka 用**分区水平扩展**解决并发，而不是读写分离；从副本只兜底高可用（选 Leader），不分担读。
+
+## 六、一句话总结
+
+> **AR = ISR + OSR**（ISR 含 Leader）；**LEO** 是"写到哪"、**HW = ISR 最小 LEO** 是"能读到哪"，HW 之前才是已提交、可消费的消息；Follower 靠 fetch 带 LEO 推进 Leader 的 HW，超时跟不上就被 `replica.lag.time.max.ms` 踢进 OSR；Kafka 读写都走 Leader、靠分区打散负载，所以**不做主写从读**。
+
+---
+
+**相关：** [高可用：Controller 选举与防脑裂](election.html) · [可靠性](reliability.html) · [ZooKeeper vs KRaft](kraft.html) · [Kafka 知识地图](knowledge-graph.html)
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/replica" data-base="../"></script>
+</body>
+</html>

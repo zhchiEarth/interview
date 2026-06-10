@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>timer / ticker 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# timer / ticker 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **timer/ticker 底层都是同一个 `timer` struct，只差 `period` 字段**（=0 一次性 / >0 周期重入堆）；管理用 **per-P 四叉小顶堆**（Go 1.14+，99% 无锁），触发靠**调度器 `findRunnable` 顺手 check 堆顶**给 channel 写值——没有独立检查线程。三铁律：**Ticker 必 `defer Stop` · 循环里别用 `time.After`（1.23 前堆积）· Reset 1.23+ 免手动 drain**。
+
+记不全时，按这条**记忆主线：一个结构 + 一条触发流程 + 四坑**展开（详细推演看[正文](timer.html)）：
+
+---
+
+## 🏗 一个结构 —— per-P 四叉小顶堆
+
+```text
+P0: timers []*timer (堆) + minWhen(堆顶最早时间, 加速 check)
+P1: 自己的堆    P2: 自己的堆 ...   每个 timer 只挂一个 P → 99% 无锁
+```
+- `timer{ when, period, f, arg, status, pp }`；Timer `period=0`、Ticker `period>0`（触发后 `when += period` 重入堆）。
+- 四叉不二叉：树高 ½log₂N，**上滤(Push)比较省一半**；Push 远多于 Pop（很多 timer 加进去就被 Stop），所以优化 Push 的四叉赢；同层 4 兄弟紧挨一个缓存行。
+- 四代演化：≤1.9 全局堆+全局锁+timerproc → 1.10–1.13 64 分片堆 → **1.14+ per-P 四叉堆+调度耦合（性能跃迁）** → 1.23+ timer 提前 GC + channel 同步语义。
+
+## ⚙️ 一条触发流程 —— findRunnable 顺手 check
+
+```text
+findRunnable → checkTimers(本P堆顶过期?) → 取G → 跑G → ... 再 check
+              过期 → timer.f (一般 sendTime: 给 t.C 写 time.Now())
+                     → 阻塞在 <-t.C 的 G 变 runnable
+```
+- 没活干要睡：算所有 P 的 `minWhen`，`netpoll(pollUntil)` 一举两得（等 IO + 等 timer）。
+- 睡下后来了更早 timer：`wakeNetPoller` 戳醒 M 重算，保证不睡过头。
+- 偷 timer：偷别 P 的 G 前先 `checkTimers(其它 P)` → per-P 卡住也不饿死（管理无锁、触发全局协作）。
+- 精度毫秒级（受调度延迟，一般 <5ms），**非硬实时**。
+
+## ⏱ Stop / Reset —— 1.23 是分水岭
+
+```go
+stopped := t.Stop()  // true=成功阻止触发; false=已触发或没在跑(≠channel 空!)
+```
+- **1.23 前**：`t.C` 带 1 缓冲，旧值会残留 → Reset 前必须手动 drain：
+  ```go
+  if !t.Stop() { select { case <-t.C: default: } }
+  t.Reset(d)
+  ```
+- **1.23+**：`t.C` 改**无缓冲同步**语义，Stop/Reset 后绝不再收到"调用前"该触发的旧值 → 直接 `t.Reset(d)`。注意：只对 `NewTimer`/`NewTicker` 有效（AfterFunc 无 channel）；`len/cap(t.C)` 老技巧失效。
+
+## ⚠️ 四个坑 —— 全来自 channel 交互 + 不自销
+
+```text
+① time.After 在循环里 → 1.23 前旧 timer 等触发才释放, 堆积
+   修(任何版本): t:=NewTimer(d); 复用 t.Reset(d)
+② Ticker 忘 Stop → 永不自销, 内存泄漏 → defer tk.Stop()
+③ Reset 时序错乱: Stop()==false 盲目 <-t.C 可能死锁 → select+default
+④ AfterFunc 回调里 Reset 自己 → 合法(=周期任务), 但 doWork 慢会推迟节拍
+```
+- 实战：超时用 `context.WithTimeout`；周期任务用 `NewTicker`（固定节拍，别用 NewTimer+Reset 循环，会漂移）；一次性延时回调用 `AfterFunc`。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/timer-memo" data-base="../../"></script>
+</body>
+</html>

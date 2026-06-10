@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL 流复制与高可用 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# PostgreSQL 流复制与高可用
+
+> 一句话：PostgreSQL 的复制**载体就是 [WAL](wal.html)**——主库的 **walsender** 进程把 WAL 流式发给备库的 **walreceiver**，备库不断**应用（replay）WAL** 让自己跟主库保持一致，这叫**物理流复制**；备库开 **hot standby** 还能对外提供只读查询。复制可选**异步**（默认，主不等备、可能丢）或**同步**（至少一个备确认才提交）；**逻辑复制（PG 10+）** 则把 WAL 解码成行级变更、按发布/订阅选表复制，能跨大版本。
+
+> 本文以 **PostgreSQL 14 / 15 / 16** 为基准。复制传输的内容是 WAL，WAL / LSN / checkpoint 的机制见 [WAL 与持久化](wal.html)。
+
+## 一、复制的载体：基于 WAL
+
+PG 复制的核心前提是：**主库产生的所有改动都已经记录在 [WAL](wal.html) 里**，那么"把 WAL 传给备库、让备库重放一遍"，备库就能得到和主库一模一样的数据。这和崩溃恢复时"重放 WAL"是同一套机制，只不过数据来源从"本地磁盘的 WAL"变成了"网络上主库发来的 WAL 流"。
+
+```text
+   崩溃恢复：  本地 pg_wal 的 WAL ──重放──→ 恢复本机数据
+   流复制：    主库网络发来的 WAL ──重放──→ 备库数据 = 主库数据
+                          └─ 同一套"重放 WAL"机制，数据来源不同而已
+```
+
+所以记住一句：**PG 复制传的是 WAL（物理复制是 WAL 字节流，逻辑复制是 WAL 解码出的行变更）。** WAL 本身的细节见 [WAL 与持久化](wal.html)。
+
+## 二、物理流复制（streaming replication）
+
+### 2.1 两个核心进程：walsender / walreceiver
+
+物理流复制是 PG 最经典的复制方式，核心是主备各一个进程：
+
+| 进程 | 位于 | 职责 |
+|---|---|---|
+| **walsender** | **主库** | 备库连上来后，主库为每个备库起一个 walsender，**持续把新产生的 WAL 流式推送**给备库 |
+| **walreceiver** | **备库** | 连接主库、**接收 WAL 流并写入本地 pg_wal**，同时反馈自己已收/已写/已应用到哪个 LSN |
+| **startup（recovery）** | **备库** | 不断读取收到的 WAL 并**应用（replay）**到备库数据上 |
+
+### 2.2 架构图
+
+```text
+            主库 Primary                              备库 Standby (hot standby)
+   ┌────────────────────────────┐          ┌──────────────────────────────────────┐
+   │  客户端写入                  │          │   只读查询 SELECT ──┐                  │
+   │      │                      │          │                     ▼                  │
+   │      ▼                      │          │              ┌─────────────┐           │
+   │  ┌─────────┐  ① 产生 WAL    │          │              │ 查询(只读)   │           │
+   │  │  WAL    │                │          │              └─────────────┘           │
+   │  └────┬────┘                │   WAL    │   ┌──────────────┐  ② 收 WAL 写本地     │
+   │       │ 读 WAL              │  流(TCP) │   │ walreceiver  │◀────────┐           │
+   │  ┌────▼─────┐ ───────────────────────────▶│              │         │           │
+   │  │ walsender│  ③ 推送 WAL   │          │   └──────┬───────┘         │           │
+   │  └──────────┘               │          │          │ 写入 pg_wal     │           │
+   │       ▲                     │          │   ┌──────▼───────┐  ④ 重放 WAL          │
+   │       │ 反馈 已应用 LSN     │◀───────────── │ startup 进程  │ → 备库数据=主库     │
+   │       │ (复制延迟由此算)    │  反馈报文 │   └──────────────┘                    │
+   └────────────────────────────┘          └──────────────────────────────────────┘
+```
+
+### 2.3 hot standby：备库可读
+
+备库默认处于"恢复模式"、不可写。开启 **hot standby**（`hot_standby = on`，PG 中默认就是 on）后，备库**在持续应用 WAL 的同时，可以对外提供只读查询**——这就是读写分离里"读走备库"的基础。
+
+> 注意冲突：备库一边重放 WAL（可能要清理某些行版本）、一边跑只读查询，两者可能冲突，PG 会按 `max_standby_streaming_delay` 决定是"延迟重放等查询跑完"还是"取消查询保证重放"。长查询太多会拖慢备库追主进度。
+
+### 2.4 搭建要点
+
+```text
+   备库一般用 pg_basebackup 从主库拉一份基础备份，再启动进入流复制：
+     pg_basebackup -h <主库> -D <备库数据目录> -R -X stream -S <slot名>
+       -R  自动生成连接信息(standby.signal + primary_conninfo)
+       -X stream  顺便拉取 WAL
+       -S  指定复制槽
+```
+
+PG 12 起，备库标识从 `recovery.conf` 改为数据目录下的 **`standby.signal`** 空文件 + `postgresql.conf` 里的 `primary_conninfo` 等参数。
+
+## 三、同步 vs 异步复制
+
+复制默认是**异步**的，是否同步由主库 `synchronous_standby_names` + 提交事务的 `synchronous_commit` 共同决定。
+
+### 3.1 异步复制（默认）
+
+```text
+   客户端 ──提交──▶ 主库本地 WAL fsync ──▶ 立即返回"成功"
+                                            └─ 主库不等备库，WAL 随后异步发给备库
+```
+
+主库提交不等备库确认，**吞吐高、延迟低**，但主库刚提交、WAL 还没传到备库时主库就宕机，这几笔事务在备库上就**丢了**（failover 到备库会丢数据）。
+
+### 3.2 同步复制
+
+配置 `synchronous_standby_names`（指定哪些备库算"同步备库"，可写 `ANY 1 (s1,s2)` / `FIRST 2 (...)` 等），并让事务的 `synchronous_commit` ≥ `remote_write`：
+
+```text
+   客户端 ──提交──▶ 主库本地 WAL fsync ──▶ 等【至少一个同步备库】确认 ──▶ 才返回"成功"
+                                                     ▲
+                                          确认到哪一步由 synchronous_commit 决定
+```
+
+`synchronous_commit` 在复制场景的取值（越往下越安全、越慢）：
+
+| 取值 | 主库提交时要等到 | 含义 |
+|---|---|---|
+| `off` | 不等（连本地都异步） | 最快，本地都可能丢最近几笔（见 [WAL 与持久化](wal.html)） |
+| `local` | 仅本地 WAL 落盘 | 等于异步复制（不等备库） |
+| `remote_write` | 备库**收到并 write 到 OS** | 备库进程崩溃不丢，备库整机崩溃可能丢 |
+| `on`（默认值语义） | 备库**WAL fsync 落盘** | 备库宕机也不丢 |
+| `remote_apply` | 备库**已 replay 应用**（备库上能查到） | 最强：保证备库读到的是最新已提交数据 |
+
+> 关键权衡：同步复制保证"提交成功 = 至少一个备库也有了"，但主库每次提交都要**等一个网络往返 + 备库落盘**，延迟显著上升。而且如果配了同步备库却全挂了，主库提交会**一直阻塞等待**——所以同步复制生产上通常配"**N 个候选里至少 1 个确认**（`ANY 1 (...)`）"来避免单备库故障卡死主库。`remote_apply` 最强但最慢，一般只在"提交后必须立刻能从备库读到"的场景用。
+
+## 四、复制槽（replication slot）
+
+### 4.1 解决什么问题
+
+异步复制下，主库 checkpoint 后会回收旧 WAL（见 [WAL 与持久化](wal.html)）。如果某个备库**断线/落后**，它还没收的那段 WAL 一旦被主库清掉，备库就再也追不上了，只能重新做基础备份。
+
+**复制槽（replication slot）** 让主库**记住每个备库消费到的 LSN，并保留它还没收走的 WAL，不被 checkpoint 回收**：
+
+```text
+   无复制槽：主库 checkpoint 照常回收旧 WAL → 落后的备库需要的 WAL 没了 → 追不上、要重建
+   有复制槽：主库知道备库只消费到 LSN=X → 把 X 之后的 WAL 都留着 → 备库恢复连接后能续上
+```
+
+### 4.2 代价：WAL 可能堆积
+
+复制槽是把双刃剑：**备库长时间挂掉/落后，主库会一直为它保留 WAL，导致 `pg_wal` 不断膨胀，甚至撑爆磁盘**。所以要监控 `pg_replication_slots` 里各槽的滞后量。PG 13+ 提供 `max_slot_wal_keep_size` 给复制槽的 WAL 保留量设上限，超了就放弃该槽（牺牲它换主库磁盘安全）。
+
+> 物理复制槽保留 WAL；逻辑复制也用复制槽（逻辑复制槽），机制类似。
+
+## 五、逻辑复制（logical replication，PG 10+）
+
+### 5.1 是什么：发布 / 订阅
+
+PG 10 引入**逻辑复制**：不再传 WAL 字节流，而是把 WAL 通过**逻辑解码（logical decoding）** 还原成"哪张表的哪一行 INSERT/UPDATE/DELETE 了"的**行级变更**，按**发布（PUBLICATION）/ 订阅（SUBSCRIPTION）** 模型同步：
+
+```text
+   发布端(主)                                  订阅端(从)
+   CREATE PUBLICATION pub                       CREATE SUBSCRIPTION sub
+     FOR TABLE orders, users;                     CONNECTION '...' PUBLICATION pub;
+
+   ┌────────────┐  WAL 逻辑解码成    ┌──────────────┐  apply worker 应用
+   │ WAL 变更   │ ─行级变更(INSERT/─▶│ 订阅端接收    │ ─→ 写入订阅端对应表
+   │            │  UPDATE/DELETE)   │ (apply worker)│
+   └────────────┘                    └──────────────┘
+       └─ 只解码【被发布的表】的变更
+```
+
+### 5.2 逻辑复制的能力
+
+相比物理复制"整库字节级镜像"，逻辑复制是"**行级、可挑选**"的，因此更灵活：
+
+- **选表复制**：只复制指定的表（甚至按列/行过滤，PG 15 起支持行过滤和列列表）。
+- **跨大版本**：可以从 PG 14 复制到 PG 16，常用于**大版本不停机升级**。
+- **多对一 / 多主**：多个库往一个库汇聚，或双向同步（需自己处理冲突）。
+- **表结构可不同**：两端表名/列只要能对上即可，不要求整库一致。
+- 订阅端是**可正常读写的普通库**（不像物理备库只读）。
+
+> 限制：逻辑复制**默认不复制 DDL**（建表、改列要两端各自做，PG 16 仍如此）、不复制序列当前值、需要表有**副本标识（REPLICA IDENTITY，通常是主键）** 才能复制 UPDATE/DELETE。大事务、初始全量同步也可能有性能开销。
+
+## 六、物理复制 vs 逻辑复制对比
+
+| 维度 | 物理流复制 | 逻辑复制（PG 10+） |
+|---|---|---|
+| **传输内容** | **WAL 字节流**（块级/物理） | WAL 解码出的**行级变更**（逻辑） |
+| **粒度** | **整个实例**（所有库、所有表） | **按表**挑选（可过滤行/列） |
+| **两端版本** | **必须同大版本**（且通常同架构） | **可跨大版本**（升级利器） |
+| **两端表结构** | 完全一致（字节级镜像） | 可不同，只需能对应 |
+| **备/订阅端可写** | 备库**只读**（hot standby） | 订阅端是**可读写**普通库 |
+| **DDL** | 自动跟随（就是 WAL） | **不自动复制**，需手动同步 |
+| **典型用途** | 高可用、读副本、灾备 | 选表同步、跨版本升级、数据汇聚/分发 |
+| **开销** | 低（直接重放 WAL） | 较高（解码 + 按行应用） |
+
+```text
+   物理复制：克隆整台机器(连磁盘块都一样) → 高可用/读副本首选
+   逻辑复制：只搬你点名的那几张表的"行变更" → 灵活、能跨版本，但不是整库镜像
+```
+
+## 七、高可用：failover 与工具
+
+流复制本身只负责"备库跟上主库"，**主库挂了之后自动切换（failover）**需要额外的编排：检测主库故障 → 选出最新的备库（LSN 最大）→ 把它**提升（promote）为新主库**（`pg_ctl promote`，会开启新时间线 timeline）→ 让其余备库和应用连到新主。
+
+生产常用外部工具来做这套自动 failover + 选主：
+
+- **Patroni**：目前最主流，用 etcd/Consul/ZooKeeper 做分布式选主，管理 PG 流复制集群的自动故障切换。
+- **repmgr**：较老牌的复制管理与 failover 工具。
+- 配合 **PgBouncer / HAProxy / VIP** 等做连接层的主库地址切换。
+
+> 一句话：PG 内核提供"复制 + promote"，**自动 failover 靠 Patroni / repmgr 这类外部工具**编排。
+
+## 八、对比 MySQL 复制
+
+| 维度 | PostgreSQL | MySQL |
+|---|---|---|
+| **复制载体** | **WAL**（物理流复制传 WAL 字节流；逻辑复制传解码后的行变更） | **binlog**（Server 层逻辑日志） |
+| **物理/逻辑** | 物理流复制 = WAL **字节级**；逻辑复制才是**行级** | binlog row 格式就是**行级**逻辑日志 |
+| **类比关系** | PG **物理复制**像 MySQL 没有的"块级镜像"；PG **逻辑复制**才类似 MySQL binlog row 复制 | binlog 复制天然是逻辑（行/语句）级 |
+| **同步级别** | 异步 / 同步（`remote_write`/`on`/`remote_apply`） | 异步 / 半同步 / 组复制(MGR) |
+| **保留未消费日志** | 复制槽（replication slot） | 主库按 binlog 过期策略保留 |
+
+```text
+   MySQL：复制只有一条路 → 传 binlog(行/语句级逻辑日志) 给从库重放
+   PG：   两条路 →
+          物理复制：传 WAL 字节流(整库块级镜像，MySQL 没有的直接对应物)
+          逻辑复制：传 WAL 解码出的行变更(这一条才对应 MySQL binlog row 复制)
+```
+
+> 面试要点：被问"PG 复制和 MySQL 一样吗"时，关键是讲清——**PG 默认的物理流复制是 WAL 字节级整库镜像（比 binlog 复制更底层、更严格同版本），PG 的逻辑复制才相当于 MySQL 的 binlog 行级复制**。MySQL 三大日志与 binlog 复制细节可对照 [WAL 与持久化](wal.html) 里的对比节。
+
+## 一句话总结
+
+> PostgreSQL 的复制载体是 **[WAL](wal.html)**。**物理流复制**靠主库 **walsender** 把 WAL 流推给备库 **walreceiver**，备库持续**重放 WAL** 保持一致，开 **hot standby** 可提供只读查询；可选**异步**（默认，主不等备、failover 可能丢）或**同步**（`synchronous_standby_names` + `synchronous_commit=remote_write/on/remote_apply`，至少一个备确认才提交）。**复制槽**让主库为落后的备库保留未消费 WAL（代价是备库长挂会让 `pg_wal` 堆积）。**逻辑复制（PG 10+）** 用**发布/订阅**把 WAL 解码成行级变更，可选表、跨大版本、双向、表结构不同（但默认不复制 DDL）。高可用的自动 **failover** 靠 **Patroni / repmgr** 等外部工具编排。对比 MySQL：**PG 物理复制是 WAL 字节级整库镜像，逻辑复制才类似 MySQL binlog 行级复制**。WAL 本身见 [WAL 与持久化](wal.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/replication" data-base="../"></script>
+</body>
+</html>

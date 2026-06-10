@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.RWMutex 原理 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.RWMutex 原理
+
+> 前置阅读：[sync.Mutex 原理](sync-mutex.html)（RWMutex 内部嵌了一个 Mutex 做写者串行化）
+
+## 一、RWMutex 是干嘛用的
+
+Mutex 一次只能让一个 G 进入临界区——**读读也要排队**。但读操作之间本来**没必要互斥**——读不会改状态。
+
+`RWMutex` 提供两种锁：
+
+| 锁 | 互斥规则 | 用法 |
+|---|---|---|
+| **读锁 (RLock)** | 多个 G **可同时持有**读锁 | 只读访问共享状态 |
+| **写锁 (Lock)** | 互斥**所有 G**（读和写都不行） | 修改共享状态 |
+
+```go
+var mu sync.RWMutex
+var config Config
+
+// N 个 reader 可并发
+func GetConfig() Config {
+    mu.RLock()
+    defer mu.RUnlock()
+    return config
+}
+
+// writer 独占
+func SetConfig(c Config) {
+    mu.Lock()
+    defer mu.Unlock()
+    config = c
+}
+```
+
+### 适用场景
+
+- **读极多写极少**（>10:1）
+- **临界区不能太短**（否则 RWMutex 的协调成本 > 临界区本身，反而比 Mutex 慢）
+
+不适用场景（用 Mutex 反而更快）：
+
+- 读写各半
+- 临界区极短（几十 ns）
+- 写多
+
+→ 看完实现就知道为什么。
+
+---
+
+## 二、整体结构
+
+```go
+type RWMutex struct {
+    w           Mutex   // 写者之间互斥
+    writerSem   uint32  // 写者等读者退出的信号量
+    readerSem   uint32  // 读者等写者放锁的信号量
+    readerCount atomic.Int32  // 当前读者数（>=0 正常；<0 表示写者待入）
+    readerWait  atomic.Int32  // 写者待入时还剩多少个读者
+}
+```
+
+24 字节（Mutex 8 + sem 8 + count 8）。
+
+```
+┌──────── RWMutex (24 字节) ────────┐
+│  w (内嵌 Mutex, 8 字节)            │  ← 写者之间串行
+├───────────────────────────────────┤
+│  writerSem  (4)                   │  ← 写者挂在这等所有读者退
+│  readerSem  (4)                   │  ← 读者挂在这等写者放锁
+├───────────────────────────────────┤
+│  readerCount  atomic.Int32 (4)    │  ← 双重含义,见下节
+│  readerWait   atomic.Int32 (4)    │  ← 写者待入时,还剩多少读者
+└───────────────────────────────────┘
+```
+
+### 字段速览
+
+| 字段 | 作用 |
+|---|---|
+| `w` | 内嵌 Mutex，写者之间互斥 |
+| `writerSem` | 写者待入时挂在这里，等所有读者 RUnlock |
+| `readerSem` | 写者持锁期间，后续 RLock 的读者挂在这里 |
+| `readerCount` | **关键字段**，承载两个含义（见下节） |
+| `readerWait` | 写者待入时还要等多少读者退出，归零时唤醒写者 |
+
+---
+
+## 三、核心设计：`readerCount` 的双重含义
+
+这是 RWMutex 最巧妙的地方——**用一个字段同时表示两件事**：
+
+```
+readerCount = +N  → 当前有 N 个读者在临界区, 写者可以来抢
+            =  0 → 没读者也没写者
+            < 0 → 有写者已声明要进入 (减去了一个大常数)
+```
+
+### 怎么做到的
+
+定义一个常量：
+
+```go
+const rwmutexMaxReaders = 1 << 30   // = 约 10 亿
+```
+
+写者声明"我要进入"时执行：
+
+```go
+atomic.AddInt32(&rw.readerCount, -rwmutexMaxReaders)
+```
+
+这一减，`readerCount` 立刻变成负数：
+
+```
+原来 readerCount = 5 (5 个读者)
+执行: 5 - 1_073_741_824 = -1_073_741_819
+
+含义:
+  - 负数  ← 表示"有写者在等"
+  - 这个负数 + maxReaders = 5  ← 仍然能算出原来 5 个读者
+```
+
+写者 Unlock 时执行：
+
+```go
+atomic.AddInt32(&rw.readerCount, +rwmutexMaxReaders)
+```
+
+加回去，`readerCount` 又变成 5（或者其它正数）。
+
+### 这个设计的好处
+
+**新读者只需一次原子加就能判断**：
+
+```go
+func (rw *RWMutex) RLock() {
+    if rw.readerCount.Add(1) < 0 {
+        // 加完是负数 → 有写者在等 → 我让位
+        挂起
+    }
+    // 加完是正数 → 直接进入临界区
+}
+```
+
+如果不用这个 trick，新读者要：
+1. 读 readerCount
+2. 检查是否有写者
+3. 再 CAS 加 1
+
+**三步操作 + 中间可能竞态**。现在变成一步 atomic.Add + 一次判断，**单条原子指令搞定**。
+
+---
+
+## 四、RLock / RUnlock 流程
+
+### RLock 源码（简化）
+
+```go
+func (rw *RWMutex) RLock() {
+    if rw.readerCount.Add(1) < 0 {
+        // 有写者在等, 自己挂到 readerSem
+        runtime_SemacquireMutex(&rw.readerSem)
+    }
+    // 否则直接走 — 一次原子加,无锁
+}
+```
+
+时间线：
+
+```
+情况 A: 没有写者
+   readerCount.Add(1) = 5  (正数)
+   → 直接进入临界区 [~5 ns 一次原子加]
+
+情况 B: 有写者已声明
+   readerCount.Add(1) = -1_073_741_818  (负数)
+   → 挂到 readerSem 上等待
+   → 写者 Unlock 时把我唤醒
+```
+
+**99% 路径就一次原子加** + 一次符号判断——这是 RWMutex 在读多场景的性能优势源头。
+
+### RUnlock 源码（简化）
+
+```go
+func (rw *RWMutex) RUnlock() {
+    r := rw.readerCount.Add(-1)
+    if r < 0 {
+        // 有写者在等 — 我是最后一个吗?
+        if rw.readerWait.Add(-1) == 0 {
+            // 是, 唤醒写者
+            runtime_Semrelease(&rw.writerSem, false, 0)
+        }
+    }
+}
+```
+
+**关键点**：写者待入时已经把 `readerWait` 设置成"当时还有几个读者"。每个读者 RUnlock 时 `readerWait--`，归零时唤醒写者。
+
+---
+
+## 五、Lock / Unlock 流程（写锁）
+
+### Lock 源码（简化）
+
+```go
+func (rw *RWMutex) Lock() {
+    // ① 先用内嵌的 Mutex 串行所有写者
+    rw.w.Lock()
+
+    // ② 把 readerCount 变成负数, 宣告"我来了"
+    r := rw.readerCount.Add(-rwmutexMaxReaders) + rwmutexMaxReaders
+
+    // ③ 还有活跃读者? 等他们退出
+    if r != 0 && rw.readerWait.Add(r) != 0 {
+        runtime_SemacquireMutex(&rw.writerSem)
+    }
+}
+```
+
+时间线：
+
+```
+① rw.w.Lock()    [先和其它写者排队, 只让一个写者进入"申请阶段"]
+   ↓
+② readerCount -= maxReaders   [一次原子加, 把 count 变负]
+   r = 此时还有 5 个活跃读者
+   ↓
+③ readerWait.Add(5) = 5  [告诉读者们: 你们 5 个走完了再叫我]
+   ↓
+④ 挂到 writerSem 等待
+   ↓
+   读者陆续 RUnlock, 最后一个把 writerSem 唤醒
+   ↓
+⑤ 写者醒来,独占临界区 ✓
+```
+
+### Unlock 源码（简化）
+
+```go
+func (rw *RWMutex) Unlock() {
+    // ① 把 readerCount 加回去, 恢复正数
+    r := rw.readerCount.Add(rwmutexMaxReaders)
+
+    // ② 唤醒所有挂在 readerSem 的读者
+    for i := 0; i < int(r); i++ {
+        runtime_Semrelease(&rw.readerSem, false, 0)
+    }
+
+    // ③ 释放写者间的互斥锁
+    rw.w.Unlock()
+}
+```
+
+**注意**：Unlock 时会**一次性唤醒所有等待中的读者**——它们会同时进入临界区（并发）。
+
+---
+
+## 六、写者优先与读者饥饿防护
+
+### 没有"写者优先"会怎样
+
+```
+0ms:  writer A 调 Lock → 等读者退出
+5ms:  reader B 调 RLock → 直接进入 (锁是空闲读)
+10ms: reader C 调 RLock → 又一个新读者进入
+...
+不断有新读者进来 → writer A 永远等不到 → 写者饿死
+```
+
+### RWMutex 怎么保证写者优先
+
+**写者声明的瞬间**（`readerCount.Add(-maxReaders)`）：
+
+```
+readerCount 立刻变负
+   ↓
+新来的 reader 调 RLock:
+   readerCount.Add(1) → 仍是负数 (除非很巧赢得加法)
+   → 看到负数立刻挂到 readerSem 等待
+   → 不许进入临界区
+```
+
+→ 写者一声明，新读者必须让位。这就是 **"写者优先"**。
+
+### 三阶段时间线
+
+```
+阶段 1: 多个读者在临界区, 写者还没来
+   ┌──────────────────────────────────────┐
+   │ readerCount = 5 (5 个读者并发)        │
+   │ 新读者随便进                          │
+   └──────────────────────────────────────┘
+
+阶段 2: 写者来了, 等读者退出 (写者优先期)
+   ┌──────────────────────────────────────┐
+   │ readerCount = -(maxR - 5)             │
+   │ readerWait = 5                        │
+   │ 新读者: 看到负数 → 挂到 readerSem     │
+   │ 旧读者陆续 RUnlock, readerWait--      │
+   │ readerWait == 0 → 唤醒写者            │
+   └──────────────────────────────────────┘
+
+阶段 3: 写者独占临界区
+   ┌──────────────────────────────────────┐
+   │ readerCount = -maxR                   │
+   │ 所有读者都挂在 readerSem              │
+   │ 写者做事...                           │
+   └──────────────────────────────────────┘
+
+阶段 4: 写者 Unlock
+   ┌──────────────────────────────────────┐
+   │ readerCount += maxR (回正数)          │
+   │ 唤醒所有挂在 readerSem 的读者         │
+   │ 它们同时涌入临界区                    │
+   └──────────────────────────────────────┘
+```
+
+---
+
+## 七、为什么读多写少快、其它场景慢
+
+### 读多写少 ✅
+
+```
+RLock 路径:
+   readerCount.Add(1)       [~5 ns, 一次原子加]
+   判断符号                  [~1 ns]
+   → 进临界区
+```
+
+**主体就是 1 次原子加**——几乎和"无锁"一样快。
+
+### 临界区极短 ❌
+
+假设临界区只是 `count++`（5 ns）：
+
+```
+RWMutex 开销:
+   RLock:    ~10 ns
+   临界区:    ~5 ns
+   RUnlock:  ~10 ns
+   ─────────────────
+   总:       ~25 ns
+
+Mutex 开销:
+   Lock:     ~10 ns
+   临界区:    ~5 ns
+   Unlock:   ~10 ns
+   ─────────────────
+   总:       ~25 ns
+
+但是, RWMutex 在 N 个读者并发时:
+   每个读者仍要 ~25 ns (原子加是共享 cache line, 还有 bus 争抢)
+   N 个并发, 反而比 Mutex 串行 N 个慢 (因为 cache line 颠簸)
+```
+
+→ **临界区不够长**时，RWMutex 的开销分摊不开。
+
+### 读写各半 ❌
+
+每次 Lock 都要：
+1. 等所有现有读者退出
+2. 唤醒所有等待的读者
+
+链路远比 Mutex 长。Mutex 一次 CAS 就抢到，RWMutex 至少要一次原子加 + 一次比较 + 信号量协调。
+
+### 写多 ❌
+
+每个 Write 都要走"宣告+等读者+独占+唤醒读者"全套——单次写比 Mutex 慢 5-10 倍。
+
+### 总结性能取舍
+
+| 场景 | RWMutex vs Mutex |
+|---|---|
+| **读极多写极少（>10:1）+ 临界区不短** | RWMutex 优 ✅ |
+| 读多但临界区很短（< 100 ns） | **Mutex 反而快** |
+| 读写各半 | Mutex 优 |
+| 写多 | Mutex 优 |
+
+---
+
+## 八、常见使用陷阱
+
+### ① 不能升级 RLock → Lock
+
+```go
+// ❌ 死锁
+mu.RLock()
+// ... 看了看, 决定要写
+mu.Lock()      // 死锁! 自己持有读锁,写锁等读锁退出
+```
+
+Go 没有"升级"语义。正确写法：
+
+```go
+mu.RLock()
+needWrite := check()
+mu.RUnlock()
+
+if needWrite {
+    mu.Lock()
+    check() 后可能状态变了, 要再判断
+    mu.Unlock()
+}
+```
+
+### ② 不能降级 Lock → RLock
+
+```go
+// ❌ 也是死锁
+mu.Lock()
+// ... 改完了, 想转读锁继续读
+mu.RLock()     // 等不到, 因为写锁还没释放
+```
+
+Go 1.18 加了 `(*RWMutex).Downgrade()` 提案但未实现。**必须 Unlock 后再 RLock**。
+
+### ③ 长读阻塞写
+
+```go
+// ❌ 一个慢读把写堵死
+mu.RLock()
+heavyComputation()   // 几秒钟
+mu.RUnlock()
+
+// 这期间所有写者都在等, 新读者也都被"写者优先"挡住
+```
+
+读锁不应保护长操作——拿数据后 RUnlock 再处理。
+
+### ④ 不能 copy
+
+跟 Mutex 一样，**`RWMutex` 不能被复制**——内部 Mutex 和原子计数器都不能复制。`go vet` 会检查。
+
+### ⑤ 读锁的"递归"陷阱
+
+```go
+// ❌ 可能死锁
+func a() {
+    mu.RLock()
+    defer mu.RUnlock()
+    b()
+}
+
+func b() {
+    mu.RLock()   // 看着像递归读锁,但如果中间有写者插入,就死锁
+    defer mu.RUnlock()
+}
+```
+
+时间线：
+
+```
+G1 调 a():       mu.RLock()   ✓
+G2 调 Lock():    宣告写, readerCount 变负, 等读退出
+G1 调 b():       mu.RLock()   → readerCount 已是负数, 自己挂起
+                  G1 自己等自己, 死锁
+```
+
+读锁**不可重入**——这点和 Mutex 一样。
+
+---
+
+## 九、内部两个信号量
+
+| 信号量 | 谁挂在上面 | 谁来唤醒 |
+|---|---|---|
+| `writerSem` | 写者（等所有读者退出） | 最后一个 RUnlock 的读者 |
+| `readerSem` | 写者持锁期间到来的读者 | 写者 Unlock 时 |
+
+为什么要两个？
+
+```
+写者醒来需要去"持锁"
+读者醒来需要"继续 RLock"
+
+如果合成一个 sema:
+   Unlock 时怎么知道是叫醒一个写者还是叫醒所有读者?
+   → 必须分开
+```
+
+每个信号量有独立的语义：`writerSem` 一次释放一个，`readerSem` 一次释放 N 个。
+
+---
+
+## 十、一图总结
+
+```
+┌──────── RWMutex (24 字节) ────────┐
+│  w (内嵌 Mutex)                   │ ← 写者间互斥
+│  writerSem / readerSem            │ ← 双信号量
+│  readerCount  (atomic.Int32)      │ ← 双重含义:
+│                                       ≥ 0: 读者数
+│                                       < 0: 写者已声明 + 仍有读者
+│  readerWait   (atomic.Int32)      │ ← 写者待入时还剩多少读者
+└───────────────────────────────────┘
+
+RLock 主路径:
+   readerCount.Add(1)
+     ≥ 0 → 直接进入 [~5 ns]
+     < 0 → 挂 readerSem 等
+
+RUnlock:
+   readerCount.Add(-1)
+     < 0 → 我是不是最后一个? → 唤醒写者
+
+Lock:
+   ① w.Lock()               [写者间串行]
+   ② readerCount -= maxR    [宣告写, 新读者必须等]
+   ③ readerWait = 现有读者数 [我要等这么多读者退出]
+   ④ 挂 writerSem           [等最后一个读者唤醒我]
+
+Unlock:
+   ① readerCount += maxR    [回到正数]
+   ② 唤醒所有挂在 readerSem 的读者
+   ③ w.Unlock()             [让下一个写者可以申请]
+
+性能法则:
+   读极多写极少 + 临界区不短 → RWMutex 胜
+   读写各半 / 临界区极短 / 写多 → Mutex 胜
+
+经典陷阱:
+   RLock 升级 Lock = 死锁
+   Lock 降级 RLock = 死锁
+   读锁内嵌读锁 + 期间有写者 = 死锁
+   长读 = 写者全部饿死
+```
+
+**一句话**：RWMutex = **内嵌 Mutex 串行写者 + readerCount 的正负双重含义 + 双信号量协调读写**；**写者优先**靠"声明时把 readerCount 变负"实现，新读者立即让位。**只在"读极多 + 临界区不短"时比 Mutex 划算**，其它场景反而慢。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-rwmutex" data-base="../../"></script>
+</body>
+</html>

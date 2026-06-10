@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>分区 Topic 与无缝扩容 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 分区 Topic 与无缝扩容
+
+> 一句话：普通 Topic 是一条逻辑消息流，**Partitioned Topic** 把它拆成 N 个内部分区分布到不同 Broker 上提升吞吐；而 Pulsar 真正的杀手锏是 **Segment-centric（段式）存储**——数据是一串可分散的 Ledger 段，**加 Bookie 立即被新写入使用，不搬历史数据、不重平衡**，扩容近乎无缝。
+
+## 一、普通 Topic vs Partitioned Topic
+
+**普通 Topic**：对外是一个名字，逻辑上是一条消息流；底层由一串 Ledger 串成（写满一个开新的）。同一时刻只有一个 Broker 是它的 Owner，吞吐受单 Broker 限制。
+
+**Partitioned Topic**：对外仍是一个名字，但内部被拆成 N 个**分区**，每个分区其实是一个独立的内部 Topic（`...-partition-0`、`-partition-1` …），可分布到不同 Broker 并行读写。
+
+```text
+普通 Topic（单流）            Partitioned Topic（对外一个名字，内部 N 个分区）
+
+order_paid                   order_paid
+   │                            ├─ order_paid-partition-0  ─► Broker A
+ 一条逻辑流                     ├─ order_paid-partition-1  ─► Broker B
+ 单 Broker 持有                 ├─ order_paid-partition-2  ─► Broker C
+                               └─ order_paid-partition-3  ─► Broker A
+                               （每个分区都是一个内部 Topic，可分散到不同 Broker）
+```
+
+价值：**并行 + 吞吐**。代价：全局顺序无法保证（只能保证分区内有序），分区数规划不当会热点。
+
+> 总览见 [Pulsar 渐进式理解](deep-dive-overview.html)。
+
+---
+
+## 二、生产路由：消息发到哪个分区
+
+Producer 发消息时按路由模式决定落到哪个分区：
+
+| 路由模式 | 规则 | 顺序保证 |
+|----------|------|----------|
+| RoundRobinPartition | **无 key 时默认**，轮询打散到各分区 | 无（追求均衡吞吐） |
+| SinglePartition | 无 key 时固定发到某一个分区 | 单分区内有序 |
+| 按 key 哈希 | **有 key 时**，`hash(key) % N` 定分区 | **同 key 同分区 → 同 key 保序** |
+| 自定义 | 实现 MessageRouter 自定义逻辑 | 看实现 |
+
+```text
+带 key 的消息（key = userId）
+   hash("u1001") % 4 = 1  ──► partition-1   ┐
+   hash("u1001") % 4 = 1  ──► partition-1   ├─ 同一 userId 永远进同一分区 → 保序
+   hash("u2002") % 4 = 3  ──► partition-3   ┘
+
+无 key 的消息
+   round-robin ──► p0, p1, p2, p3, p0, ...   （均匀打散，不保序）
+```
+
+要点：**想保序就带 key**（同 key 哈希到固定分区）；只追求吞吐、不在意顺序就用默认轮询。
+
+---
+
+## 三、Segment-centric 无缝扩容（核心卖点）
+
+这是 Pulsar 相对 Kafka 最关键的架构优势，面试高频。
+
+**根因：Topic 的数据不是绑死在某台机器上的一整块，而是一串 Ledger 段（segment）。** 每写满一个 Ledger 就新建下一个，新 Ledger 可以独立地选择落在**哪一组 Bookie** 上——包括刚加进来的新 Bookie。
+
+```text
+Topic 的数据 = 一串 Ledger 段（每段独立选副本放置）
+
+Ledger-1 ─► Bookie A,B,C   （历史数据，原地不动）
+Ledger-2 ─► Bookie A,B,C
+─────────────── 此时加入 Bookie D ───────────────
+Ledger-3 ─► Bookie B,C,D   ← 新 Ledger 立刻用上新 Bookie D
+Ledger-4 ─► Bookie A,C,D
+                  │
+            加 Bookie = 立即被新写入使用
+            不搬历史数据、不重平衡
+```
+
+对比 Kafka 加 Broker：
+
+```text
+Pulsar：加 Bookie                      Kafka：加 Broker
+─────────────────────                  ─────────────────────
+新 Ledger 落到新 Bookie                 老 partition 数据仍在旧 Broker
+历史数据原地不动                         需 partition reassignment 把副本搬过去
+立即生效、近乎无缝                       大量网络/磁盘 IO 搬 TB 级数据
+                                        重平衡期间影响线上、耗时长
+```
+
+| 维度 | Pulsar（段式） | Kafka（分区绑机器） |
+|------|----------------|---------------------|
+| 数据归属粒度 | Ledger 段（可分散放置） | partition（整块绑在 Broker 本地） |
+| 加节点 | 新写入立即用上新 Bookie | 需 reassignment 搬移已有副本 |
+| 是否搬历史数据 | **否** | **是**（搬到新 Broker 才能用） |
+| 是否重平衡 | 不需要 | 需要，且影响线上吞吐 |
+| 扩容体验 | 近乎无缝、即时 | 慢、有运维负担 |
+
+一句话：**Pulsar 因为存算分离 + 段式存储，扩容是“加了就用”；Kafka 因为分区数据绑死本地，扩容要“搬完才用”。**
+
+> 段 / Ledger / 副本放置（E·Qw·Qa）的细节见 [BookKeeper 存储原理](bookkeeper.html)；为什么 Broker 能无状态见 [存算分离](storage-compute.html)；整体对比见 [Pulsar vs Kafka](vs-kafka.html)。
+
+---
+
+## 四、Bundle 与负载均衡
+
+分区数可能成千上万，Broker 不会逐个 Topic 去分配，而是引入 **Bundle** 这层中间抽象。
+
+一个 Namespace 的所有 Topic 按名字哈希，落到固定数量的 **Bundle**（哈希环上的一段区间）；Broker 以 **Bundle 为单位**做负载均衡和迁移。
+
+```text
+Namespace ecommerce/order 的哈希环切成若干 Bundle：
+
+  [0x0000‑0x3fff]  Bundle-1 ─► Broker A
+  [0x4000‑0x7fff]  Bundle-2 ─► Broker B
+  [0x8000‑0xbfff]  Bundle-3 ─► Broker C
+  [0xc000‑0xffff]  Bundle-4 ─► Broker A
+
+topic 名 hash 落到某区间 → 归属对应 Bundle → 归属当前持有它的 Broker
+```
+
+负载均衡时：
+
+```text
+Broker A 过载
+   └─► 把 Bundle-1 的归属从 A 迁到空闲的 Broker D
+       │
+       ▼
+   只是改“谁是 Owner”这条元数据
+   Broker 无状态 → 数据都在 BookKeeper，不用搬
+   → 迁移极快，Client 重新 lookup 即可
+```
+
+要点：因为 **Broker 无状态、数据在 BookKeeper**，Bundle 迁移只是**换归属、改元数据**，不涉及数据搬运，所以负载均衡和故障转移都很快。Bundle 还能在过热时**分裂（split）**成更细的区间以分散压力。
+
+---
+
+## 一句话总结
+
+> Partitioned Topic 用“对外一个名字、内部 N 个分区分散到多 Broker”换吞吐，靠带 key 哈希在分区内保序；而 Pulsar 真正的扩容优势来自 **Segment-centric 存储**——数据是一串可独立放置的 Ledger 段，**加 Bookie 立即被新写入使用、不搬历史、不重平衡**，配合以 **Bundle 为单位、只换归属不搬数据**的无状态 Broker 负载均衡，使扩容和迁移近乎无缝——这正是 Kafka 加 Broker 要做 partition reassignment 搬数据所做不到的。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/partitioned-topic" data-base="../"></script>
+</body>
+</html>

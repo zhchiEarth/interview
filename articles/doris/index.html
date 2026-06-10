@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Doris 索引机制 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Doris 索引机制
+
+> 一句话：Doris 是 OLAP 数仓，它的索引几乎都为**扫描加速**服务——核心思路不是 OLTP 那种"精确点查直达某一行"，而是**尽量跳过不需要读的数据块**（page / segment / tablet），少读就是快；索引分为「自动建的内建索引」（前缀索引、ZoneMap）和「需要手动声明的二级索引」（Bloom Filter、Bitmap、倒排、NGram BF）。
+
+> 本文基准 **Apache Doris 2.x**；倒排索引（Inverted Index）标注为 **2.0+** 引入。相关：[三种数据模型](data-model.html)、[存储与数据划分](storage.html)、[查询执行](query.html)。
+
+## 一、先建立直觉：Doris 索引是为"少读数据"
+
+Doris 是列式存储的 MPP 分析型数据库，单表动辄上亿、几十亿行，查询多是聚合、过滤、范围扫描，而**不是按主键查一行**。所以它的索引设计目标和 MySQL（点查直达某行）完全不同：
+
+```text
+OLTP 索引(如 MySQL B+ 树):  WHERE id=10  → 沿树直达那一行(point lookup)
+OLAP 索引(Doris):           WHERE dt BETWEEN ... AND status=2
+                            → 目标:用各种索引「排除掉绝大多数不可能命中的数据块」
+                              只把可能命中的 page / segment 读上来再过滤
+```
+
+记住这个核心：**Doris 索引基本都是"过滤/跳过"型的稀疏索引或块级元数据**，作用是减少 IO 扫描量（data skipping），而不是定位单行。它们大多在 **segment 内的 page（约 1024 行一块，可配）** 这一粒度上工作。
+
+存储的物理层次（详见[存储与数据划分](storage.html)）：
+
+```text
+表 → 多个分区(partition) → 多个分桶 tablet → 多个 rowset → 多个 segment → 列内分 page
+                                                            ▲ 大多数索引在 segment / page 粒度生效
+```
+
+## 二、前缀索引 / Short Key Index（最重要，自动建）
+
+这是 Doris 最核心、最该理解的内建索引。
+
+**原理**：Doris 的数据在 segment 内是按表的 **Key 列排序存储**的（三种模型的 Key 含义见[三种数据模型](data-model.html)）。既然数据已按 Key 有序，Doris 就对 Key 的**前缀**建一份**稀疏索引**——每隔若干行（默认每 1024 行一个 block）记录一条"前缀 → 行块位置"，查询时先用前缀索引二分定位到大致行块，再在块内顺序找。
+
+**前缀的边界规则（高频考点）**：
+
+- 取排序 Key 列拼起来的**前 36 字节**作为 short key；
+- 遇到 **VARCHAR 类型列就在该列处截断**（即 VARCHAR 只参与到它自己，且整个前缀到此为止），哪怕还没满 36 字节；
+- 因此**建表时 Key 列的顺序极其关键**——只有查询条件命中了 Key 的**最左前缀**，才能走前缀索引。
+
+```sql
+-- 假设建表排序 Key 顺序为 (user_id INT, age INT, msg VARCHAR)
+-- short key 前缀 = user_id(4B) + age(4B) = 8B, 到 VARCHAR(msg) 截断,msg 不进前缀
+
+SELECT * FROM t WHERE user_id = 100;                 -- 命中前缀(最左列) → 走前缀索引
+SELECT * FROM t WHERE user_id = 100 AND age = 20;    -- 命中前缀(user_id, age) → 走
+SELECT * FROM t WHERE age = 20;                       -- 跳过了最左列 user_id → 用不上前缀索引
+```
+
+```text
+前缀索引示意(稀疏,每隔一个 block 记一条):
+  [前缀=10 ] → 第 0    块起始位置
+  [前缀=10 ] → 第 1024 块
+  [前缀=35 ] → 第 2048 块
+       ▲ 查 WHERE key BETWEEN 10 AND 35 → 二分定位到对应块,跳过其余块
+```
+
+类比 MySQL 联合索引的"最左前缀原则"：前缀索引也是**先看第一列、第一列定了再看第二列**，所以**把最常用作过滤条件、区分度高的列放在 Key 列靠前的位置**。一张表只有一份前缀索引（数据只能按一种顺序排）。想换一套排序前缀，得靠 [物化视图与 Rollup](materialized-view.html) 里的 Rollup 重建另一份排序。
+
+## 三、ZoneMap 索引（自动建，无需声明）
+
+**原理**：Doris 为**每一列**、在**每个数据块（page）以及每个 segment**级别，自动维护这块数据的 **min / max（以及是否有 null 等）** 等统计信息，这就是 ZoneMap。
+
+做范围 / 等值过滤时，优化器拿过滤条件和每个块的 min/max 比对，**不在 [min, max] 区间内的块直接跳过，根本不读**。
+
+```text
+某列分了 3 个 page,各自的 ZoneMap:
+  page0: min=1   max=50
+  page1: min=51  max=120
+  page2: min=121 max=300
+
+SELECT ... WHERE col = 200;
+  → page0(1~50) 跳过, page1(51~120) 跳过, 只读 page2  ✅ 跳过 2/3 数据
+SELECT ... WHERE col > 250;
+  → 只 page2 可能命中,读 page2
+```
+
+特点：
+
+- **全自动、对所有列都有，无需建表声明**，是 data skipping 的基础设施；
+- 数据**越有序、越聚集，跳过效果越好**（所以排序 Key 列、按时间分区的列上 ZoneMap 特别有效）；若某列值随机分散，各块 min/max 都覆盖全域，就几乎跳不掉。
+
+## 四、Bloom Filter 索引（手动声明，高基数列等值过滤）
+
+**原理**：Bloom Filter 是一种概率型数据结构，能快速回答"这个值**有没有可能**在这个块里"——返回"一定没有"或"可能有"（有小概率假阳性，但**绝无假阴性**）。Doris 为指定列的每个块维护一个 BF，等值过滤时先问 BF：答"没有"就**直接跳过该块**。
+
+**适用**：**高基数列（取值很多、区分度高，如 user_id、订单号、设备 ID）** 上的**等值 / IN 查询**。它弥补了 ZoneMap 的短板——ZoneMap 只有 min/max，对"值散落在区间内但实际不存在"的情况无能为力，BF 能精确判定"块里没有这个值"。
+
+```sql
+-- 建表时在 PROPERTIES 指定 BF 列(只列出高基数、常做等值过滤的列)
+CREATE TABLE t (
+  user_id   BIGINT,
+  order_no  VARCHAR(64),
+  amount    DECIMAL(18,2)
+) ...
+PROPERTIES (
+  "bloom_filter_columns" = "order_no"
+);
+
+SELECT * FROM t WHERE order_no = 'NO20240101xxx';   -- BF 先判块里有没有 → 跳过大量块
+```
+
+注意：
+
+- **不适合低基数列**（取值很少，如性别、状态）——几乎每个块都"可能有"，BF 形同虚设，那种场景用 Bitmap 或倒排；
+- 主要服务**等值 / IN**，对范围查询无效（范围用 ZoneMap / 倒排）。
+
+## 五、Bitmap 索引（手动声明，低基数列）
+
+**原理**：对列的每个**取值**建一个 bitmap（位图），第 i 位为 1 表示第 i 行等于该值。等值 / IN 过滤就是对位图做位运算，极快，且位图可压缩。
+
+**适用**：**低基数列（取值数量少，枚举型，如 status、gender、city、平台类型）**。基数越低，bitmap 数量越少、压缩率越高、收益越大；基数一高（接近行数），bitmap 个数爆炸、空间和收益都崩坏。
+
+```sql
+-- 在低基数枚举列上建 bitmap 索引
+CREATE INDEX idx_status ON t (status) USING BITMAP;
+
+SELECT * FROM t WHERE status IN (1, 2);   -- 位运算快速定位
+```
+
+> 提醒：这里说的 **Bitmap 索引** 与数据模型里用于精确去重的 **BITMAP 数据类型 / `bitmap_union`**（聚合模型做 UV 去重那套）不是一回事，别混淆。
+
+## 六、倒排索引（Inverted Index，2.0+，手动声明）
+
+**这是 2.0 引入的重磅能力**。倒排索引为列建立"**值 → 包含该值的行号列表**"的映射（类似搜索引擎），用途广：
+
+- **全文检索**：通过 `MATCH` / `MATCH_ANY` / `MATCH_ALL` 等做分词后的关键词检索（建索引时可指定分词器，如 english / chinese / unicode），这是其它索引做不到的；
+- **任意列的等值 / 范围 / IN 过滤加速**：对普通列建倒排后，`=`、`>`、`<`、`IN`、`IS NULL` 等过滤都能加速，**在很多场景可替代 Bloom Filter / Bitmap**（既能高基数也能低基数，还省去选型纠结）；
+- 索引随数据导入**增量构建**，存在文件里。
+
+```sql
+-- 建表时声明(也可对已有表 ADD INDEX,新数据生效,旧数据可 BUILD INDEX 补建)
+CREATE TABLE log (
+  ts       DATETIME,
+  level    VARCHAR(16),
+  msg      TEXT,
+  INDEX idx_msg (msg) USING INVERTED PROPERTIES("parser" = "english"),  -- 全文检索
+  INDEX idx_level (level) USING INVERTED                                 -- 普通过滤加速
+) ...;
+
+-- 全文检索: 分词匹配(注意 MATCH 与 LIKE 语义不同)
+SELECT * FROM log WHERE msg MATCH_ANY 'timeout error';
+-- 普通过滤: 等值 / 范围也走倒排
+SELECT * FROM log WHERE level = 'ERROR' AND ts > '2024-01-01';
+```
+
+相比 BF / Bitmap，倒排更通用（全文 + 等值 + 范围 + 高/低基数都行），代价是占更多存储、导入时有构建开销。新项目做日志 / 文本检索或不确定列基数时，倒排往往是首选。
+
+## 七、NGram BloomFilter 索引（手动声明，加速 LIKE '%xx%'）
+
+普通 ZoneMap / BF 都救不了**中间匹配的模糊查询** `LIKE '%xx%'`（前导 % 没有有序前缀可用）。**NGram BloomFilter** 把字符串切成长度为 N 的连续片段（n-gram），对这些片段建 Bloom Filter；`LIKE '%abc%'` 时把 `abc` 也切成 n-gram 去问 BF，块里凑不齐这些片段就跳过。
+
+```sql
+-- gram_size 为切分长度, bf_size 为位图字节数
+CREATE TABLE t (...);
+CREATE INDEX idx_url ON t (url) USING NGRAM_BF
+  PROPERTIES("gram_size" = "3", "bf_size" = "1024");
+
+SELECT * FROM t WHERE url LIKE '%login%';   -- 把 login 切 3-gram 去 BF 判块,跳过不含的块
+```
+
+适合**长字符串列的 `LIKE '%子串%'`** 加速；它只能加速包含匹配，不改变结果正确性（依旧是 data skipping）。
+
+## 八、对比表（速查）
+
+| 索引类型 | 适用列基数 | 适用查询 | 是否自动 | 备注 |
+|---|---|---|---|---|
+| **前缀索引 / Short Key** | — | 命中 Key 最左前缀的等值 / 范围 | **自动** | 前 36 字节，遇 VARCHAR 截断；建表 Key 顺序决定一切，一表一份 |
+| **ZoneMap** | 任意（越有序越有效） | 等值 / 范围（靠 min/max 跳块） | **自动** | 每列、每 page/segment 都有；data skipping 基础 |
+| **Bloom Filter** | **高基数** | 等值 / IN | 手动声明 | 判"块里有没有"；不适合低基数、不支持范围 |
+| **Bitmap** | **低基数**（枚举状态等） | 等值 / IN | 手动声明 | 与 BITMAP 去重类型不同；高基数会爆炸 |
+| **倒排（2.0+）** | 高 / 低均可 | **全文 MATCH** + 等值 / 范围 / IN | 手动声明 | 最通用，可替代部分 BF/Bitmap；占空间、有构建开销 |
+| **NGram BloomFilter** | 长字符串 | `LIKE '%xx%'` 包含匹配 | 手动声明 | 切 n-gram 建 BF；只做包含匹配加速 |
+
+选型口诀：
+
+```text
+排序 + 最左前缀过滤        → 前缀索引(靠建表 Key 顺序,免费)
+范围/等值跳块             → ZoneMap(免费,数据越有序越香)
+高基数等值                → Bloom Filter
+低基数枚举等值            → Bitmap
+全文检索 / 拿不准基数的过滤 → 倒排(2.0+,最通用)
+LIKE '%中间%'           → NGram BloomFilter
+```
+
+## 一句话总结
+
+> Doris 的索引都为 **OLAP 扫描加速（data skipping，少读块）** 而非点查。**自动**的两类是基石：**前缀索引 / Short Key**（数据按 Key 排序、对前 36 字节、遇 VARCHAR 截断的前缀建稀疏索引，命中**最左前缀**才走，所以**建表 Key 顺序决定性能**）和 **ZoneMap**（每列每块的 min/max，按范围/等值**跳过**不可能命中的块）。**手动声明**的二级索引按场景选：**Bloom Filter** 管**高基数等值**、**Bitmap** 管**低基数枚举等值**、**倒排索引（2.0+）** 最通用——支持**全文 MATCH** 以及任意列的等值/范围/IN，可替代部分 BF/Bitmap、**NGram BloomFilter** 专治 `LIKE '%子串%'`。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/index" data-base="../"></script>
+</body>
+</html>

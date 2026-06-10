@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.WaitGroup &amp; sync.Once · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# sync.WaitGroup & sync.Once
+
+> 两个都在解决"等待"，但等的东西不同：
+> **WaitGroup** 等"**一组任务全部结束**"；**Once** 等"**某段初始化恰好跑一次**，其他人等它跑完再走"。
+> 套路一致：**一个原子状态(计数/标志) + runtime 信号量** —— 没竞争走无锁快路径，真要等才挂起。
+
+## 一、WaitGroup 用法
+
+```go
+var wg sync.WaitGroup
+for _, url := range urls {
+    wg.Add(1)                 // ← 必须在 go 之前
+    go func(u string) {
+        defer wg.Done()       // = Add(-1)
+        fetch(u)
+    }(url)
+}
+wg.Wait()                     // 阻塞到 counter 归 0
+```
+
+心智模型：**一个计数器**。`Add(n)` 加、`Done()` 减一、`Wait()` 卡在那儿等它变 0。
+
+---
+
+## 二、WaitGroup 内部：一个 uint64 装下 counter + waiter
+
+```go
+type WaitGroup struct {
+    noCopy noCopy             // go vet 用: 禁止拷贝
+    state  atomic.Uint64      // 高 32 位 = counter, 低 32 位 = waiter 数
+    sema   uint32             // runtime 信号量, Wait 的 G 挂这里
+}
+```
+
+```text
+            state (64 bit)
+   ┌─────────────────────┬─────────────────────┐
+   │   counter (高 32)    │   waiter 数 (低 32)  │
+   │   还有多少任务没完    │   多少个 G 卡在 Wait  │
+   └─────────────────────┴─────────────────────┘
+```
+
+### 三个操作
+
+- **`Add(n)`**：`state += n<<32`（改高 32 位的 counter）。
+- **`Done()`**：就是 `Add(-1)`。
+- **`Wait()`**：counter>0 → 低 32 位 +1（登记一个 waiter）→ 挂到 `sema` 睡；counter==0 → 直接返回。
+
+### 关键设计：为什么 counter 和 waiter 要塞进同一个 uint64
+
+因为那个**把 counter 减到 0 的 `Done`**，需要在**同一个原子操作**里立刻知道"**现在到底有没有人在等**"，才能决定要不要唤醒：
+
+```text
+Done 把 counter 减到 0 的瞬间, 一次原子读就同时拿到:
+   counter == 0   且   waiter == 3
+        │
+        ▼
+   "任务都完了, 还有 3 个 G 在等" → Semrelease 唤醒这 3 个
+```
+
+如果 counter 和 waiter 是**两个字段**，"counter 归 0"和"读 waiter 数"之间就有一道缝：可能刚读完 `waiter==0` 决定不唤醒，紧接着一个 `Wait` 进来把自己登记成 waiter，却再也没人叫它 → **永久死等**。挤进一个 uint64，一次原子操作同时看 counter 和 waiter，**没有缝**。
+
+### Add / Wait 流程
+
+```text
+Add(n):  state.Add(n<<32) → 取新 counter v
+   v < 0                      → panic("negative WaitGroup counter")
+   v > 0  或  没有 waiter      → 直接返回
+   v == 0 且有 waiter          → state 清 0, Semrelease 唤醒【所有】waiter
+
+Wait():  循环
+   读 state → counter v
+   v == 0                      → 直接返回 (没任务要等)
+   v > 0                       → CAS 把 waiter+1, 成功后 Semacquire 挂起
+                                 醒来时 state 必须为 0, 否则 panic(被提前复用)
+```
+
+> 这里的 `sema` 不是 OS 信号量，是 runtime 的 G 等待队列（sudog 挂载、gopark/goready）——见 [sudog：阻塞/唤醒的通用节点](../03-expert/sudog.html) 与 [sync.Mutex 第七节](sync-mutex.html)。
+
+---
+
+## 三、WaitGroup 的四条铁律
+
+### ① Add 必须在 `go` 之前（最常见的错）
+
+```go
+// ❌ Add 在 goroutine 里
+for _, u := range urls {
+    go func(u string) {
+        wg.Add(1)            // 太晚了!
+        defer wg.Done()
+        fetch(u)
+    }(u)
+}
+wg.Wait()                    // 可能在任何 Add 跑之前就到了 → counter==0 → 直接返回
+```
+
+Go 内存模型要求：**`Add` 的调用必须 happens-before 它所计数的那个 `Wait`**。`Add` 放进 goroutine，调度顺序无保证，`Wait` 可能先看到 counter==0 直接走人——任务一个没等，却"等完了"。
+
+```text
+正确:  main: Add Add Add ───────── Wait(阻塞) ──→ 全 Done 后唤醒
+       go:                Done Done Done
+
+错误:  main: ─────────────── Wait(看到 0, 立刻返回) ✗
+       go:   (还没来得及 Add)
+```
+
+### ② counter 不能变负 → panic
+
+`Done()` 比 `Add()` 多 → counter 减成负数，直接 `panic("sync: negative WaitGroup counter")`。多见于 `Done` 多调一次、或 `Add` 的数与实际 goroutine 数对不上。
+
+### ③ 不能拷贝
+
+`state` 一拷贝，两份各算各的，等待逻辑就废了。结构里的 `noCopy` 让 **`go vet` 直接报错**。传递一律用指针 `*sync.WaitGroup`，别传值。
+
+### ④ 复用要等上一轮 Wait 完全返回
+
+`Wait` 还没返回就 `Add` 开下一轮 → `panic("WaitGroup is reused before previous Wait has returned")`。要复用，等 `Wait()` 返回后再开新一轮。
+
+---
+
+## 四、sync.Once 用法
+
+```go
+var once sync.Once
+once.Do(func() { initStuff() })   // 无论多少个 G、调多少次, initStuff 只跑一次
+```
+
+最常见场景：**懒加载单例 / 全局初始化**——多个 G 同时第一次访问，只让一个去初始化，其余的等它完成后直接用结果。
+
+---
+
+## 五、Once 内部：双检 + atomic
+
+```go
+type Once struct {
+    done atomic.Uint32   // 0 = 没跑过, 1 = 跑过
+    m    Mutex
+}
+
+func (o *Once) Do(f func()) {
+    if o.done.Load() == 0 {   // 快路径: 一次原子读, 无锁
+        o.doSlow(f)
+    }
+}
+
+func (o *Once) doSlow(f func()) {
+    o.m.Lock()
+    defer o.m.Unlock()
+    if o.done.Load() == 0 {   // 慢路径: 锁内【再检查一次】(双检)
+        defer o.done.Store(1) // ← 注意是 defer, 且登记在 f 之前
+        f()
+    }
+}
+```
+
+三个"为什么"，把这篇问到底就值了：
+
+### 为什么要"双检"（检查两次）
+
+- **快路径**（`Do` 里那次 `Load`）：初始化完成后，**99.99% 的调用**只是一次原子读 `done==1` 就返回，**完全无锁**，几乎零开销。
+- **慢路径**：只有 `done==0` 才进 `doSlow` 抢锁。抢到锁后**必须再检查一次**——因为从"快路径读到 0"到"抢到锁"这段时间里，**可能已经有别的 G 跑完 f 并把 done 置 1 了**。不再检查就会重复执行 f。
+
+```text
+G1: done==0 → 抢锁 → 跑 f → done=1 → 解锁
+G2: done==0 → 抢锁(等 G1) ── 拿到锁 ── 再检查 done==1 → 啥也不做 ✓
+                                       ↑ 双检在这里救命
+```
+
+### 为什么 `done` 必须是 atomic，不能用普通 bool
+
+这是最容易被忽略、也最致命的一点——**不是为了"原子"，是为了"可见性 / happens-before"**：
+
+`done.Store(1)` 是一次 **release**，`done.Load()` 是 **acquire**。它保证：**看到 `done==1` 的 G，一定也能看到 f() 里写的所有数据**（比如初始化好的单例字段）。
+
+```text
+G1:  填好单例的各个字段 ...
+     done.Store(1)        ── release ──┐
+                                        │ 可见性传递
+G2:  done.Load()==1  ── acquire ────────┘  → 读单例字段, 保证是初始化后的值
+```
+
+换成普通 `bool` 就没这条保证：G2 可能看到 `done==true`，**却读到 f 还没写完的半成品单例**（编译器/CPU 重排）。详见 [atomic & CAS 的内存语义一节](atomic-cas.html)。
+
+### 为什么 f panic 也算"跑过了"
+
+注意是 **`defer o.done.Store(1)`**：先登记 defer，再调 `f()`。`f` 即使 panic，**defer 在栈展开时照样把 done 置 1** → 之后的 `Do` 直接返回、不再跑 f。
+
+```go
+defer o.done.Store(1)   // 先登记
+f()                     // 若 panic, 上面的 defer 仍会执行 → done=1
+```
+
+这是**有意为之**（官方文档："If f panics, Do considers it to have returned"）。所以 **f 内部务必自己处理好错误**，否则就是"初始化失败，但再也没机会重试"。
+
+---
+
+## 六、Once 的衍生（Go 1.21+）
+
+老写法要自己声明 `var once sync.Once` 再配个闭包。1.21 加了三个语法糖，把"只算一次的值"直接包成函数：
+
+```go
+// 只跑一次, 无返回值
+setup := sync.OnceFunc(func() { doSetup() })
+
+// 只算一次, 之后每次返回缓存的值 (懒加载单例的标准写法)
+config := sync.OnceValue(func() *Config { return loadConfig() })
+c := config()   // 第一次真加载, 后续直接返回同一个
+
+// 两个返回值版本
+get := sync.OnceValues(func() (*DB, error) { return openDB() })
+db, err := get()
+```
+
+> `OnceValue` 是现在写懒加载单例最干净的方式——内部就是 Once + 缓存结果，还顺带处理了 panic 的传播。
+
+---
+
+## 七、一图总结
+
+```text
+┌──────────────── WaitGroup ─────────────────┐
+│ state(uint64): [counter 高32 | waiter 低32] │
+│ sema: runtime 信号量(G 等待队列)             │
+│                                             │
+│ Add(n): counter += n                        │
+│ Done(): Add(-1)                             │
+│ Wait(): counter>0 → waiter++ 挂 sema        │
+│         counter==0 → 唤醒所有 waiter         │
+│                                             │
+│ 为什么挤一个 uint64:                         │
+│   Done 减到 0 的同一瞬间, 一次原子读就知道   │
+│   "还有几个在等" → 决定唤醒, 中间没有缝      │
+│                                             │
+│ 四铁律:                                      │
+│   ① Add 必须在 go 之前 (happens-before)      │
+│   ② counter 变负 → panic                     │
+│   ③ 不能拷贝 (noCopy / go vet)               │
+│   ④ 复用要等上轮 Wait 返回                    │
+└─────────────────────────────────────────────┘
+
+┌──────────────── Once ───────────────────────┐
+│ done atomic.Uint32 + m Mutex                │
+│                                             │
+│ Do: 快路径 done.Load()==0? 否→直接返回(无锁) │
+│     慢路径 → 抢锁 → 双检 done==0 → 跑 f       │
+│             defer done.Store(1)             │
+│                                             │
+│ 三个为什么:                                  │
+│   双检   → 防快路径到抢锁之间被别人跑过       │
+│   atomic → 看到 done=1 必看到 f 写的数据      │
+│            (happens-before, 不是为了原子)    │
+│   defer  → f panic 也算跑过, 不再重试         │
+│                                             │
+│ 1.21+: OnceFunc / OnceValue / OnceValues    │
+└─────────────────────────────────────────────┘
+```
+
+**一句话**：
+**WaitGroup** = `[counter|waiter]` 挤进一个 uint64 + 信号量——`Done` 把 counter 减到 0 时，一次原子读就知道要不要唤醒等待者；**`Add` 必须在 `go` 之前**。
+**Once** = `atomic done + Mutex 双检`——快路径无锁读、慢路径锁内再检防重复；`done` 用 atomic 是为了**可见性**（看到 done=1 必看到 f 的写），`defer Store(1)` 让 **panic 也算跑过**。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-waitgroup-once" data-base="../../"></script>
+</body>
+</html>

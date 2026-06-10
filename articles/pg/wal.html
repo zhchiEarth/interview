@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAL 与持久化 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# WAL 与持久化
+
+> 一句话：PostgreSQL 的 **WAL（Write-Ahead Logging，预写日志）** 是"**改数据页之前，先把改动顺序写进 WAL**"——崩溃后照着 WAL **重放（redo）** 就能把数据恢复到崩溃前一刻。它类似 MySQL 的 redo log，但关键区别是 **PG 只有 WAL 这一套日志**，同时兼顾**崩溃恢复 + 主从复制 + 时间点恢复（PITR）**三件事；而 MySQL 是 redo（恢复）+ binlog（复制）两套。
+
+> 本文以 **PostgreSQL 14 / 15 / 16** 为基准（涉及版本差异处会单独标注）。WAL 是复制的载体，基于 WAL 的流复制 / 逻辑复制见 [流复制与高可用](replication.html)。
+
+## 一、为什么需要 WAL（先建立全局图）
+
+数据库的数据页平时缓存在内存（**shared_buffers**）里，被改过、还没刷回磁盘的页叫**脏页**。如果"改一次就立刻把整页随机写回磁盘"，性能极差；可要是脏页只留在内存，**一断电就全丢了**。WAL 就是解决这个两难的：
+
+```text
+   改数据  ─┬─→ ① 改内存里的数据页(shared_buffers) → 变"脏页"
+            └─→ ② 顺序写 WAL 记录(顺序 IO，快)        ← 事务提交只需保证这一步落盘
+                                                       (脏页可以晚点由 checkpoint 慢慢刷)
+   ③ checkpointer 进程择机把脏页刷回数据文件(随机 IO，慢)
+```
+
+核心思想就一句：**先写日志、再改数据（write-ahead）**。提交时只要 WAL 落了盘，哪怕脏页还没刷、机器立刻断电，重启后也能用 WAL 把改动重放回来，所以"提交即不丢"。
+
+| 角色 | 是什么 | 解决的核心问题 |
+|---|---|---|
+| **WAL** | 顺序追加的物理/物理逻辑日志 | 崩溃恢复（crash recovery）+ 复制 + PITR |
+| **shared_buffers** | 内存里的数据页缓存 | 减少磁盘随机 IO，缓存脏页 |
+| **数据文件** | 表/索引的实际存储（`base/` 下） | 最终持久化的数据 |
+| **checkpointer** | 后台进程 | 把脏页刷盘、推进恢复起点 |
+
+## 二、WAL 长什么样：LSN 与 segment 文件
+
+### 2.1 WAL 记录与 LSN（日志序列号）
+
+每一条 WAL 记录描述"对某个数据页做了什么物理改动"。整个 WAL 是一条**只增不减的字节流**，流中的每个位置用 **LSN（Log Sequence Number，日志序列号）** 唯一标识——本质是"WAL 从开机到现在写了多少字节"的偏移量，形如 `0/16B3F50`（高 32 位 / 低 32 位）。
+
+LSN 是 PG 里非常核心的"时间坐标"：
+
+- 每个数据页头部记着 `pd_lsn`，表示"**这一页最后一次改动对应的 WAL 位置**"。刷脏页前必须保证"覆盖到该 LSN 的 WAL 已经落盘"——这就是 WAL 规则（**WAL 必须先于数据页落盘**）。
+- 复制里，主备之间就是靠比较 LSN 来判断"备库追到哪了、落后多少"（见 [流复制与高可用](replication.html)）。
+
+### 2.2 WAL segment 文件（默认 16MB）
+
+WAL 物理上切成一个个固定大小的 **segment 文件**，放在数据目录的 `pg_wal/`（PG 10 前叫 `pg_xlog/`）下：
+
+```text
+   pg_wal/
+     000000010000000000000001   ┐
+     000000010000000000000002   ├─ 每个默认 16MB，文件名 = 时间线 + LSN 段号
+     000000010000000000000003   ┘   写满一个就切到下一个(顺序追加)
+```
+
+- 单个 segment **默认 16MB**（initdb 时可用 `--wal-segsize` 改，如 64MB）。
+- 文件名前 8 位是**时间线（timeline）ID**（PITR / 故障切换后会 +1，见第七节与复制篇）。
+- WAL 是**追加写**，写满循环复用文件名空间，但旧的、已不再需要的 segment 会被 checkpoint 后回收或归档（见下文）。
+
+## 三、checkpoint（检查点）—— 推进恢复起点
+
+### 3.1 checkpoint 在干什么
+
+WAL 不能无限重放——总得有个"从这里开始恢复就够了"的起点。**checkpoint** 就是这个起点：
+
+```text
+   一次 checkpoint 做两件事：
+     ① 把到某个 LSN 为止的所有脏页刷回数据文件
+     ② 在 WAL 里写一条 checkpoint 记录，记下"恢复可以从这个 LSN 开始"
+```
+
+做完 checkpoint，之前那段 WAL 对"崩溃恢复"就没用了（脏页都已落盘），可以被回收/归档。**崩溃恢复时，PG 从最近一次 checkpoint 记录的 LSN 开始，向后重放 WAL** 即可，不用从头放。
+
+### 3.2 谁来做、何时触发
+
+由专门的 **checkpointer 进程**执行（后台写脏页还有 background writer 协助）。触发条件主要两个：
+
+| 触发 | 参数 | 含义 |
+|---|---|---|
+| **超时** | `checkpoint_timeout`（默认 5min） | 距上次 checkpoint 超过这个时间就触发 |
+| **WAL 写太多** | `max_wal_size`（默认 1GB） | 自上次 checkpoint 累积的 WAL 量超过阈值就触发 |
+
+此外还有手动 `CHECKPOINT;`、关库等会触发。
+
+### 3.3 频率的权衡：恢复快 vs IO 抖动
+
+```text
+   checkpoint 越频繁(间隔短)  → 每次要重放的 WAL 少  → 崩溃恢复快
+                              → 但脏页被频繁集中刷盘 → IO 抖动大、影响吞吐
+   checkpoint 越稀疏(间隔长)  → 平时 IO 平稳
+                              → 但崩溃后要重放的 WAL 多 → 恢复慢
+```
+
+为了缓解"集中刷盘"造成的 IO 尖峰，PG 用 `checkpoint_completion_target`（默认 **0.9**，9.5 前默认 0.5）把一次 checkpoint 的写盘**摊到整个 checkpoint 间隔的 90% 时间里**慢慢刷，避免一刀切式的 IO 风暴。
+
+> 面试常考点：调大 `max_wal_size` / `checkpoint_timeout` 能减少 checkpoint 频率、降低写放大与 IO 抖动（写多的库常这么调），代价是崩溃恢复变慢、WAL 占盘更多。
+
+## 四、full_page_writes —— 防"部分页写（torn page）"
+
+### 4.1 torn page 是什么问题
+
+PG 的数据页默认 **8KB**，而操作系统/磁盘的原子写单位通常是 **4KB（扇区/块）**。如果正在把一个 8KB 页写盘时突然断电，可能只写进去了前 4KB——这一页就**半新半旧、被"撕裂"了（torn page / partial write）**。这种页是损坏的，光靠 WAL 里的"增量改动"重放，是没法在一个本身已损坏的基础页上恢复出正确结果的。
+
+### 4.2 解决办法：checkpoint 后第一次改某页，整页写进 WAL
+
+`full_page_writes`（默认 **on**）的机制：
+
+```text
+   每次 checkpoint 之后，某个数据页【第一次】被修改时：
+     → 不只记"改了哪几个字节"，而是把【整张 8KB 页】完整写进 WAL（full-page image, FPI）
+   同一页在本次 checkpoint 周期内之后的再次修改：
+     → 只记增量改动(因为已经有整页备份兜底了)
+```
+
+这样崩溃恢复时，遇到 FPI 就**直接用 WAL 里那张完整页覆盖**磁盘上可能撕裂的页，再往后重放增量，就能保证页一定是完整的。
+
+> 代价：checkpoint 刚做完那一阵，WAL 量会明显变大（很多整页被写进去）。这也是"checkpoint 别太频繁"的另一个理由——越频繁，全页写越多、WAL 膨胀越厉害。关闭 `full_page_writes` 能减小 WAL，但**只有在存储本身保证 8KB 原子写时才安全**，否则有数据损坏风险，一般不要关。
+
+## 五、提交时怎么落盘：fsync 与 synchronous_commit
+
+### 5.1 WAL 落盘链路
+
+WAL 记录也是先进内存的 **WAL buffers**，由 **WAL writer** 进程或提交动作写到 OS page cache，再 `fsync` 到磁盘：
+
+```text
+   WAL buffers ──write()──→ OS page cache ──fsync()──→ 磁盘(pg_wal 文件)
+     (进程内存)              (内核内存)                 (持久)
+```
+
+两个相关参数：
+
+- **`fsync`**（默认 **on**）：是否真正调用 `fsync` 把数据强制刷到物理磁盘。**关掉（off）会快很多，但崩溃可能导致数据彻底损坏、不可恢复——生产环境绝不能关。**
+- **`synchronous_commit`**：控制"事务提交时要不要等 WAL 真正 fsync 落盘"，见下。
+
+### 5.2 synchronous_commit：on / off
+
+| 取值 | 提交时行为 | 风险 | 性能 |
+|---|---|---|---|
+| **on**（默认） | 提交要**等本地 WAL fsync 落盘**才返回成功 | 宕机不丢已提交事务 | 较低（每次提交一次 fsync） |
+| **off** | 提交**立即返回**，WAL 由后台稍后（`wal_writer_delay`，默认 200ms 量级）批量刷盘 | 崩溃可能丢**最近几笔已提交事务** | 高 |
+
+关键面试点：**`synchronous_commit=off` 丢的是"最近极短时间内已返回提交成功的事务"，但绝不会破坏数据库一致性**——因为 WAL 写入顺序仍然保证，只是末尾少了几条，重放出来仍是一个一致的状态（不会出现半个事务）。所以它是"拿少量已提交事务的丢失，换更高吞吐"，适合可容忍丢一点点的场景（如日志、埋点）。
+
+> 注意：`synchronous_commit` 还有 `remote_write` / `on` / `remote_apply` 等取值，那是配合**同步流复制**用的（要不要等备库确认），属于复制范畴，见 [流复制与高可用](replication.html)。本地单机场景只看 on/off。
+
+## 六、WAL 归档 + PITR（时间点恢复）
+
+WAL 既然记录了所有改动，那"**全量基础备份 + 之后的全部 WAL**"就能把库恢复到任意时刻——这就是 **PITR（Point-In-Time Recovery，时间点恢复）**。
+
+### 6.1 WAL 归档（archive）
+
+平时旧 WAL 在 checkpoint 后就被回收了，要做 PITR 就得在回收前先把它们**归档**保存下来：
+
+```text
+   archive_mode = on
+   archive_command = 'cp %p /archive/%f'   -- %p=待归档WAL路径, %f=文件名
+                                            -- (生产常用 pgBackRest / WAL-G 等工具)
+
+   每写满一个 16MB WAL segment → PG 调 archive_command 把它复制到归档目录
+```
+
+### 6.2 PITR 流程
+
+```text
+   ① 基础备份 base backup (pg_basebackup) ──→ 某个时刻的全量数据快照
+   ② 持续归档的 WAL 流 ───────────────────────────────────────────▶ 时间
+              ▲                                    ▲
+          备份起点                            想恢复到的目标点
+
+   恢复时：
+     先还原【基础备份】 → 再从备份起点开始【重放归档的 WAL】
+     → 重放到指定目标(recovery_target_time / _lsn / _xid)就停下
+     ⇒ 库被恢复到那个精确时间点(比如"误删表的前一秒")
+```
+
+恢复目标用 `recovery_target_time` / `recovery_target_lsn` / `recovery_target_xid` 等指定（PG 12 起这些配置写在 `postgresql.conf`，并用 `recovery.signal` 文件触发恢复模式；PG 12 之前是单独的 `recovery.conf`）。
+
+> 这正是"PG 一套 WAL 全包"的体现：**同一份 WAL，既用于崩溃恢复，又用于 PITR，还用于复制**。
+
+## 七、对比 MySQL：一套 WAL vs redo + binlog 两套
+
+这是 PG 与 MySQL 持久化模型最核心的差异，高频考点：
+
+| 维度 | PostgreSQL | MySQL（InnoDB） |
+|---|---|---|
+| **日志套数** | **只有 WAL 一套** | **redo log + binlog 两套** |
+| **崩溃恢复** | WAL 重放 | redo log 重放 |
+| **主从复制** | 基于 **WAL**（物理流复制 / 逻辑复制） | 基于 **binlog**（redo 不参与复制） |
+| **时间点恢复 PITR** | 基础备份 + **WAL** 重放 | 全量备份 + **binlog** 重放 |
+| **写入方式** | 追加写 segment，checkpoint 后回收/归档 | redo 环形循环写、binlog 追加写 |
+| **两阶段提交** | 单套日志，**无需** redo↔binlog 的 2PC 协调 | redo 与 binlog 需 **2PC** 保持一致 |
+
+```text
+   MySQL：  redo log ── 只管崩溃恢复(环形、会覆盖)
+            binlog  ── 只管复制 + PITR(追加、可归档)
+            两套日志要用【两阶段提交】对齐 → 复杂但解耦
+
+   PG：     WAL ───── 崩溃恢复 + 复制 + PITR  全都用它
+            一套搞定 → 简洁、天然一致，但 WAL 既要兼顾物理恢复又要被复制消费
+```
+
+> 一个常见追问："PG 为什么不需要像 MySQL 那样做 redo/binlog 两阶段提交？" 因为 PG 只有 WAL 一套日志，**复制和恢复读的是同一份 WAL**，不存在"两份日志可能不一致"的问题，自然就不需要 2PC 去对齐它们。代价是 WAL 这一套要同时承担物理恢复、复制、归档多个角色。MySQL 复制 / binlog 的对照细节见 [流复制与高可用](replication.html)。
+
+## 一句话总结
+
+> PostgreSQL 靠 **WAL（预写日志）** 实现持久化：改数据页前先顺序写 WAL，提交时只要 WAL `fsync` 落盘就"提交即不丢"，崩溃后从最近 **checkpoint** 的 **LSN** 开始重放 WAL 恢复。WAL 切成默认 **16MB 的 segment**；**checkpoint** 由 checkpointer 进程做、靠 `checkpoint_timeout` / `max_wal_size` 触发，越频繁恢复越快但 IO 抖动越大；**full_page_writes** 在 checkpoint 后首次改页时把整页写进 WAL 防 torn page；**synchronous_commit=off** 可异步提交（更快、崩溃可能丢最近几笔已提交事务但不破坏一致性）；开 **archive_mode** 归档 WAL 后，基础备份 + WAL 重放即可做 **PITR**。与 MySQL 最大的区别是 **PG 只有 WAL 一套，同时承担崩溃恢复 + 复制 + PITR**（MySQL 是 redo + binlog 两套，需两阶段提交对齐）。基于 WAL 的复制详见 [流复制与高可用](replication.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/wal" data-base="../"></script>
+</body>
+</html>

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulsar vs Kafka 怎么选 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Pulsar vs Kafka 怎么选
+
+> 一句话：**Pulsar 强在架构（存算分离带来的弹性、原生多租户、灵活订阅、分层存储、队列+流统一），Kafka 强在生态与成熟度（社区、Connect/Streams/ksqlDB、运维资料、极致吞吐与大厂背书）**——选型不是比谁先进，而是看你更缺「架构弹性」还是「成熟生态」。
+
+## 一、整体对比表
+
+| 维度 | Apache Pulsar | Apache Kafka |
+|------|---------------|--------------|
+| **架构** | 存算**分离**：Broker 只算、BookKeeper 只存 | 存算**一体**：分区数据落在 Broker 本地盘 |
+| **扩容计算** | 加 Broker **即用**，不搬数据 | 加 Broker 需 **partition reassignment 搬数据** |
+| **扩容存储** | 加 Bookie 即时生效，与 Broker 解耦 | 加盘与 Broker 绑定 |
+| **消费模型** | 四种订阅统一**队列 + 流**（独占/灾备/共享/Key 共享） | Consumer Group（分区粒度的流模型） |
+| **多租户** | **原生** Tenant / Namespace 隔离与配额 | 靠 **topic 前缀 + ACL + Quota 模拟** |
+| **消息确认** | 游标（cursor）可**单条 ack / 累积 ack**，支持选择性确认 | offset **单指针**累积提交 |
+| **分层存储** | **原生 Tiered Storage**（冷数据上对象存储） | 需 Tiered Storage（较新，或依赖商业版/KIP-405 演进） |
+| **延迟 / 吞吐** | 吞吐高、尾延迟可控；链路多一跳延迟略高 | 本地直写，**极致吞吐与低延迟** |
+| **运维复杂度** | 组件多：Broker + BookKeeper + ZK/元数据 | **KRaft 后单一组件**（去 ZK），更简单 |
+| **生态成熟度** | 生态在追赶 | **Connect / Streams / ksqlDB / 社区** 全面领先 |
+
+## 二、几个关键差异讲细一点
+
+### 1. 扩容：加节点即用 vs 搬数据
+
+```text
+   Kafka 加 Broker：
+     新 Broker 空着 ──► 需 partition reassignment
+                       把分区副本数据“搬”过去才分担负载（耗时、占带宽）
+
+   Pulsar 加 Broker：
+     新 Broker 上线 ──► 接管部分 Topic 的 ownership 即可
+                       数据本就在 BookKeeper，无需搬迁
+```
+
+弹性扩缩是 Pulsar 架构层面的核心优势，细节见 [存算分离](storage-compute.html) 与 [分区 Topic 与无缝扩容](partitioned-topic.html)。
+
+### 2. 消费模型：统一队列+流 vs Consumer Group
+
+Pulsar 用 [四种订阅模式](subscription.html) 在同一套机制里同时覆盖「流」（独占/灾备，保序）与「队列」（共享，多消费者分摊）；Kafka 则以 Consumer Group + 分区为核心，天然偏「流」，做队列式分摊时受分区数约束。
+
+### 3. 消息确认：单条 ack vs 单指针 offset
+
+```text
+   Kafka offset：一条指针，提交到哪就认为之前全消费了
+     [0][1][2][3][4]   提交 offset=5 → 0~4 全确认（不能漏掉中间某条）
+
+   Pulsar cursor：可单条 / 累积 ack
+     [0][1][x][3][4]   可单独 ack 第 2 条，未 ack 的会重投
+```
+
+这让 Pulsar 在「逐条处理、个别消息要重试」的场景更细粒度。
+
+### 4. 运维复杂度
+
+Pulsar 组件更多（Broker + BookKeeper + 元数据/ZK），部署与排障面更宽；Kafka 在 **KRaft 去掉 ZooKeeper** 后架构更单一，运维更简单——这是 Kafka 近年补强、拉开易用性差距的一点。
+
+## 三、各自的优势
+
+**Pulsar 优势**
+
+- **弹性扩容**：加节点即用，扩容不搬数据，故障迁移搬元数据而非 TB 级消息；
+- **原生多租户**：Tenant / Namespace 做隔离、配额、策略，天然适合平台化；
+- **订阅灵活**：四种订阅统一了队列与流两种语义；
+- **分层存储**：原生把冷数据卸载到对象存储，近乎无限保留 + 降本（见 [分层存储与 Pulsar Functions](tiered-storage.html)）；
+- **队列 + 流统一**：一套系统覆盖两类用法。
+
+**Kafka 优势**
+
+- **生态最成熟**：Kafka Connect、Kafka Streams、ksqlDB 一应俱全；
+- **社区最大、资料最多**：踩坑有人趟过，招人也容易；
+- **架构更简单**：尤其 KRaft 之后单一组件，运维心智负担低；
+- **极致吞吐与低延迟**：本地直写，性能调优经验丰富；
+- **大厂背书**：长期大规模生产验证，稳定可信。
+
+## 四、怎么选（结论）
+
+```text
+   选 Pulsar 当你：
+     · 多租户 / 平台型，要给多业务方做隔离与配额
+     · 海量 topic、需要弹性扩缩
+     · 要近乎无限的消息保留（合规 / 长期回放）
+     · 想用一套系统同时做队列 + 流
+
+   选 Kafka 当你：
+     · 已重度依赖 Kafka 生态（Connect / Streams / ksqlDB）
+     · 追求成熟稳定、运维简单、招人与资料丰富
+     · 看重极致吞吐与低延迟，且场景以“流”为主
+```
+
+> 没有绝对优劣：**缺架构弹性与多租户 → 偏 Pulsar；缺成熟生态与运维省心 → 偏 Kafka。** 多数团队若已在 Kafka 上跑得稳，迁移成本往往大于收益。
+
+## 五、相关阅读
+
+- [存算分离：Broker 无状态 + BookKeeper](storage-compute.html)
+- [BookKeeper 存储原理](bookkeeper.html)
+- [四种订阅模式](subscription.html)
+- [分区 Topic 与无缝扩容](partitioned-topic.html)
+- [分层存储与 Pulsar Functions](tiered-storage.html)
+- 总览：[Pulsar 渐进式理解](deep-dive-overview.html)
+
+## 一句话总结
+
+> Pulsar 赢在架构（存算分离的弹性、原生多租户、灵活订阅、分层存储、队列+流统一），Kafka 赢在生态与成熟度（Connect/Streams/ksqlDB、社区、KRaft 后的简洁运维、极致吞吐）；按「更缺架构弹性还是更缺成熟生态」来选，而非比谁更新。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/vs-kafka" data-base="../"></script>
+</body>
+</html>

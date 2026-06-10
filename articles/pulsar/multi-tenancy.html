@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多租户：Tenant / Namespace / Topic · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 多租户：Tenant / Namespace / Topic
+
+> 一句话：Pulsar 把命名空间做成**三层（Tenant → Namespace → Topic）**，并把保留、配额、限流、权限、复制等**策略统一挂在 Namespace 上**，从而在一套集群里原生隔离多个团队/业务——这是 Kafka 要靠前缀 + ACL 模拟才能近似的能力。
+
+## 一、三级层级：Tenant / Namespace / Topic
+
+Pulsar 的 Topic 全名不是一个裸字符串，而是带完整路径的层级名：
+
+```text
+persistent://tenant/namespace/topic
+└─┬──────┘  └─┬──┘ └───┬───┘ └─┬─┘
+  │           │        │       └─ Topic：真正的消息流
+  │           │        └───────── Namespace：策略容器（一组 topic 统一管）
+  │           └────────────────── Tenant：租户（谁的，对应团队/业务线/客户）
+  └────────────────────────────── 持久化前缀（persistent / non-persistent）
+```
+
+层级关系：
+
+```text
+Cluster（一个 Pulsar 集群）
+└─ Tenant: ecommerce            ← 租户：电商团队
+   ├─ Namespace: ecommerce/order
+   │    ├─ Topic: order_created
+   │    └─ Topic: order_paid
+   └─ Namespace: ecommerce/inventory
+        └─ Topic: stock_changed
+└─ Tenant: risk                 ← 租户：风控团队（彼此隔离）
+   └─ Namespace: risk/realtime
+        └─ Topic: tx_event
+```
+
+- **Tenant（租户）**：最顶层，通常对应一个团队、一条业务线或一个外部客户。可绑定到允许使用的集群、配置管理角色。
+- **Namespace（命名空间）**：一个 Tenant 下的逻辑分组，是**策略的最小配置单位**，一组相关 Topic 放在一起统一管理。
+- **Topic**：真正的消息流。一个 Namespace 下可有任意多个 Topic。
+
+> 总览见 [Pulsar 渐进式理解](deep-dive-overview.html)；存储侧为什么能这么灵活见 [存算分离](storage-compute.html)。
+
+---
+
+## 二、Namespace 是策略单元（关键）
+
+**几乎所有可配置策略都挂在 Namespace 级**，这样运维一次配置、组内 Topic 统一生效，而不必逐个 Topic 设置：
+
+| 策略 | 作用 |
+|------|------|
+| Retention（保留） | 消息被所有订阅 Ack 后，还保留多久 / 多大 |
+| TTL | 未被消费的消息，超过 TTL 自动判定为已消费（推进 Cursor） |
+| Backlog 配额 | 积压上限，超限可拒写 / 限流 / 丢弃旧消息 |
+| 限流（rate limit） | 发布 / 派发的消息数或字节数上限 |
+| 权限（authorization） | 哪些角色能 produce / consume / 管理 |
+| Geo-Replication | 该 Namespace 的 Topic 复制到哪些集群 |
+| 消息去重（dedup） | 在 Namespace 级开关生产端去重 |
+
+也就是说：**调一个 Namespace 的策略 = 调它下面一整组 Topic 的策略**。这是 Pulsar 把“治理”做成一等公民的体现。
+
+> Retention / TTL / Backlog 三者如何协同决定消息删除时机，见 [Pulsar 渐进式理解](deep-dive-overview.html) 的「消息什么时候能删」一节。
+
+---
+
+## 三、隔离：资源 + 配额
+
+多租户不仅是命名分组，还包括**真实的资源隔离**，避免“吵闹邻居”互相影响：
+
+```text
+                ┌──────────── Broker 隔离组 ───────────┐
+Namespace A ───►│  只调度到 broker-1 / broker-2        │
+Namespace B ───►│  只调度到 broker-3                   │
+                └──────────────────────────────────────┘
+
+                ┌──────────── Bookie 隔离组 ───────────┐
+Namespace A ───►│  数据只落到 group-ssd 的 bookie       │
+Namespace B ───►│  数据只落到 group-hdd 的 bookie       │
+                └──────────────────────────────────────┘
+```
+
+- **Broker 隔离**：可把 Namespace / Topic 绑定到特定一组 Broker（通过隔离策略 / anti-affinity），让重要业务独占算力。
+- **Bookie 隔离**：通过 BookKeeper 的 rack/placement 与隔离组，让某 Namespace 的数据只写到指定一组 Bookie（如 SSD 组 vs HDD 组）。
+- **流量 / 存储配额**：限流 + Backlog 配额 + 存储配额，从带宽和容量两个维度限制单租户的占用。
+
+> 数据具体怎么落到 Bookie、为什么换 Bookie 不用搬历史数据，见 [BookKeeper 存储原理](bookkeeper.html)。
+
+---
+
+## 四、认证与授权
+
+Pulsar 的安全分两步：先证明“你是谁”（认证），再决定“你能干什么”（授权）。
+
+```text
+Client ──①认证 (你是谁)──► Broker
+        TLS 双向证书 / JWT Token / OAuth2 / Kerberos / 自定义插件
+            │ 解析出 role（角色）
+            ▼
+        ②授权 (你能干什么)
+        按 Tenant / Namespace 检查 role 的 produce / consume / 管理权限
+```
+
+- **认证（Authentication）**：可插拔，常见方式有 TLS 客户端证书、JWT Token、OAuth2，也支持 Kerberos 及自定义 provider。认证结果是一个 **role（角色）**。
+- **授权（Authorization）**：基于 role，在 **per-tenant / per-namespace** 粒度授予 produce、consume、管理等权限。例如只给风控团队的 role 对 `risk/*` 的读写权，对其他租户的 Topic 无权访问。
+
+这套机制让“一个集群、多个互不信任的租户”成为可能。
+
+---
+
+## 五、持久 vs 非持久 Topic
+
+Topic 全名的前缀决定了它走不走持久化存储：
+
+```text
+persistent://tenant/ns/topic       non-persistent://tenant/ns/topic
+        │                                   │
+   写入 BookKeeper（多副本落盘）        只在 Broker 内存中转发
+        │                                   │
+   Broker / Bookie 重启不丢            Broker 重启 / 消费者掉线即丢
+        │                                   │
+   常规可靠场景                         极低延迟、可容忍丢失的场景
+```
+
+| 维度 | persistent:// | non-persistent:// |
+|------|---------------|-------------------|
+| 是否落盘 | 是，写 BookKeeper 多副本 | 否，只走 Broker 内存 |
+| 持久性 | 重启 / 故障不丢 | 不持久，消费者不在线即丢 |
+| 延迟 | 略高（要等多副本 Ack） | 更低（省去存储链路） |
+| 适用 | 绝大多数业务 | 监控打点、可丢的实时通知等 |
+
+默认即 `persistent://`。非持久 Topic 用内存换延迟，但牺牲可靠性，谨慎使用。
+
+---
+
+## 六、对比 Kafka：原生 vs 模拟
+
+| 维度 | Pulsar | Kafka |
+|------|--------|-------|
+| 多租户 | **原生三级层级** Tenant/Namespace/Topic | 无原生概念 |
+| 隔离手段 | Namespace 策略 + Broker/Bookie 隔离组 | 靠 **topic 名前缀**（如 `teamA.order`）约定 |
+| 权限 | per-tenant / per-namespace 授权 | per-topic ACL |
+| 配额 | Namespace 级限流 / Backlog / 存储配额 | client/user 级 quota |
+| 策略统一管 | Namespace 一处配，组内 Topic 全生效 | 多为 per-topic 配置，需逐个或脚本管理 |
+
+一句话对比：**Pulsar 把多租户做进了模型本身；Kafka 是用“前缀 + ACL + quota”在外面拼出一个近似效果。** 当租户多、治理需求强时，Pulsar 的原生层级显著省心。
+
+> 更系统的对比见 [Pulsar vs Kafka](vs-kafka.html)。
+
+---
+
+## 一句话总结
+
+> Pulsar 的多租户不是附加功能，而是写进命名模型的三层结构：**Tenant 管“谁的”、Namespace 管“一组 Topic 的策略与隔离”、Topic 是消息流**；保留/配额/限流/权限/复制统一挂在 Namespace，配合可插拔认证 + 细粒度授权 + Broker/Bookie 隔离组，让一套集群安全承载多个互不信任的租户——这正是 Kafka 只能靠前缀 + ACL 模拟的能力。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/multi-tenancy" data-base="../"></script>
+</body>
+</html>

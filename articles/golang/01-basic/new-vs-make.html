@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>new vs make 的区别 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# new vs make 的区别
+
+## 一、一句话区分
+
+| 函数 | 适用类型 | 返回 | 做的事 |
+|---|---|---|---|
+| `new(T)` | **任意类型** | **`*T`** | 分配一块零值内存，返回指针 |
+| `make(T, ...)` | **只能** slice / map / chan | **`T`**（不是指针） | 分配 + **初始化运行时结构** |
+
+```go
+p := new(int)              // *int, *p == 0
+s := make([]int, 5)        // []int{0,0,0,0,0}
+m := make(map[string]int)  // 已初始化的 hmap, 可写
+c := make(chan int, 10)    // 已初始化的 hchan
+```
+
+---
+
+## 二、为什么需要 make（不能只有 new）
+
+slice / map / chan 这三种类型在 Go 内部都是**带元信息的复杂结构**——不是单一内存块。
+
+### slice：3 个字段的 header
+
+```go
+type sliceHeader struct {
+    Data unsafe.Pointer
+    Len  int
+    Cap  int
+}
+```
+
+`new([]int)` 返回 `*[]int`，header 三个字段全是零（Data=nil, Len=0, Cap=0）。虽然能 append（append 会判 nil 自动分配），但很别扭。
+
+### map：完整 hmap 结构
+
+map 背后是 [hmap 结构](../02-advanced/map.html)——包含 buckets 数组、hash 种子、状态标记等。
+
+```go
+m := new(map[string]int)   // m 是 *map[string]int, 指向 nil map
+(*m)["a"] = 1               // ❌ panic: assignment to entry in nil map
+```
+
+**nil map 不能写**——必须 `make` 才能初始化 buckets 和 hash 种子。
+
+### chan：完整 hchan 结构
+
+```go
+c := new(chan int)   // *chan, 指向 nil chan
+*c <- 1               // ❌ 永远阻塞 (nil channel 行为)
+```
+
+---
+
+## 三、什么时候用哪个
+
+```go
+// ✓ slice / map / chan 必须 make
+s := make([]int, 0, 100)
+m := make(map[string]int, 16)
+c := make(chan int, 10)
+
+// new(T) 几乎不用 — 用 &T{} 更直观
+p1 := new(MyStruct)        // 不推荐
+p2 := &MyStruct{}           // 推荐, 还能初始化字段
+p3 := &MyStruct{name: "x"}  // 更清楚
+```
+
+**实战建议**：
+
+- slice / map / chan → **必须 make**
+- 其它类型 → 用 **`&T{...}` 复合字面量**，几乎不用 new
+
+`new` 在现代 Go 代码中已经很少见——`&T{}` 提供同等能力且**可以同时初始化字段**。
+
+---
+
+## 四、nil slice / map / chan 的行为对照
+
+```go
+var s []int          // nil slice
+var m map[string]int // nil map
+var c chan int       // nil chan
+```
+
+| 操作 | nil slice | nil map | nil chan |
+|---|---|---|---|
+| 读 / range / len | ✅ 0 元素 | ✅ 返回零值 | 永远阻塞 |
+| 写 | ❌ panic | **❌ panic** | 永远阻塞 |
+| append | ✅ 自动分配 | — | — |
+| close | — | — | ❌ panic |
+
+→ **`make` 是 slice / map / chan 从"半可用"变成"完全可用"的初始化步骤**。
+
+---
+
+## 五、性能 & 实战陷阱
+
+### make 时给容量参数
+
+```go
+s := make([]int, 0)        // ❌ cap=0, 反复扩容
+s := make([]int, 0, 1000)  // ✓ 预分配 cap, 不再扩容
+
+m := make(map[K]V)         // ❌ 默认小容量, 大量插入反复扩容
+m := make(map[K]V, 1000)   // ✓ 提示初始大小, 减少 rehash
+```
+
+**预知容量时一定给参数**——避免不必要的扩容 + 拷贝。
+
+### `make([]T, n)` 给的是 len 不是 cap
+
+```go
+s := make([]int, 5)   // len=5, cap=5, 已有 5 个零值
+s[0] = 1              // 直接赋值
+s = append(s, 99)     // 在 5 之后追加, cap 不够会扩容
+
+// 想要"预分配但 len=0":
+s := make([]int, 0, 5)
+```
+
+新手最容易在这里翻车——`make([]int, n)` **不是 "预留 n 容量"**，是 "已经有 n 个零值"。
+
+---
+
+## 六、一图总结
+
+```
+            new vs make
+                │
+    ┌───────────┴───────────┐
+    ▼                       ▼
+  new(T)                make(T, ...)
+   │                        │
+   ├─ 适用: 任意类型           ├─ 适用: slice/map/chan 三种
+   ├─ 返回: *T               ├─ 返回: T (不是指针)
+   └─ 仅分配零值              └─ 分配 + 初始化运行时结构
+
+  使用建议:
+    new(T)       几乎不用, 改 &T{...}
+    make(slice)  必用, 预知 cap 时给参数
+    make(map)    必用, 预知大小时给 hint
+    make(chan)   必用, buffer chan 给容量
+
+  nil 的行为:
+    nil slice: 可读不可写, append 自动分配
+    nil map:   读返零值, 写 panic ⚠️
+    nil chan:  读写永远阻塞, close panic
+```
+
+**一句话**：`new(T)` 给任意类型分配零值返回 `*T`，几乎被 `&T{...}` 替代；`make` 只能用在 **slice / map / chan**——这三种类型有"运行时元结构"必须初始化，零值不能直接用。**make 时给容量参数避免扩容**，**`make([]int, n)` 给的是 len 不是 cap**——这是最常见的踩坑点。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/new-vs-make" data-base="../../"></script>
+</body>
+</html>

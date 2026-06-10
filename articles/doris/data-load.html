@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据导入：Stream / Broker / Routine Load · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 数据导入：Stream / Broker / Routine Load
+
+> 一句话：Doris 的导入都是**事务的**——每次导入带一个 **Label**（同库内唯一，用来去重做幂等）、对外**原子可见**（要么这批数据全部成功且一次性可见、要么整批失败回滚，不会读到「写了一半」的中间态）；按数据来源与场景选不同入口：程序/微批用 **Stream Load**（HTTP 同步推），HDFS/对象存储大批量用 **Broker Load / S3 Load**（异步），持续消费 Kafka 用 **Routine Load**（常驻），ETL 与小批量用 **Insert Into**，而 Hive/Iceberg/JDBC 这类外部数据可以**不导入、直接用 Multi-Catalog 联邦查询**。
+
+> 本文以 **Apache Doris 2.x** 为基准；涉及版本差异处会显式标注。相关：[三种数据模型](data-model.html)、[存储与数据划分](storage.html)、[查询执行：向量化 + MPP + Pipeline](query.html)。
+
+## 一、先记住两个共性：事务 + Label + 原子可见
+
+不管走哪种方式，Doris 的导入都共享同一套语义，这是面试的「题眼」：
+
+```text
+一次导入 = 一个事务
+  ├── Label：本次导入的标识（同一 database 内唯一）
+  │     · 同一个 Label 只会成功一次 → 重试不会重复写 → 幂等去重
+  │     · Label 状态可查（PENDING / LOADING / FINISHED / CANCELLED）
+  ├── 原子可见（atomic）：
+  │     · 成功 → 这批数据「一次性」对查询可见
+  │     · 失败 → 整批回滚，查询看不到任何半成品
+  └── 不是「逐行可见」，而是「整批事务提交后才可见」
+```
+
+> 关键点：**Label 是幂等的基石**。客户端导入失败后用「同一个 Label」重试，若上一次其实已成功，Doris 会拒绝重复导入，从而避免重复数据；这也是后面 Routine Load 配合 Kafka offset 做 Exactly-once 的前提。
+
+## 二、五种入口怎么选（核心对比）
+
+| 方式 | 数据源 | 同步/异步 | 触发形态 | 典型场景 |
+|---|---|---|---|---|
+| **Stream Load** | 本地文件 / 程序内存中的一批数据（HTTP PUT 推） | **同步**（请求返回即知成败） | 程序主动发起、单次一批 | 业务实时写入、微批、Flink/自研程序写入 |
+| **Broker Load** | **HDFS** / 对象存储（**S3** 等，经 Broker 或内置 S3 直读） | **异步**（提交后轮询 Label 状态） | 一条 SQL 提交一个作业 | 大批量离线导入、数仓 T+1 批量灌数 |
+| **S3 Load** | 对象存储 S3/OSS/COS（内置直读，无需 Broker 进程） | **异步** | SQL 提交作业 | 云上对象存储大批量导入 |
+| **Routine Load** | **Kafka** | **异步常驻**（任务一直跑） | 创建后常驻、持续消费 | 实时流数据持续入库 |
+| **Insert Into** | `VALUES` 字面量 / `SELECT`（含外部表/Catalog） | **同步** | SQL 执行 | 小批量写入、库内/跨源 ETL |
+| **Multi-Catalog 外部表** | Hive / Iceberg / Hudi / JDBC 等 | —（**不导入**，直接查） | 查询时按需读取 | 湖仓联邦查询、导入前探查、ELT 源 |
+
+口诀：**程序推一批走 Stream，文件/对象存储大批量走 Broker/S3，Kafka 流走 Routine，SQL 拼/转走 Insert，外部数据不搬就用 Catalog。**
+
+## 三、Stream Load —— HTTP 同步推一批
+
+通过 HTTP `PUT` 把一批数据（CSV / JSON）直接推给 Doris，**同步返回**导入结果，最适合程序化的实时/微批写入。
+
+```bash
+# 向 BE/FE 的 http 端口 PUT 一个文件；-H label 指定本次 Label（幂等关键）
+curl --location-trusted -u user:passwd \
+  -H "label:order_20260612_001" \
+  -H "column_separator:," \
+  -H "format:csv" \
+  -T ./orders.csv \
+  http://fe_host:8030/api/example_db/orders/_stream_load
+```
+
+```text
+返回 JSON 关注字段：
+  "Status": "Success"            ← 成功；"Label Already Exists" 表示该 Label 已用过（幂等命中）
+  "NumberLoadedRows": 10000      ← 实际写入行数
+  "NumberFilteredRows": 0        ← 被过滤（脏数据）的行数
+  "Label": "order_20260612_001"
+```
+
+特点：**同步**（一次请求得到结果，便于程序判断成败重试）；单次导入有大小上限，超大数据应拆成多批或改用 Broker Load；Flink Doris Connector 底层即基于 Stream Load。
+
+## 四、Broker Load / S3 Load —— 大批量异步导入
+
+从 **HDFS / 对象存储** 异步拉取大批量文件。提交一条 SQL 生成一个**异步作业**，之后轮询 Label 状态获知进度与成败。
+
+```sql
+-- Broker Load：从 HDFS 异步导入
+LOAD LABEL example_db.bulk_20260612
+(
+  DATA INFILE("hdfs://nn:8020/path/orders/*.parquet")
+  INTO TABLE orders
+  FORMAT AS "parquet"
+)
+WITH BROKER "broker_name" ("hadoop.username"="hdfs");
+
+-- 提交后轮询作业状态（异步）
+SHOW LOAD WHERE LABEL = "bulk_20260612";
+```
+
+```sql
+-- S3 Load：内置直读对象存储，无需单独 Broker 进程
+LOAD LABEL example_db.s3_20260612
+(
+  DATA INFILE("s3://bucket/orders/*.parquet")
+  INTO TABLE orders
+  FORMAT AS "parquet"
+)
+WITH S3 (
+  "s3.endpoint" = "s3.ap-northeast-1.amazonaws.com",
+  "s3.region"   = "ap-northeast-1",
+  "s3.access_key" = "AK", "s3.secret_key" = "SK"
+);
+```
+
+特点：**异步**（适合一次几十 GB ~ TB 级离线批量）；同样受事务 + Label 保护，整批原子可见；失败可按 Label 排查与重试。
+
+## 五、Routine Load —— 持续消费 Kafka
+
+创建一个**常驻任务**持续消费 Kafka topic，把流数据实时写入 Doris。Doris 内部把任务拆成多个子任务并发消费分区，自动管理 offset。
+
+```sql
+CREATE ROUTINE LOAD example_db.orders_kafka ON orders
+COLUMNS TERMINATED BY ",",
+COLUMNS(order_id, user_id, amount, create_time)
+PROPERTIES
+(
+  "desired_concurrent_number" = "3",   -- 期望并发子任务数
+  "max_batch_interval" = "10",         -- 每批最长攒批时间(秒)
+  "format" = "json"
+)
+FROM KAFKA
+(
+  "kafka_broker_list" = "broker1:9092,broker2:9092",
+  "kafka_topic" = "orders",
+  "property.kafka_default_offsets" = "OFFSET_END"  -- 从最新开始
+);
+
+-- 运维：查看 / 暂停 / 恢复 / 停止
+SHOW ROUTINE LOAD FOR orders_kafka\G
+PAUSE  ROUTINE LOAD FOR orders_kafka;
+RESUME ROUTINE LOAD FOR orders_kafka;
+STOP   ROUTINE LOAD FOR orders_kafka;
+```
+
+特点：**异步常驻**，实时摄入；每一批消费同样是一个带 Label 的事务，**消费进度（offset）与导入事务一起提交**，这正是不重不丢的关键（见第七节）。
+
+## 六、Insert Into 与外部表 / Multi-Catalog
+
+### 6.1 Insert Into
+
+```sql
+-- 小批量：直接写字面量（一般用于测试/补数，不适合高频大批量）
+INSERT INTO orders (order_id, amount) VALUES (1, 99.5), (2, 18.0);
+
+-- 库内/跨源 ETL：INSERT ... SELECT，可从外部 Catalog 表读取并转换
+INSERT INTO orders_agg
+SELECT user_id, SUM(amount) FROM hive_catalog.db.orders GROUP BY user_id;
+```
+
+`INSERT INTO ... SELECT` 是做 **ELT** 的常用手段：直接从外部表/Catalog 读出、加工后落入 Doris 内表。
+
+### 6.2 Multi-Catalog 联邦查询（不导入也能查）
+
+Doris **2.0+** 的 Multi-Catalog 可挂载 **Hive / Iceberg / Hudi / JDBC（MySQL/PG 等）** 等外部数据源，**不搬数据**就能直接查询，也能与内表 join，是「湖仓一体」的入口。
+
+```sql
+CREATE CATALOG hive_catalog PROPERTIES (
+  "type" = "hms",
+  "hive.metastore.uris" = "thrift://hms:9083"
+);
+SELECT * FROM hive_catalog.db.orders LIMIT 10;   -- 直接查 Hive，无需导入
+```
+
+> 选择逻辑：**数据要常驻 Doris 高频分析 → 导入**（Stream/Broker/Routine/Insert）；**只是偶尔查、或先探查再决定是否落库 → 用 Catalog 联邦查询**，再按需 `INSERT INTO ... SELECT` 物化进来。
+
+## 七、Label 幂等 + Routine Load 的 Exactly-once
+
+把「事务 + Label」和 Kafka 的 offset 绑在一起，就得到不重不丢：
+
+```text
+Routine Load 的每一批：
+   消费 Kafka [offset_a, offset_b)
+        │
+        ▼
+   写入 Doris（一个事务，自带 Label）
+        │  事务提交时，把「消费到 offset_b」与「数据写入」一起原子提交
+        ▼
+   提交成功 → 数据可见 且 offset 推进     （二者要么都成、要么都不成）
+   提交失败 → 数据回滚 且 offset 不推进 → 下次从 offset_a 重新消费
+
+结果：
+  · 不丢：未成功提交的批次，offset 不前进，会被重新消费
+  · 不重：同一批用同一 Label，重复提交被幂等拒绝
+  → Exactly-once（端到端精确一次）
+```
+
+| 保证 | 机制 |
+|---|---|
+| 幂等去重 | **Label 同库唯一**：重复 Label 的导入被拒绝，重试不产生重复数据 |
+| 不丢数据 | offset 仅在导入事务**提交成功后**才推进 |
+| 不重数据 | offset 与导入数据**在同一事务原子提交**，配合 Label 幂等 |
+| 原子可见 | 整批成功才一次性可见，失败整批回滚 |
+
+> 对比：Stream/Broker/Insert 的幂等靠**调用方自己生成稳定 Label** 并在重试时复用；Routine Load 则由 Doris 自动管理 Label 与 offset，天然贴近 Exactly-once。
+
+## 一句话总结
+
+> Doris 导入皆为**事务**——**Label 做幂等去重**、**整批原子可见**。按来源选入口：程序推一批用 **Stream Load**（HTTP 同步）、HDFS/对象存储大批量用 **Broker / S3 Load**（异步）、Kafka 流用 **Routine Load**（常驻，offset 与数据同事务提交 → Exactly-once）、SQL 拼接与跨源 ETL 用 **Insert Into（含 ... SELECT）**，而 Hive/Iceberg/JDBC 等可用 **Multi-Catalog 联邦查询**不导入直查。延伸见 [三种数据模型](data-model.html)、[存储与数据划分](storage.html)、[查询执行：向量化 + MPP + Pipeline](query.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/data-load" data-base="../"></script>
+</body>
+</html>

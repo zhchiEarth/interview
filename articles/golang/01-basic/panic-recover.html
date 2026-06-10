@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>panic / recover 机制 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# panic / recover 机制
+
+## 一、panic / recover 是干嘛的
+
+Go 的错误处理哲学是 **"显式 error 返回"**——但有些场景**没法用 error**：
+
+| 情况 | 例子 | 该用 |
+|---|---|---|
+| **不应该发生的程序 bug** | 数组越界 / 解引用 nil 指针 / 除零 / 关闭已关闭 channel | **panic（runtime 自动触发）** |
+| **不可恢复的初始化失败** | 启动时配置文件解析失败 / 必备依赖加载失败 | panic（让进程死） |
+| **远端的递归边界**（库内深处出错） | 解析器深处发现非法输入 | panic + 在入口 recover |
+| **正常业务失败** | 文件不存在 / 网络超时 / 参数不合法 | **return error**（不要 panic） |
+
+`panic` = "**程序遇到了我处理不了的状况**"——展开栈一路向上抛，每层执行 defer。
+
+`recover` = "**在 defer 里截住 panic，让程序活下去**"——一般用于 HTTP handler / worker goroutine 等"不能让单个请求把整个服务挂掉"的场景。
+
+---
+
+## 二、panic 的完整流程
+
+```go
+func main() {
+    defer fmt.Println("main defer")
+    f()
+    fmt.Println("main after f")    // 永远不会执行
+}
+
+func f() {
+    defer fmt.Println("f defer")
+    panic("boom")
+}
+
+// 输出:
+// f defer
+// main defer
+// panic: boom
+// [stack trace]
+```
+
+时间线：
+
+```
+panic("boom") 触发
+  ↓
+runtime 把 "boom" 包装成 _panic 结构, 挂到 g.panic
+  ↓
+当前函数 (f) 停止后续代码
+  ↓
+沿 g._defer 链表执行 defer (LIFO):
+  跑 "f defer"
+  ↓
+f 返回 (异常返回)
+  ↓
+回到 main, panic 继续传播
+  ↓
+跑 main 的 defer:
+  跑 "main defer"
+  ↓
+没人 recover → runtime 打印 panic 信息 + stack trace + crash
+```
+
+### 关键性质
+
+| 性质 | 含义 |
+|---|---|
+| **沿调用栈向上传播** | 每层函数都会停止，并执行已注册的 defer |
+| **defer 仍会跑** | panic 不绕过 defer（这是 recover 的基础） |
+| **未被 recover → 程序 crash** | 整个 Go 进程退出 |
+| **goroutine 之间不传播** | 一个 G panic 不会传到另一个 G（除非主 G 死了进程挂） |
+
+---
+
+## 三、recover：在 defer 里截住 panic
+
+```go
+func safe() {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Println("recovered:", r)
+        }
+    }()
+    panic("oops")
+}
+
+// 输出:
+// recovered: oops
+// (函数正常返回, 程序继续)
+```
+
+### recover 的工作机制
+
+```
+recover() {
+    if 当前 goroutine 没在 panic 状态:
+        return nil
+    if 调用者不是被 panic 流程直接触发的 defer 函数:
+        return nil
+    取出 g.panic 里的值, 清掉 panic 状态, 返回值
+}
+```
+
+**两条铁律**：
+
+1. **必须直接写在 defer 函数体里**——套一层调用就失效
+2. **`g.panic` 状态只在 runtime 跑 defer 链时才打开**——其它时刻调 recover() 返 nil
+
+详细机制见 [Defer 是怎么实现的](../02-advanced/defer.html) 的"recover 必须在 defer 函数里"那节。
+
+---
+
+## 四、什么时候 runtime 自动 panic
+
+不只是 `panic(...)` 显式调用——很多 **runtime 错误**也会触发 panic：
+
+| 触发 | 例子 |
+|---|---|
+| nil 指针解引用 | `var p *T; p.x` |
+| nil map 写入 | `var m map[K]V; m["k"]=1` |
+| 数组/slice 越界 | `s[100]` 但 `len(s)=10` |
+| 整数除零 | `x / 0` |
+| 类型断言失败（不带 ok） | `v := i.(int)` 但 i 不是 int |
+| 关闭已关闭的 channel | `close(ch); close(ch)` |
+| 关闭 nil channel | `close(nil)` |
+| 向已关闭的 channel 发送 | `close(ch); ch <- 1` |
+| 重复加锁 | （死锁不算 panic，但运行时死锁会被 detect 然后 crash） |
+
+**这些 runtime panic 同样可以被 recover 截住**——但**不应该用 recover 当 try-catch**，应该写代码前避免这些情况发生。
+
+---
+
+## 五、recover 的 4 个限制
+
+### ① 必须在 defer 函数里
+
+```go
+// ❌ 错的
+recover()         // 普通调用, 直接返 nil
+panic("oops")     // 照样挂
+
+// ✓
+defer func() {
+    if r := recover(); r != nil { ... }
+}()
+panic("oops")
+```
+
+### ② 不能跨 goroutine
+
+```go
+func main() {
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Println("caught:", r)   // ❌ 截不住!
+        }
+    }()
+    go func() {
+        panic("oops in worker")          // 新 goroutine, 跟主 G 的 defer 链无关
+    }()
+    time.Sleep(time.Second)
+}
+// 程序整个挂掉
+```
+
+→ 每个 goroutine 自己负责自己的 recover。
+
+### ③ 套一层调用也失效
+
+```go
+// ❌ 也截不住
+func tryRecover() {
+    if r := recover(); r != nil { ... }
+}
+
+defer tryRecover()    // recover 在 tryRecover 里, 不是直接在 defer 函数里
+panic("oops")          // 仍然挂
+```
+
+### ④ recover 后函数仍然返回，调用者看到的是函数正常返回
+
+```go
+func divide(a, b int) (result int) {
+    defer func() {
+        if r := recover(); r != nil {
+            result = -1   // 通过命名返回值传递 "失败"
+        }
+    }()
+    return a / b   // b=0 时 panic, 被截住, 函数返回 -1
+}
+```
+
+→ **recover 不能让 panic "原地继续"——只能"让函数提前返回"**。要传递 panic 信息，用命名返回值。
+
+---
+
+## 六、实战：goroutine 入口必加 recover
+
+**这是生产事故的最常见配方**——一个 goroutine 没加 recover，里面 panic 整个服务挂：
+
+```go
+// ❌ 危险
+go func() {
+    work()   // work 里万一 panic, 整个进程死
+}()
+
+// ✓ 安全
+go func() {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("worker panic: %v\n%s", r, debug.Stack())
+        }
+    }()
+    work()
+}()
+```
+
+### 封装一个 SafeGo 工具函数
+
+```go
+func SafeGo(f func()) {
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                log.Printf("panic: %v\n%s", r, debug.Stack())
+            }
+        }()
+        f()
+    }()
+}
+
+// 使用
+SafeGo(work)
+```
+
+→ **不可信路径都用这个启动 goroutine**——确保单点 panic 不会拖死服务。
+
+### HTTP handler 入口同样
+
+`net/http` 自己会 recover 每个 handler 的 panic（不会让服务挂）——但日志可能不够详细。生产代码通常自己加 middleware：
+
+```go
+func RecoverMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if rec := recover(); rec != nil {
+                log.Printf("handler panic: %v\n%s", rec, debug.Stack())
+                w.WriteHeader(500)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+---
+
+## 七、什么时候用 panic vs error
+
+### ✅ 用 panic 的场景
+
+```go
+// ① 启动时不可恢复的失败
+if err := loadConfig(); err != nil {
+    panic("must have config: " + err.Error())
+}
+
+// ② 不变量违反 (programmer bug)
+func divide(a, b int) int {
+    if b == 0 {
+        panic("divide by zero: caller's bug")
+    }
+    return a / b
+}
+
+// ③ 库内部深处, 通过 panic 跳出, 在公共入口 recover
+// (例: go/parser, encoding/json 内部就这么用)
+```
+
+### ❌ 不要用 panic 的场景
+
+```go
+// ❌ 业务错误
+if user == nil {
+    panic("user not found")    // 应该 return error!
+}
+
+// ❌ 网络/IO 错误
+if err != nil {
+    panic(err)                  // return err
+}
+
+// ❌ 参数验证
+if age < 0 {
+    panic("invalid age")        // return err
+}
+```
+
+**原则**：
+
+> error 是**预期会发生**的（业务正常路径之一）
+>
+> panic 是**不应该发生**的（要么 bug、要么环境严重出错）
+
+→ Go 的 idiom：**99% 的错误用 error 返回，panic 只在剩下 1% 的"真的没法继续了"用**。
+
+---
+
+## 八、性能 & 实际开销
+
+| 操作 | 开销 |
+|---|---|
+| 正常的 return error | 几 ns |
+| 显式 `panic(...)` + recover | **几 μs 到几十 μs**（要展开栈 + 调用 defer 链 + 构造 stack trace） |
+| 没被 recover 的 panic | 同上 + 写日志 + crash |
+
+→ **panic 是非常昂贵的**——比正常返回贵 1000 倍。**绝对不能在 hot path 用 panic 当流程控制**。
+
+---
+
+## 九、一图总结
+
+```
+            panic / recover 机制
+                    │
+                    ▼
+            panic 触发
+              ↓
+          停止当前函数
+              ↓
+       g.panic 状态打开
+              ↓
+       runtime 沿 g._defer 链表跑 defer (LIFO)
+              ↓
+       defer 里有 recover()? ──── 否 ──→ 继续传播到上层
+              │                          一直到 main → crash
+              是
+              ↓
+       拿出 panic 值, 清掉 g.panic 状态
+              ↓
+       函数从 panic 点 "提前返回"
+       (用命名返回值传失败信号)
+
+   两条铁律:
+   ① recover 必须直接写在 defer 函数体里
+      (套一层调用就失效, 因为身份检查不过)
+   ② 不能跨 goroutine
+      (每个 G 一条 _defer 链)
+
+   什么时候用:
+   ✅ 启动时不可恢复的初始化失败
+   ✅ 不变量违反 (caller 给了非法输入)
+   ✅ goroutine 入口加 recover 防止单 panic 拖死服务
+   ❌ 业务错误 (用 error)
+   ❌ hot path (慢 1000×)
+
+   runtime 自动 panic:
+   nil 指针 / nil map 写 / 越界 / 除零 / 类型断言失败
+   close 已关闭 chan / close nil chan / 向已关闭 chan 发送
+
+   生产模式 (必背):
+     SafeGo(f) { go { defer recover; f() } }
+     RecoverMiddleware (HTTP)
+```
+
+**一句话**：panic = **"我处理不了，沿调用栈向上抛"**——沿途跑 defer，没人 recover 就 crash 整个进程。**recover 必须直接写在 defer 函数体里、不跨 goroutine、不能让 panic 原地继续**（只能让函数提前返回）。**业务错误一律 return error，panic 留给"不应该发生"的 bug 和不可恢复失败**；**goroutine 入口必加 defer recover**——这是 Go 服务最常见的事故配方。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/panic-recover" data-base="../../"></script>
+</body>
+</html>

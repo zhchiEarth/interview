@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>事务与隔离级别 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 事务与隔离级别
+
+> 一句话：事务用 **ACID** 把一组操作打包成"要么全成、要么全不成"；隔离级别决定并发事务能看到彼此多少中间状态——脏读 / 不可重复读 / 幻读 就是放得越松暴露的问题，InnoDB 默认的 **RR** 靠 **MVCC（快照读）+ next-key 锁（当前读）** 在性能和正确性之间取了平衡。
+
+> 本文默认讨论 **MySQL InnoDB 存储引擎**（MyISAM 不支持事务）。涉及具体行为以 InnoDB 为准。索引相关细节见 [MySQL 索引原理](index.html)。
+
+## 一、ACID：事务的四个特性，分别由什么保证
+
+事务（Transaction）是一组要么全部生效、要么全部不生效的操作。它的四个特性常被问"分别由什么机制保证"——这是区分背诵和理解的关键。
+
+| 特性 | 一句话 | 由什么保证（InnoDB） |
+|---|---|---|
+| **原子性** Atomicity | 一个事务里的操作要么全做、要么全不做，中途失败要能回滚 | **undo log**（回滚日志）：记录"反操作"，失败时逆向执行 |
+| **一致性** Consistency | 事务把数据库从一个合法状态带到另一个合法状态（约束、业务规则不被破坏） | 是**目标 / 结果**，由 A、I、D 加上应用层约束共同保证，本身不是单独的机制 |
+| **隔离性** Isolation | 并发事务之间互不干扰，一个事务的中间状态不应被别的事务看到 | **锁 + MVCC**：锁串行化冲突操作，MVCC 让读不阻塞写 |
+| **持久性** Durability | 事务一旦提交，结果就永久落盘，宕机也不丢 | **redo log**（重做日志，WAL）：先写日志再刷盘，崩溃后用它恢复 |
+
+```text
+        ┌──────────── 一致性(Consistency) = 最终目标 ────────────┐
+        │                                                          │
+   原子性(undo log)   +   隔离性(锁 + MVCC)   +   持久性(redo log)
+        └──────────────────── 共同支撑 ────────────────────────┘
+```
+
+记忆钩子：**A 靠 undo、D 靠 redo、I 靠 锁+MVCC、C 是这三者达成的结果**。
+
+## 二、并发会出什么问题（脏读 / 不可重复读 / 幻读）
+
+如果不做隔离，多个事务并发读写同一份数据会出三类经典问题。下面各配一个两事务时序例子（账户余额初始为 100）。
+
+### 2.1 脏读（Dirty Read）：读到了别人**未提交**的数据
+
+```sql
+-- 事务A                              -- 事务B
+                                      BEGIN;
+                                      UPDATE acc SET balance=200 WHERE id=1;
+BEGIN;
+SELECT balance FROM acc WHERE id=1;   -- 读到 200（B 还没提交！）
+                                      ROLLBACK;  -- B 回滚了，200 根本不存在
+-- A 拿着一个从未真正存在过的值去做决策 → 脏读
+```
+
+### 2.2 不可重复读（Non-Repeatable Read）：同一行，两次读结果不同
+
+```sql
+-- 事务A                              -- 事务B
+BEGIN;
+SELECT balance FROM acc WHERE id=1;   -- 读到 100
+                                      BEGIN;
+                                      UPDATE acc SET balance=200 WHERE id=1;
+                                      COMMIT;                -- B 已提交
+SELECT balance FROM acc WHERE id=1;   -- 又读到 200，同一事务内两次不一致
+COMMIT;
+-- 针对"已存在行"的 UPDATE/DELETE 导致的前后不一致 → 不可重复读
+```
+
+### 2.3 幻读（Phantom Read）：同一范围查询，行数变了（多/少了"幻影行"）
+
+```sql
+-- 事务A                              -- 事务B
+BEGIN;
+SELECT * FROM acc WHERE balance>50;   -- 返回 3 行
+                                      BEGIN;
+                                      INSERT INTO acc VALUES(99, 80);
+                                      COMMIT;                -- B 插入一行新数据
+SELECT * FROM acc WHERE balance>50;   -- 返回 4 行，多出一行"幻影"
+COMMIT;
+-- 重点：幻读针对 INSERT/DELETE 引起的"行数变化"，而非某一行的值变化
+```
+
+> **不可重复读 vs 幻读** 的区别（高频追问）：不可重复读关注**已有行的内容被改**（UPDATE/DELETE），幻读关注**范围内行的数量变化**（INSERT）。解决手段也不同——前者锁住"行"，后者要锁住"范围（间隙）"。
+
+## 三、四个隔离级别
+
+SQL 标准定义了四个隔离级别，隔离性从弱到强、并发性能从高到低：
+
+- **读未提交 RU**（Read Uncommitted）：能读到别人没提交的数据
+- **读已提交 RC**（Read Committed）：只能读到已提交的数据
+- **可重复读 RR**（Repeatable Read）：**MySQL InnoDB 默认**，同一事务内多次读结果一致
+- **串行化 Serializable**：所有事务串行执行，读也加锁
+
+各级别能否防住三类问题：
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 |
+|---|---|---|---|
+| 读未提交 RU | ❌ 会发生 | ❌ 会发生 | ❌ 会发生 |
+| 读已提交 RC | ✅ 防住 | ❌ 会发生 | ❌ 会发生 |
+| 可重复读 RR（MySQL 默认） | ✅ 防住 | ✅ 防住 | ✅ **InnoDB 下基本防住**（见下） |
+| 串行化 Serializable | ✅ 防住 | ✅ 防住 | ✅ 防住 |
+
+> **关于 RR 与幻读**：按 SQL 标准，RR 并不要求防住幻读。但 **InnoDB 在 RR 下做了增强**——快照读靠 MVCC、当前读靠 next-key lock，把幻读基本消除了（第七节展开）。这是 MySQL 与标准的重要差异，面试常考。
+
+## 四、MVCC 实现（重点）
+
+MVCC（Multi-Version Concurrency Control，多版本并发控制）是 InnoDB 实现"读不加锁、读写不互相阻塞"的核心。它让**快照读**能读到某个一致的历史版本，而不必等写事务释放锁。
+
+### 4.1 行记录的两个隐藏列
+
+InnoDB 每行数据除了用户定义的列，还隐含两个关键系统列（实际还有 DB_ROW_ID 等，这里只关心 MVCC 用到的两个）：
+
+| 隐藏列 | 含义 |
+|---|---|
+| **DB_TRX_ID** | 最近一次**修改（或插入）这行**的事务 ID |
+| **DB_ROLL_PTR** | 回滚指针，**指向该行在 undo log 中的上一个旧版本** |
+
+### 4.2 undo log 版本链
+
+每次对一行做 UPDATE / DELETE，旧值不会被直接覆盖丢弃，而是写一份旧版本到 undo log，新行的 `DB_ROLL_PTR` 指向它——这样一行的历次修改就被 `roll_pointer` 串成一条**版本链**：
+
+```text
+   当前行(最新)                  undo log 里的旧版本
+ ┌──────────────────┐
+ │ balance = 300    │
+ │ DB_TRX_ID  = 30  │
+ │ DB_ROLL_PTR ─────┼──→ ┌──────────────────┐
+ └──────────────────┘    │ balance = 200    │
+                         │ DB_TRX_ID  = 20  │
+                         │ DB_ROLL_PTR ─────┼──→ ┌──────────────────┐
+                         └──────────────────┘    │ balance = 100    │
+                                                 │ DB_TRX_ID  = 10  │
+                                                 │ DB_ROLL_PTR = NULL│
+                                                 └──────────────────┘
+        新 ───────────────────────────────────────────────→ 旧
+```
+
+读的时候，沿着这条链从新往旧找，找到"对当前事务可见"的那个版本——怎么判断可见，靠 ReadView。
+
+### 4.3 ReadView：判断哪个版本对我可见
+
+**ReadView** 是事务做快照读时生成的"一致性视图快照"，记录了生成那一刻系统里事务的活跃情况，核心四个字段：
+
+| 字段 | 含义 |
+|---|---|
+| **m_ids** | 生成 ReadView 时，**所有仍活跃（未提交）的事务 ID 列表** |
+| **min_trx_id** | m_ids 里的**最小值**（最早还活跃的事务） |
+| **max_trx_id** | 系统下一个将分配的事务 ID（即"当前最大已分配 + 1"），可理解为**上界** |
+| **creator_trx_id** | **创建这个 ReadView 的事务自己的 ID** |
+
+**可见性判断规则**：拿版本链上某个版本的 `DB_TRX_ID`（记为 `trx_id`）去比对：
+
+```text
+  ① trx_id == creator_trx_id  →  可见（自己改的，当然能看见）
+
+  ② trx_id <  min_trx_id      →  可见
+        （这个版本由"比最早活跃事务还早"的事务产生，那它必然已提交）
+
+  ③ trx_id >= max_trx_id      →  不可见
+        （在我生成 ReadView 之后才开启的事务，它的修改我不该看到）
+
+  ④ min_trx_id <= trx_id < max_trx_id  →  看它在不在 m_ids 里:
+        ├─ 在 m_ids 中  → 该事务当时还活跃(未提交) → 不可见
+        └─ 不在 m_ids 中→ 该事务当时已经提交     → 可见
+```
+
+不可见就顺着 `DB_ROLL_PTR` 往版本链更旧的版本走，重复判断，直到找到一个可见版本（或到链尾，记录对该事务不存在）。这样就实现了"读到一个一致的历史快照、且不阻塞写"。
+
+## 五、RC vs RR 的关键区别（同一套 MVCC，差在何时建 ReadView）
+
+RC 和 RR 用的是**同一套** undo 版本链 + ReadView 机制，唯一关键差别在于 **ReadView 的创建时机**：
+
+```text
+  RC (读已提交):  每一次快照读(每条 SELECT)都重新创建一个 ReadView
+                  → 别的事务一旦提交,下次再读就能看到 → 会"不可重复读"
+
+  RR (可重复读):  只在事务内第一次快照读时创建一次 ReadView,之后整个事务复用它
+                  → 视图被冻结在第一次读的时刻 → 后续读结果始终一致 → "可重复读"
+```
+
+```sql
+-- RR 下：第一次 SELECT 建 ReadView 并冻结
+-- 事务A (RR)                          -- 事务B
+BEGIN;
+SELECT balance FROM acc WHERE id=1;   -- 100，此刻建 ReadView 并复用
+                                      UPDATE acc SET balance=200 WHERE id=1;
+                                      COMMIT;
+SELECT balance FROM acc WHERE id=1;   -- 仍是 100（复用旧 ReadView）→ 可重复读
+COMMIT;
+
+-- 同样的时序换成 RC：第二次 SELECT 会新建 ReadView，读到 200 → 不可重复读
+```
+
+> 一句话记忆：**RC 每次读都"刷新"视图，RR 把视图"冻"在第一次读**。这就是 RR 能做到可重复读的根本原因。
+
+## 六、快照读 vs 当前读
+
+MVCC 只对**快照读**生效。区分两者是理解锁与幻读的前提：
+
+| 类型 | 哪些语句 | 读到什么 |
+|---|---|---|
+| **快照读**（一致性非锁定读） | 普通 `SELECT ...`（不加锁） | 走 MVCC，读 ReadView 对应的**历史一致版本**，不加锁 |
+| **当前读**（锁定读） | `SELECT ... FOR UPDATE`、`SELECT ... LOCK IN SHARE MODE`（新语法 `FOR SHARE`）、`UPDATE`、`DELETE`、`INSERT` | 读**最新已提交版本**，并对读到的记录**加锁** |
+
+```text
+快照读  SELECT * FROM acc WHERE id=1;              → MVCC, 可能读到旧版本, 不加锁
+当前读  SELECT * FROM acc WHERE id=1 FOR UPDATE;   → 读最新, 加 X 锁
+        UPDATE / DELETE 在执行前也必须先"当前读"到最新行再改
+```
+
+直觉：**改数据前必须看到最新的数据**，所以 `UPDATE/DELETE` 是当前读、要加锁；而普通查询为了不阻塞、走 MVCC 历史版本，是快照读。
+
+## 七、幻读怎么解决（RR 下）
+
+InnoDB 在 RR 下从两条路径压制幻读，对应快照读和当前读：
+
+```text
+  ┌─ 快照读 ─┐  普通 SELECT 走 MVCC，整事务复用同一 ReadView
+  │          │  → 别人新插入的行 DB_TRX_ID 在 m_ids 之后，对我不可见
+  │          │  → 天然看不到"幻影行" → 防住幻读
+  │
+  └─ 当前读 ─┘  SELECT...FOR UPDATE / UPDATE / DELETE 读最新、要加锁
+               → 单纯记录锁锁不住"还不存在的行"，无法阻止别人 INSERT
+               → 用 next-key lock(记录锁 + 间隙锁) 把"范围/间隙"也锁住
+               → 别人无法往这个范围插入 → 防住幻读
+```
+
+```sql
+-- RR 下当前读靠 next-key lock 防幻读
+-- 事务A                                          -- 事务B
+BEGIN;
+SELECT * FROM acc WHERE balance>50 FOR UPDATE;   -- 锁住 balance>50 的记录及其间隙
+                                                 INSERT INTO acc VALUES(99,80);
+                                                 -- 被阻塞！间隙锁挡住了插入
+COMMIT;                                          -- A 提交后 B 才能继续
+```
+
+> 注意：MVCC 防的是**快照读的幻读**，next-key lock 防的是**当前读的幻读**。两者配合，InnoDB 在 RR 下基本消除了幻读。但仍有边角 case（如同一事务内先快照读、再当前读 / 更新某行，可能"激活"对新行的感知），严格意义上不能说 100% 杜绝——面试可点到为止。
+
+## 八、锁简述（行锁基于索引）
+
+InnoDB 的行级锁都是**加在索引上**的——如果查询条件没走索引，会退化成锁全表（实际是逐行加锁，效果接近表锁）。常见几种：
+
+| 锁 | 锁的是什么 | 作用 |
+|---|---|---|
+| **记录锁** Record Lock | 锁住索引上的**某一条记录** | 防止该行被并发修改 |
+| **间隙锁** Gap Lock | 锁住索引记录之间的**开区间（间隙）**，不含记录本身 | 防止往间隙里 INSERT → 防幻读 |
+| **临键锁** Next-Key Lock | **记录锁 + 间隙锁**，左开右闭区间 `(a, b]` | RR 下的默认行锁，既锁记录又锁间隙 |
+| **意向锁** Intention Lock（IS/IX） | **表级**标记，表示"表里有行将被加 S/X 锁" | 让表锁与行锁的冲突判断 O(1)，无需扫所有行锁 |
+
+```text
+   索引:  ... 10 ────── 20 ────── 30 ...
+              │    间隙    │   间隙   │
+   记录锁:    ●(锁 20 这条)
+   间隙锁:         ◇◇◇◇(锁 10 和 20 之间,不让插入)
+   临键锁:    ◇◇◇◇●(锁 (10,20] 这个左开右闭区间)
+```
+
+> RC 隔离级别下基本只用**记录锁**（不加间隙锁），所以 RC 并发更好但有幻读；RR 默认用**临键锁**，靠间隙锁防幻读。这也是 RC/RR 在锁层面的核心差别。
+
+## 九、三大日志 + 两阶段提交
+
+InnoDB 有三种关键日志，分工明确，是事务持久性、原子性、主从复制的基础：
+
+| 日志 | 属于 | 作用 | 关联特性 |
+|---|---|---|---|
+| **redo log** | InnoDB 引擎层 | **WAL**：改动先写 redo log（顺序写、快），脏页异步刷盘；崩溃后用它把已提交但没刷盘的改动重放回来 | **持久性** |
+| **undo log** | InnoDB 引擎层 | 记录"反操作"用于**回滚**；同时是 **MVCC 版本链**的存储 | **原子性** + 隔离性(MVCC) |
+| **binlog** | MySQL Server 层 | 归档日志，记录所有变更（逻辑日志）；用于**主从复制**和数据恢复 | 复制 / 归档 |
+
+> **WAL（Write-Ahead Logging，预写日志）**：先把改动写进 redo log（顺序 IO，很快），再在合适时机把内存中的脏页刷回磁盘数据文件（随机 IO，较慢）。这样既保证持久性（崩溃可恢复），又把昂贵的随机写攒成批量异步操作，提升性能。
+
+### 9.1 为什么需要两阶段提交（2PC）
+
+redo log 是引擎层的、binlog 是 Server 层的，两者要保证一致——否则崩溃时可能"一个记录了、另一个没记录"，导致主库和从库（或主库自身恢复后）数据不一致。InnoDB 用 **redo log 的两阶段提交** 解决：
+
+```text
+   1) 写 redo log，标记为 prepare 状态   (引擎层)
+   2) 写 binlog                          (Server 层)
+   3) 写 redo log，标记为 commit 状态    (引擎层)
+
+   崩溃恢复时的判定:
+     ├─ redo 是 commit          → 直接提交
+     ├─ redo 是 prepare 且 binlog 完整 → 提交（补完 commit）
+     └─ redo 是 prepare 但 binlog 不完整 → 回滚
+```
+
+```text
+   prepare(redo) ──→ 写 binlog ──→ commit(redo)
+        │                │                │
+        └── 任意一步崩溃，恢复时都能根据"redo 状态 + binlog 是否完整"
+            做出与 binlog 一致的提交/回滚决定 → 主从数据不会错乱
+```
+
+核心思想：**以 binlog 是否写成功作为事务最终是否提交的依据**，redo log 的 prepare/commit 两阶段把"引擎层提交"和"binlog 落盘"绑在一起，保证两份日志的最终一致。
+
+## 一句话总结
+
+> **事务 = ACID**（A 靠 undo log、D 靠 redo log、I 靠 锁+MVCC、C 是结果）。隔离级别越松越快但暴露 **脏读 / 不可重复读 / 幻读**；InnoDB 默认 **RR**，靠 **MVCC** 让快照读读到一致历史版本（RR 只在第一次读建 ReadView 并复用，故"可重复"；RC 每次读都新建，故会"不可重复"），靠 **next-key lock（记录锁 + 间隙锁）** 让当前读防住幻读。底层三大日志各司其职——**redo（持久性/WAL）、undo（回滚+MVCC 版本链）、binlog（主从复制）**，redo 与 binlog 用 **两阶段提交（prepare → 写 binlog → commit）** 保证一致。索引层面的细节见 [MySQL 索引原理](index.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="mysql/transaction" data-base="../"></script>
+</body>
+</html>

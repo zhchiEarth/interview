@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulsar 渐进式理解：从简单队列到存算分离 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Pulsar 渐进式理解：从简单队列到存算分离
+
+> 不背概念。从“最朴素的消息队列”开始，每遇到一个具体问题就引入一个机制。这一篇是**地图**，每步只讲“出现了什么问题、Pulsar 怎么答”，深度细节走对应专题。
+
+## 第 1 步：从直接调用到 Producer / Topic / Consumer
+
+服务直接 RPC 互相调用——下游慢就拖上游、下游挂上游就失败、新增订阅就要改代码。
+
+引入一个中间层，把“我要通知谁”变成“我只发布事件”：
+
+```text
+订单服务 Producer
+       │ 发布 OrderCreated
+       ▼
+   Topic: order_created
+       ├─ 支付服务 Consumer
+       ├─ 库存服务 Consumer
+       └─ 通知服务 Consumer
+```
+
+→ 消息放哪里？Broker 重启会不会丢？
+
+---
+
+## 第 2 步：消息要持久化，但 Broker 别既算又存
+
+最直觉的方案是 Broker 把消息写自己本地磁盘——**Kafka 走的就是这条路**。代价是 Broker 既处理网络协议又刷磁盘，CPU/网络/IO 绑死；坏了要靠副本恢复本地日志，扩容要搬数据。
+
+**Pulsar 的选择：把存储拆出去**。Broker 只做服务层，不长期保存消息。
+
+→ 那存储交给谁？
+
+---
+
+## 第 3 步：BookKeeper 接管存储
+
+```text
+Producer / Consumer
+        │
+   Broker（服务层：协议 / 路由 / Subscription / 流控）
+        │
+   BookKeeper（存储层）
+   ├─ Bookie A
+   ├─ Bookie B
+   └─ Bookie C
+```
+
+BookKeeper 不按“队列”存，而是把每个 Topic 看作一条**日志**，由若干 Ledger 串成；每个 Ledger 的 Entry 多副本写到一组 Bookie 上，参数 `E / Qw / Qa` 控制副本池 / 写副本 / Ack 副本。**不等最慢副本**就能返回成功，所以尾延迟可控。
+
+> Managed Ledger / Cursor / 写入链路 / Bookie 内部结构 → 见《Pulsar 存储架构与实现》专题。
+
+---
+
+## 第 4 步：Broker 无状态了，Client 怎么找它
+
+一个 Topic 在某一刻只有一个 Broker 是它的 **Owner**，但这是可迁移的。
+
+```text
+Client → 任意 Broker 做 lookup(topic)
+       → 查 Metadata Store，拿到当前 Topic Owner
+       → 后续读写都连那个 Owner
+
+Owner 挂了
+       → Client 重新 lookup
+       → 新 Broker 接管，从 BookKeeper 继续读写
+```
+
+**这就是“存算分离”真正值钱的地方**：故障迁移搬的是元数据，不是 TB 级数据。
+
+---
+
+## 第 5 步：Topic 多了要治理 → Tenant / Namespace
+
+平铺所有 Topic 很快就乱。Pulsar 把命名做成三层：
+
+```text
+Tenant（租户：谁的）
+  └─ Namespace（策略容器：保留 / 限流 / 复制 / 权限）
+       └─ Topic
+            └─ Subscription
+```
+
+Namespace 是策略的最小单位，也是多租户隔离的关键——保留时间、TTL、Backlog 配额、限流、跨地域复制开关、鉴权，全在 Namespace 上配。
+
+> 字段含义和分层例子 → 见《Pulsar 核心模型》专题。
+
+---
+
+## 第 6 步：订阅是服务端对象
+
+同一 Topic 想被风控、通知、清结算各自独立消费——不能共用一个进度。
+Pulsar 的解法：**每方建一个 Subscription**，Broker 为每个 Subscription 维护独立 Cursor。
+
+```text
+Topic: order_paid
+  ├─ Subscription: risk        → Cursor 在 msg-108
+  ├─ Subscription: notify      → Cursor 在 msg-95
+  └─ Subscription: settlement  → Cursor 在 msg-103
+```
+
+Subscription 内部还能选 4 种模式：
+
+| 模式 | 一句话 |
+|------|------|
+| Exclusive | 只允许一个 Consumer，严格顺序 |
+| Failover | 主备，主挂备接，仍保序 |
+| Shared | 多 Consumer 并发分摊，无序 |
+| Key_Shared | 按 Key 哈希分发，**并发 + 同 Key 保序** |
+
+`Key_Shared` 是 Pulsar 的杀手锏——Kafka Consumer Group 做不到“多 Consumer 并发同时按 Key 保序”。
+
+> 4 种模式的细节、选型、坑点 → 见《Pulsar 订阅模式详解》专题。
+
+---
+
+## 第 7 步：投递闭环 —— 流控 / Ack / 重投
+
+收到消息不等于处理完，所以默认 **至少一次** 语义：
+
+- **Permits 流控**：Consumer 告诉 Broker “我还能接多少”，避免被打爆。
+- **Ack** 推进 Cursor。Shared 模式下消息会乱序完成，Cursor 用 `markDeletePosition + individuallyDeletedMessages` 两段记。
+- **Nack / Ack Timeout / Retry Topic / Dead Letter**：失败链路兜底，最终不行进 DLQ。
+
+代价：消费侧必须做幂等。
+
+---
+
+## 第 8 步：单 Topic 吞吐不够 → Partitioned Topic
+
+把 Topic 切成多个内部分区，分布到不同 Broker 上并行读写：
+
+```text
+Partitioned Topic: order_paid
+├─ partition-0   ┐
+├─ partition-1   ├─ 不同 Broker 持有不同 partition
+├─ partition-2   │
+└─ partition-3   ┘
+```
+
+- 有 key → 哈希到固定分区（保 Key 顺序）
+- 没 key → 轮询 / 单分区
+
+代价：全局顺序难保证、分区数规划不当易热点、连接和元数据开销随分区数增长。
+
+---
+
+## 第 9 步：高级能力（一笔带过）
+
+到这步 Pulsar 已是一个能跑业务的事件平台。剩下的都是“在底座上加层”，按需启用：
+
+| 能力 | 解决什么 |
+|------|--------|
+| Schema | 消息结构契约和兼容性演进 |
+| Batch / Compression / Chunk | 小消息吞吐 / 带宽 / 大消息支持 |
+| 延迟消息 | “30 分钟后检查支付” |
+| 消息去重（ProducerName + SequenceId） | 生产端重发幂等（不等于业务幂等） |
+| Transaction | 跨 Topic 写入 + Ack 的原子性 |
+| Geo-Replication | 跨地域复制（Namespace 级开关） |
+| Functions / IO | 轻量流处理 + 外部系统连接器 |
+
+> 实现细节和取舍 → 见《Pulsar 高级能力》专题。
+
+---
+
+## 第 10 步：消息什么时候能删 —— Retention / TTL / Backlog
+
+一条消息能不能清理，看两件事：
+
+1. **所有 Subscription 的 Cursor 都越过它了吗**（最慢那个说了算）
+2. **Namespace 的 Retention 策略允许删了吗**
+
+未消费的消息看 Backlog 配额和 TTL。
+
+```text
+所有 Cursor 都越过该 Ledger？
+  ├─ 否 → 不能清理
+  └─ 是
+      ├─ 仍在 Retention 内 → 暂不清理
+      └─ 已过 → 删除 / 下沉到 Tiered Storage
+```
+
+> 监控、限流、配额的实操 → 见《Pulsar 运维治理》专题。
+
+---
+
+## 全貌
+
+```text
+        ┌────────────────────────────┐
+        │ Metadata Store（元数据）    │
+        │ Tenant / Namespace / Owner │
+        └──────────────▲─────────────┘
+                       │ lookup
+Producer ──send──► Broker（无状态服务层） ◄──subscribe── Consumer
+                       │
+                       ▼ append
+                ManagedLedger
+                       │
+                       ▼
+                BookKeeper（多副本存储层）
+                ├─ Bookie A
+                ├─ Bookie B
+                └─ Bookie C
+```
+
+## 一句话总结
+
+> Pulsar 不是“又一个 MQ”，而是把传统 MQ 的“Broker 管一切”拆成 **无状态 Broker + 分布式日志 BookKeeper + 元数据中心**，并把“订阅”做成服务端公民——代价是组件多、运维面更宽，回报是弹性扩容、灵活消费、原生多租户、跨地域、冷热分层。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/deep-dive-overview" data-base="../"></script>
+</body>
+</html>

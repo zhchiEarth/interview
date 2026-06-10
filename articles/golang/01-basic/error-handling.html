@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>error 处理与 errors.Is / As / Unwrap · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# error 处理与 errors.Is / As / Unwrap
+
+## 一、Go 的错误哲学：显式 return
+
+Go 故意**没有 try-catch**——错误是**值**，必须显式返回和检查：
+
+```go
+f, err := os.Open(path)
+if err != nil {
+    return fmt.Errorf("open: %w", err)
+}
+defer f.Close()
+```
+
+好处：
+- **错误路径在代码里可见**——一眼看出哪可能出错
+- 编译器不强制你处理错误（但 lint 工具会）
+- 错误传播路径清晰、可追踪
+
+代价：
+- 写起来啰嗦（`if err != nil` 满屏）
+- 没有自动栈追踪（需要自己包装路径）
+
+→ Go 1.13 引入 `errors.Is` / `errors.As` / `%w` 后才有了**标准的错误链处理方式**。
+
+---
+
+## 二、error 接口
+
+```go
+type error interface {
+    Error() string
+}
+```
+
+**任何带 `Error() string` 方法的类型**都满足 `error`——没有继承约束。
+
+### 创建 error 的两种基本方式
+
+```go
+// ① errors.New: 简单字符串错误
+var ErrNotFound = errors.New("not found")
+
+// ② fmt.Errorf: 格式化, 也可以包装其它 error
+err := fmt.Errorf("user %d not found", uid)
+err := fmt.Errorf("query failed: %w", dbErr)   // %w 包装!
+```
+
+`%w` 是 Go 1.13 加的——**把 `dbErr` 嵌入新 error 里**，可以用 `errors.Is/As` 解出来。
+
+---
+
+## 三、错误包装：`%w` 和 Unwrap
+
+### 为什么要包装
+
+底层错误一路传上来时，希望**保留底层错误，同时附加上下文**：
+
+```go
+// ❌ 不包装 — 上下文丢失
+if err != nil {
+    return errors.New("read config failed")   // 底层 err 没了!
+}
+
+// ❌ 不包装 — 上下文有了, 但 errors.Is 拿不到底层
+if err != nil {
+    return fmt.Errorf("read config failed: %v", err)   // %v 不是 %w!
+}
+
+// ✓ 包装 — 加上下文 + 保留底层
+if err != nil {
+    return fmt.Errorf("read config failed: %w", err)
+}
+```
+
+### `%w` vs `%v`
+
+| 格式 | 行为 | 用 errors.Is/As 能否取到原 err |
+|---|---|---|
+| `%v` | 把 err 转字符串拼进去 | **❌ 拿不到** |
+| `%w` | **把 err 嵌入返回的 error** | **✅ 可以解包** |
+
+### 错误链结构
+
+```
+返回的 err 是个链表:
+  err = "read config failed:"
+        └─ Unwrap() → "open file failed:"
+                      └─ Unwrap() → "permission denied"
+
+errors.Unwrap(err) → 下一层
+依次解包到链的最深处
+```
+
+---
+
+## 四、`errors.Is`：比较错误"是不是某个值"
+
+```go
+var ErrNotFound = errors.New("not found")
+
+func getUser(id int) error {
+    return fmt.Errorf("getUser %d: %w", id, ErrNotFound)
+}
+
+err := getUser(42)
+
+// ❌ 直接 == 比较: 比的是包装后的 err, 不是底层
+err == ErrNotFound       // false
+
+// ✓ errors.Is: 沿链一路查找
+errors.Is(err, ErrNotFound)   // true ✓
+```
+
+**`errors.Is` 做的事**：沿错误链 Unwrap，找有没有等于 target 的值。
+
+### 用 sentinel error
+
+标准库大量使用：
+
+```go
+// 标准库定义
+var (
+    os.ErrNotExist
+    os.ErrPermission
+    io.EOF
+    sql.ErrNoRows
+    context.Canceled
+    context.DeadlineExceeded
+)
+
+// 用法
+if errors.Is(err, os.ErrNotExist) {
+    // 文件不存在的处理
+}
+if errors.Is(err, context.Canceled) {
+    // 上游取消的处理
+}
+```
+
+---
+
+## 五、`errors.As`：把错误"还原成"具体类型
+
+```go
+type ValidationErr struct {
+    Field string
+    Msg   string
+}
+func (e *ValidationErr) Error() string {
+    return e.Field + ": " + e.Msg
+}
+
+func validate(u User) error {
+    if u.Age < 0 {
+        return &ValidationErr{Field: "Age", Msg: "negative"}
+    }
+    return nil
+}
+
+err := validate(u)
+
+// 想拿到 ValidationErr 里的字段:
+var vErr *ValidationErr
+if errors.As(err, &vErr) {
+    fmt.Println(vErr.Field, vErr.Msg)   // 拿到具体字段
+}
+```
+
+**`errors.As`**：沿链找**类型匹配**的 error，赋值给 target。
+
+**`Is` vs `As`** 对照：
+
+| | `errors.Is` | `errors.As` |
+|---|---|---|
+| 比的是什么 | **值**（指针相等 或 实现了 Is 方法） | **类型** |
+| 用在哪 | sentinel error（固定值） | 自定义 error 类型（要取字段） |
+| target 是什么 | error 值 | error 类型的指针的指针 |
+
+---
+
+## 六、自定义 error 类型
+
+```go
+// 携带额外信息的 error
+type HTTPError struct {
+    Code int
+    Msg  string
+}
+
+func (e *HTTPError) Error() string {
+    return fmt.Sprintf("HTTP %d: %s", e.Code, e.Msg)
+}
+
+// 实现 Is 让 errors.Is 能识别
+func (e *HTTPError) Is(target error) bool {
+    t, ok := target.(*HTTPError)
+    if !ok { return false }
+    return e.Code == t.Code   // 按 code 比较
+}
+
+// 实现 Unwrap 让 errors.Is/As 能继续往下找
+type WrappedErr struct {
+    Op  string
+    Err error
+}
+func (w *WrappedErr) Error() string { return w.Op + ": " + w.Err.Error() }
+func (w *WrappedErr) Unwrap() error { return w.Err }
+```
+
+### 接口三件套（可选）
+
+```go
+type myErr struct{ ... }
+func (e *myErr) Error() string        { ... }   // 必须
+func (e *myErr) Unwrap() error        { ... }   // 让 Is/As 能链式查
+func (e *myErr) Is(target error) bool { ... }   // 自定义"相等"语义
+func (e *myErr) As(target any) bool   { ... }   // 自定义类型匹配 (少用)
+```
+
+---
+
+## 七、Go 1.20+ 的多错误：`errors.Join`
+
+Go 1.20 加了 **多 error 合并**：
+
+```go
+err := errors.Join(err1, err2, err3)
+
+// 检查任一是不是某个值:
+if errors.Is(err, io.EOF) { ... }       // 沿所有分支查
+if errors.As(err, &target) { ... }
+```
+
+适合**并发场景**收集多个 goroutine 的错误：
+
+```go
+var errs []error
+for _, item := range items {
+    if err := process(item); err != nil {
+        errs = append(errs, err)
+    }
+}
+if len(errs) > 0 {
+    return errors.Join(errs...)
+}
+```
+
+---
+
+## 八、常见反模式
+
+### ① 用 `==` 比较 wrap 过的 error
+
+```go
+err := fmt.Errorf("oops: %w", io.EOF)
+
+err == io.EOF               // ❌ false (包装后不等于原值)
+errors.Is(err, io.EOF)       // ✓ true
+```
+
+### ② 用 `err.Error() == "xxx"` 字符串比较
+
+```go
+if err.Error() == "file not found" { ... }   // ❌
+```
+
+**破坏抽象 + 不稳定**——错误消息一改你就坏。用 `errors.Is(err, os.ErrNotExist)`。
+
+### ③ 全部 wrap 但从不 Unwrap
+
+```go
+// 链路深处:
+return fmt.Errorf("step1: %w", err)
+return fmt.Errorf("step2: %w", err)
+return fmt.Errorf("step3: %w", err)
+...
+return fmt.Errorf("step10: %w", err)
+
+// 用户拿到的 err:
+"step10: step9: step8: ... step1: original"
+```
+
+→ **包装上下文有用，但要有节制**——一般每层加 1 个关键标识，不要每个函数都包一次。
+
+### ④ panic 当错误用
+
+业务错误**永远 return error**，不要 panic——详见 [panic / recover 机制](panic-recover.html)。
+
+### ⑤ 吞掉错误
+
+```go
+_, _ = file.Write(data)   // ❌ 忽略 error
+result, _ := fn()          // ❌ 同上
+```
+
+`_` 太随手——`go vet` / `errcheck` 工具能检出。
+
+### ⑥ 检查 nil 用 `errors.Is`
+
+```go
+if errors.Is(err, nil) { ... }   // ❌ 没必要, 直接 err == nil
+if err == nil { ... }             // ✓
+```
+
+---
+
+## 九、实战推荐写法
+
+```go
+// 1) 包装时加关键上下文
+func loadConfig(path string) (*Config, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return nil, fmt.Errorf("loadConfig %s: %w", path, err)
+    }
+    defer f.Close()
+
+    var cfg Config
+    if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+        return nil, fmt.Errorf("loadConfig parse %s: %w", path, err)
+    }
+    return &cfg, nil
+}
+
+// 2) 区分错误类型
+cfg, err := loadConfig("foo.yaml")
+switch {
+case errors.Is(err, os.ErrNotExist):
+    // 文件不在
+case errors.Is(err, os.ErrPermission):
+    // 权限问题
+case err != nil:
+    // 其它错
+}
+
+// 3) 想拿具体字段用 errors.As
+var pathErr *os.PathError
+if errors.As(err, &pathErr) {
+    fmt.Println("失败的路径:", pathErr.Path)
+}
+```
+
+---
+
+## 十、一图总结
+
+```
+            Go error 处理 (1.13+)
+                    │
+              error 是个接口 (Error() string)
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+     创建 error              传播 / 检查
+     errors.New              ┌─ %w 包装 (推荐)
+     fmt.Errorf              ├─ %v 不包装 (上下文丢)
+                             ├─ errors.Is — 比值
+                             ├─ errors.As — 比类型
+                             └─ errors.Unwrap — 拿底层
+
+   错误链 (link list):
+     最外层 ──Unwrap──→ 中层 ──Unwrap──→ 最底层
+     errors.Is/As 沿这条链查找
+
+   两种典型 error:
+   ① Sentinel  var ErrNotFound = errors.New("not found")
+                 用 errors.Is 比较
+   ② 自定义类型  type MyErr struct{ Field string }
+                 用 errors.As 拿字段
+
+   Go 1.20+:
+     errors.Join(err1, err2, ...)  多 error 合并
+
+   常见反模式:
+   ❌ == 比较 wrap 过的 err  → errors.Is
+   ❌ err.Error() == "xxx"   → errors.Is
+   ❌ 每层都 wrap 一次       → 关键节点包装即可
+   ❌ panic 当错误用          → return err
+   ❌ _ 吞错                  → 处理或显式忽略
+
+   实战:
+     包装加关键上下文 + 用 errors.Is/As 区分
+```
+
+**一句话**：Go error = **显式 return + 接口**——Go 1.13+ 用 **`%w` 包装** 形成错误链，用 **`errors.Is` 比值 + `errors.As` 比类型** 沿链查找。**直接 `==` 比 wrap 过的 err 拿不到底层**，**`err.Error() == "..."` 字符串比是反模式**——按值用 sentinel + errors.Is，按字段用自定义类型 + errors.As。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/error-handling" data-base="../../"></script>
+</body>
+</html>

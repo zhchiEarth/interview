@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>atomic &amp; CAS · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# atomic & CAS
+
+## 一、为什么需要原子操作
+
+并发场景下，**最简单的"i++"都不是原子的**：
+
+```go
+var n int
+go func() { n++ }()
+go func() { n++ }()
+// 期望 n=2, 实际可能 n=1 (数据竞争)
+```
+
+`n++` 在汇编层面是 **3 条指令**：
+
+```
+1. mov  n → reg     (读)
+2. add  reg, 1      (改)
+3. mov  reg → n     (写)
+```
+
+两个 G 同时执行时可能交错——都读到 0，都加成 1，都写回 1。**丢了一次更新**。
+
+**怎么解决**？两个思路：
+
+| 方案 | 优劣 |
+|---|---|
+| **加锁** `sync.Mutex` | 通用，但开销 ~20 ns，竞争重时排队 |
+| **atomic 原子操作** | **CPU 单条指令** ~5 ns，无锁，但能做的事有限 |
+
+→ atomic 适合**简单变量更新**（计数器、标志位、指针替换）；mutex 适合**保护多步组合操作**。
+
+---
+
+## 二、一条主线：从"锁太重"到 CAS 与 lock-free
+
+> 这篇零件多（lock 前缀、CAS、自旋、ABA、内存屏障……），但它们是**一条线**串起来的。先把线走一遍，后面每个零件就知道自己卡在哪。
+
+**① 锁能解决，但对"只改一个值"太重**
+
+`i++` 丢更新，加把 `sync.Mutex` 当然能修。但锁要做一次"获取-释放"，竞争时还得把 G 挂起/唤醒（进 runtime、可能进内核）。**为了保护一个 `int` 自增付出几十~几千 ns，太亏。**
+
+**② 让 CPU 一条指令把"读-改-写"做完 → 原子指令**
+
+能不能不加锁，直接让硬件保证"读+改+写"中间不被任何核插队？能——这就是 CPU 的**原子指令**（x86 `lock xadd`、ARM LL/SC），`atomic.Add` 就是它。**这是 atomic 的本体**（原理见下一节）。
+
+**③ 但很多更新是"基于旧值算新值"，不是单纯 +1 → CAS**
+
+`push 链表节点`、`状态 A→B`、`配置整体替换`——新值依赖旧值，中间别人可能已经改了。于是需要带**条件**的原子操作：
+
+> "我以为它还是 old，**是的话**才帮我改成 new；不是，说明有人抢先了，告诉我一声。"
+
+这就是 **CAS（Compare-And-Swap）**——atomic 里最重要的那个，**所有无锁算法的地基**。
+
+**④ CAS 失败怎么办？→ 自旋重试范式**
+
+CAS 返回 false = 别人抢先了 = 我基于的旧值过期 → **重读、重算、再 CAS**，直到成功。这是贯穿全篇的范式：
+
+```go
+for {
+    old := load()
+    new := f(old)          // 基于最新的 old 算新值
+    if CAS(old, new) { break }
+    // 失败 → 别人改了 → 重试
+}
+```
+
+**⑤ 用 CAS 拼出 lock-free 栈 / 队列** —— 把"改 head 指针"用 CAS + 自旋包起来，就得到多 G 并发也不用锁的结构。
+
+**⑥ lock-free 有两个暗坑**
+
+- **正确性坑：ABA**——值 A→X→A，CAS 看不出变过，可能 use-after-free。
+- **性能坑：自旋代价**——竞争激烈时所有核疯狂重试 + 缓存行乒乓，反而比"让 G 睡一觉"的 mutex 更慢更费 CPU。
+
+**⑦ 容易被忽略的一层：atomic 不只保证"原子"，还保证"可见性 / 不被重排"**
+
+普通变量的写，别的 G **不保证看得到、看到的顺序也不保证**（编译器和 CPU 会重排）。atomic 自带**内存屏障**，解决的是另一半问题——这就是 happens-before。
+
+> **整条线**：锁太重 → 硬件原子指令(atomic) → 带条件的原子(CAS) → 自旋重试 → lock-free 结构 → 躲坑(ABA + 自旋代价) → 顺带拿到内存可见性。
+> **落地结论**：单个值/指针的改用 atomic，多字段组合操作用 mutex；做 lock-free 先掂量竞争度和 ABA。
+
+---
+
+## 三、CPU 层面的 atomic 是什么
+
+atomic 操作是 **CPU 硬件层面提供的指令**——一条指令完成"读-改-写"且**不会被打断**。
+
+### 为什么"一条指令"就能不被打断？
+
+关键不在"指令快"，而在 **CPU 的缓存一致性协议（MESI）**：任何一个缓存行，同一时刻**最多只有一个核能独占它来写**；要写就得先让其它核手里的副本失效。原子指令做的事，就是**在持有这份独占权的整段时间里，一口气把"读-改-写"做完，中间不松手**。
+
+```text
+普通 n++ (3 条指令, 中间能被插队):
+   核A: 读n=0 ───────────────── 写n=1
+   核B:        读n=0 ─ 写n=1              ← 两核都读到 0, 各写 1 → 丢一次更新
+
+原子加 (一条 RMW, 全程独占该缓存行):
+   核A: ┌ 独占 n 的缓存行 ┐
+        │ 读0 → 改1 → 写回 │             ← 这期间核B碰不到这一行
+        └──────────────────┘
+   核B:                     ┌ 此刻才拿到独占 ┐
+                            │ 读1 → 改2 → 写 │
+                            └────────────────┘
+   结果必为 2
+```
+
+**为什么两个核不会同时 CAS 成功？** 因为缓存一致性把对同一缓存行的"读-改-写"**串行化**了：独占权一次只发给一个核。先拿到的核读到 old、写成 new；另一个核再拿到时值已是 new，它的 `compare old` 必然失败。**硬件层面就互斥，不需要软件锁。**
+
+具体到每种架构，这份"独占 + 不可打断"是怎么实现的：
+
+### x86：lock 前缀
+
+x86 用 `lock` 前缀让某条指令成为原子：
+
+```asm
+lock xadd  [n], 1     # 原子地 n += 1, 返回旧值
+lock cmpxchg [p], r1, r2  # 原子 CAS
+```
+
+`lock` 前缀的语义：
+
+- 这条指令期间**独占缓存行**（其它 CPU 看不到中间态）
+- 自带**内存屏障**（前后指令不会被乱序穿越）
+
+### ARM / RISC-V：LL/SC（Load-Linked / Store-Conditional）
+
+ARM 用另一种 trick——**乐观策略**：
+
+```asm
+loop:
+  ldxr  r1, [p]       # Load-exclusive: 读并标记 "我在监视这块内存"
+  add   r1, r1, 1
+  stxr  w2, r1, [p]   # Store-exclusive: 期间没人改才成功; w2=0 成功, 否则失败
+  cbnz  w2, loop      # 失败重试
+```
+
+中间任何一个 CPU 改了这块内存，`stxr` 就失败，重试。
+
+### 不管哪种，给程序员的保证
+
+| 保证 | 含义 |
+|---|---|
+| **不可分割** | 别的 CPU 看到的要么是改前要么是改后，绝不撕裂 |
+| **内存屏障** | atomic 之前的写在 atomic 之后能被其它 CPU 看到 |
+
+Go 的 `sync/atomic` 包就是对这些 CPU 指令的**跨平台封装**。
+
+---
+
+## 四、Go 提供的 atomic API
+
+### 基础类型
+
+```go
+var n atomic.Int64        // Go 1.19+ 类型化, 推荐
+var p atomic.Pointer[T]
+var v atomic.Value         // 通用 (any)
+var b atomic.Bool
+```
+
+### 五个核心操作
+
+```go
+n.Load()                    // 原子读
+n.Store(10)                 // 原子写
+n.Add(1)                    // 原子加
+n.Swap(new)                 // 原子交换 (返回旧值)
+n.CompareAndSwap(old, new)  // CAS: 期望是 old 时改成 new, 返回 true; 否则不改, 返回 false
+```
+
+### 老版 API（Go 1.19 前）
+
+```go
+var n int64
+atomic.AddInt64(&n, 1)
+atomic.LoadInt64(&n)
+atomic.CompareAndSwapInt64(&n, old, new)
+```
+
+类型化 API 更安全（编译器帮你检查），**新代码全用类型化**。
+
+---
+
+## 五、CAS 是什么
+
+CAS = **Compare-And-Swap**——所有无锁算法的基石。
+
+```go
+// 伪代码
+func CAS(ptr *T, old, new T) bool {
+    if *ptr == old {
+        *ptr = new
+        return true
+    }
+    return false
+}
+```
+
+整个过程**一条 CPU 指令完成**，期间不被打断。
+
+### CAS 的语义
+
+CAS 在问一个问题：**"我以为这个值还是 old，是的话帮我改成 new"**。
+
+```
+- 是 old → 改成功, 返回 true   (我看到的值确实没被别人改过, 改我自己写一个)
+- 不是 old → 改失败, 返回 false (别人抢先改了, 我得重新决策)
+```
+
+→ **CAS 是"乐观锁"的硬件实现**——不锁住资源，先假设没人抢，抢不到再重试。
+
+### 经典用法：自旋 CAS 实现 lock-free 计数
+
+```go
+for {
+    old := n.Load()
+    if n.CompareAndSwap(old, old+1) {
+        break    // 改成功了
+    }
+    // 改失败 → 别人先改了 → 重试
+}
+```
+
+实际上 `n.Add(1)` 在 CPU 上就是这种自旋（或者直接 `lock xadd`）。
+
+---
+
+## 六、用 CAS 实现 lock-free 数据结构
+
+### 例 1：lock-free 栈
+
+```go
+type Stack[T any] struct {
+    head atomic.Pointer[node[T]]
+}
+
+type node[T any] struct {
+    val  T
+    next *node[T]
+}
+
+func (s *Stack[T]) Push(v T) {
+    n := &node[T]{val: v}
+    for {
+        old := s.head.Load()
+        n.next = old
+        if s.head.CompareAndSwap(old, n) {
+            return
+        }
+        // CAS 失败 → 别人先 push 了 → 重试
+    }
+}
+
+func (s *Stack[T]) Pop() (T, bool) {
+    for {
+        old := s.head.Load()
+        if old == nil {
+            var zero T
+            return zero, false
+        }
+        if s.head.CompareAndSwap(old, old.next) {
+            return old.val, true
+        }
+        // 重试
+    }
+}
+```
+
+**完全无锁**——多个 G 同时 Push/Pop 都不会冲突，性能极高。
+
+### 例 2：lock-free 单例（Double-Checked Locking 的现代版）
+
+```go
+var instance atomic.Pointer[Foo]
+
+func GetInstance() *Foo {
+    if p := instance.Load(); p != nil {
+        return p           // 快路径: 已初始化, 无锁读
+    }
+    // 慢路径
+    newOne := newFoo()
+    if instance.CompareAndSwap(nil, newOne) {
+        return newOne
+    }
+    return instance.Load()  // 别人抢先初始化了
+}
+```
+
+不过这种场景**直接用 `sync.Once` 更简洁、更安全**。
+
+---
+
+## 七、ABA 问题
+
+CAS 有个**经典陷阱**——"值没变但其实变了"：
+
+```
+时刻 t0:  线程 1 读到 *p = A, 准备 CAS(A, B)
+时刻 t1:  线程 2 改 *p: A → X → A   (改了再改回来)
+时刻 t2:  线程 1 执行 CAS(A, B)  → 看到 *p 仍然是 A → 成功!
+          但其实期间发生了变化, 线程 1 不知道
+```
+
+### 典型 ABA 翻车场景：lock-free 栈
+
+```
+栈: head → A → B → C
+
+线程 1: 想 Pop
+  读 head = A
+  打算 CAS(head, A→B)  ...
+
+线程 2: Pop(A), Pop(B), Push(A)  → 栈现在: head → A → C  (B 被 free 了!)
+
+线程 1: 继续 CAS(head, A→B)
+  → CAS 成功 (head 仍是 A)
+  → 但 head 现在指向已 free 的 B! 💥 use-after-free
+```
+
+### 解法
+
+| 方法 | 说明 |
+|---|---|
+| **带版本号的指针**（DCAS） | 每次更新带个递增 counter，CAS 比较 (ptr, counter) 二元组 |
+| **Hazard Pointer** | 每个线程登记"我正在用哪些指针"，防止被回收 |
+| **Epoch-Based Reclamation** | 用 GC-like 机制延迟回收 |
+| **直接加锁** | 最简单暴力 |
+
+Go 标准库**没直接支持 DCAS**——实战中 ABA 翻车的概率不高（GC 帮你避免了大部分指针重用），但**做 lock-free 队列/栈时一定要警惕**。
+
+> **简单建议**：90% 场景用 `sync.Mutex` 一刀切，性能足够；只在 benchmark 显示锁是瓶颈时才尝试 lock-free。
+
+---
+
+## 八、atomic.Value / atomic.Pointer
+
+### atomic.Pointer[T]（Go 1.19+，推荐）
+
+```go
+var cfg atomic.Pointer[Config]
+
+cfg.Store(&Config{...})
+c := cfg.Load()        // *Config, 不用类型断言
+```
+
+**类型化、安全、零开销**——配置热更新等场景的标准方案。
+
+### atomic.Value（老 API）
+
+```go
+var cfg atomic.Value
+cfg.Store(&Config{...})
+c := cfg.Load().(*Config)   // 要类型断言
+```
+
+⚠️ **每次 Store 类型必须一致**——第二次 Store 不同类型会 panic：
+
+```go
+cfg.Store(&ConfigV1{})
+cfg.Store(&ConfigV2{})    // panic! 类型不一致
+```
+
+新代码用 `atomic.Pointer[T]`，老代码迁移时注意。
+
+---
+
+## 九、内存语义：原子操作的"另一半"——可见性与重排
+
+> 前面讲的"原子"(不被打断)解决的是**丢更新**。但并发还有**另一半**问题：一个 G 写的东西，别的 G **看不看得到、按什么顺序看到**？atomic 同时解决了这一半——这就是 happens-before。
+
+### 问题：编译器和 CPU 会重排，普通变量跨 G 没有顺序保证
+
+```go
+// 生产者 G
+data = compute()     // (1) 写数据
+ready = true         // (2) 置标志
+
+// 消费者 G
+for !ready {}        // (3) 等标志
+use(data)            // (4) 用数据
+```
+
+直觉上 (1) 先于 (2)，看到 `ready==true` 就该看到 `data`。但**普通变量没这个保证**，三种翻车：
+
+- **编译器重排**：(1)(2) 之间无依赖，编译器可能把 (2) 提到 (1) 前面。
+- **CPU 重排 / store buffer**：写先进核本地的 store buffer，刷回内存的顺序可能 (2) 先于 (1)，别的核就先看到 `ready=true`。
+- **编译器把变量缓存进寄存器**：`for !ready {}` 可能只读一次就把 `ready` 缓存在寄存器，永远是旧值 → **死循环**（这正是为什么标志位不能用普通 bool）。
+
+→ 消费者可能看到 **`ready==true` 但 `data` 还是旧的**——"半发布(half-published)"。
+
+### atomic 怎么修：store-release / load-acquire 屏障
+
+把标志位换成 atomic，就插入了**内存屏障**：
+
+```go
+data = compute()
+ready.Store(true)    // store-release: 之前的写(含 data)不许重排到它之后,
+                     //                且保证刷成对其它核可见
+if ready.Load() {    // load-acquire:  之后的读(含 data)不许重排到它之前
+    use(data)        // 读到 ready==true → 必然读到完整的 data
+}
+```
+
+- **release（写侧）**：`Store` 是一道栅栏——它**之前**的所有写不许溜到它**之后**，且会被推送到其它核可见。
+- **acquire（读侧）**：`Load` 也是栅栏——它**之后**的读不许提到它**之前**。
+- 两者配对，建立 **happens-before**：
+
+```text
+   生产者                              消费者
+   data = ...        ┐
+   ──────────────────┤ release           acquire ┌──────────────────
+   ready.Store(true) ┘ ───── 可见性传递 ─────→ ready.Load()==true
+                                                 └─ use(data)  ← 保证看到新 data
+```
+
+> Go 1.19+ 的 `sync/atomic` 类型(`atomic.Bool/Int64/Pointer...`)给的是**顺序一致性**(最强的一档)。所以实战只要记住"**发布/标志位用 atomic**"，可见性和顺序就都对了，不必纠结 acquire/release 细节。
+
+### 一句话
+
+> atomic 给你**两件事**：
+> ① **原子性**——读-改-写不被打断，解决**丢更新**（撕裂写见 [sync.Map 第三节](sync-map.html)）；
+> ② **屏障 / happens-before**——跨 G 的可见性与顺序，解决**半发布、重排、寄存器缓存**。
+> **普通变量两件都不保证**——这就是"并发标志位必须用 atomic，不能用普通 bool"的根本原因。
+
+---
+
+## 十、atomic vs mutex：CPU 层面到底差在哪
+
+> 一句话先记住：**它俩不是并列的两种东西——mutex 是用 atomic 当零件搭出来的。** 真正的区别在"抢不到锁时怎么办"和"保护焊在哪一层"。
+
+### 1. mutex 的地基就是 atomic
+
+`mu.Lock()` 的第一步——把 `state` 从 0 改成 1——就是一次 **atomic CAS**（一条 `lock cmpxchg` 硬件指令）。所以无竞争时，`Lock/Unlock` 跟一次裸 CAS 几乎是**同一条指令**、同一量级（~20 ns）：
+
+```text
+atomic.Add(&n,1)      → lock xadd    [n],1      ← 一条硬件指令
+mu.Lock() (没人占)     → lock cmpxchg [state],..  ← 也是一条!(mutex 的快路径)
+```
+
+### 2. 有竞争时才分叉：自旋不睡 vs 让出 CPU
+
+```text
+        CAS 失败 (锁被占)
+        ┌──────────────┴──────────────┐
+        ▼                             ▼
+   atomic (lock-free)            mutex (blocking)
+   原地自旋重试, 始终占着核        自旋几次还不行 → gopark / futex
+   绝不睡、不进内核                让出 CPU 去跑别的 G(可能进内核)
+```
+
+### 3. 两个"lock"根本不是一回事
+
+| "lock" | 是什么 | 锁多久 | 锁什么 |
+|---|---|---|---|
+| x86 `LOCK` 前缀（atomic） | **硬件**：独占缓存行（老 CPU 锁整条总线，现代只锁缓存行，靠 MESI） | **一条指令**（~ns） | 一个内存地址的一次读-改-写 |
+| `mu.Lock()`（mutex） | **软件**：互斥准入协议 | **整个临界区**（可能很久，甚至睡眠） | "谁能进这段代码"，**不锁任何硬件** |
+
+> "锁总线 / 锁缓存行"是 **atomic** 的硬件机制，**跟 mutex 无关**。mutex 在硬件层面什么都不锁。
+
+### 4. mutex 临界区里是普通指令，还能被抢占
+
+锁住期间，临界区跑的是**普通、非原子、可被打断**的指令：
+
+```go
+mu.Lock()
+a++          // 仍是 3 条普通指令(读/加/写), 不是原子的
+b++
+mu.Unlock()
+```
+
+持锁的 G **可以在 `a++` 和 `b++` 之间被抢占、被换下 CPU**。它之所以"看起来原子"，不是因为指令原子，而是因为**别的想拿同一把锁的 G 全被挡在 `Lock()` 外面**，看不到中间的半成品状态。
+
+### 5. 持锁被抢占：锁不释放，等待者干等（lock convoy）
+
+> 被调度走 ≠ 释放锁。锁是 `state` 这个内存值，G 暂停了它也不变，**锁还在被暂停的那个 G 手里**。
+
+```text
+G1: Lock()✓ a++ ──[被抢占]──┐  (mu.state 仍 = 1, 锁还在 G1 手里)
+                            ▼
+G2: 想要这把锁 → Lock() 失败 → park 干等 (哪怕 G1 没在跑也拿不到)
+                            ▼
+   G1 被调回来 → b++ → Unlock() → 才唤醒 G2
+```
+
+**一个持锁者被暂停，就能卡住所有等待者**——这就是 lock convoy，也是 blocking 锁相对 lock-free 的软肋（lock-free 下一个线程暂停不会拖停别人，总有人能前进）。
+
+### 6. "软件约定"只约束守约定的人
+
+mutex 是**协作式**的：保护只在"**所有访问者都来拿同一把锁**"时才成立。
+
+```go
+mu.Lock(); a++; mu.Unlock()   // G1: 守约定
+a++                           // G2: 不拿锁直接改 → 锁拦不住 → 数据竞争!
+```
+
+锁守的是"**门**"（`Lock()` 调用），不是"**内存**"。翻窗的 G（不 Lock 直接访问）锁形同虚设——用 `go run -race` 抓。
+
+> 注：atomic 也要求"别对同一地址混用普通读写和 atomic"，但每条 atomic 操作**本身**是硬件兜底的原子。
+
+### 小结表
+
+| | atomic | mutex |
+|---|---|---|
+| 本质 | 一条硬件指令 | 软件结构，**用 atomic 搭** |
+| 保护焊在哪 | 内存地址（硬件，谁都绕不过） | "门"（`Lock()`，只约束拿锁的人） |
+| 无竞争开销 | ~5–20 ns | ~20 ns（快路径就是一次 CAS） |
+| 竞争时 | 自旋重试，不睡 | 自旋几次 → 阻塞让出 CPU |
+| 临界区指令 | —（就一条） | 普通指令，可被抢占 |
+| 进度保证 | lock-free | blocking（持锁被暂停会拖住等待者） |
+| 保护范围 | 单地址一次读-改-写 | 任意多步、多变量的临界区 |
+
+---
+
+## 十一、什么时候用 atomic / 什么时候用 mutex
+
+| 用 atomic ✅ | 用 mutex ✅ |
+|---|---|
+| 计数器（`n.Add(1)`） | 多步操作（读 + 改 + 写一组字段） |
+| 标志位（`done.Store(true)`） | 临界区超过几条指令 |
+| 配置热更新（`atomic.Pointer` 整体替换） | 需要等待 / 条件变量 |
+| 单字段的发布 / 检查 | 大对象 / 复杂逻辑 |
+
+**决策启发**：
+
+```
+要改的是"单个值"或"单个指针"?     → atomic
+要改的是"对象的多个字段"?         → mutex
+要"读多写少 + 整体替换"?           → atomic.Pointer (替换指针即可)
+要"读多写少 + 部分字段修改"?       → RWMutex
+```
+
+### 性能对比（直觉值）
+
+```
+原子操作:    ~5 ns
+mutex 无竞争: ~20 ns
+mutex 竞争:  ~几千 ns (挂起)
+CAS 自旋失败重试: 看竞争激烈程度, 通常几十 ns
+```
+
+### CAS 自旋为什么会输给 mutex
+
+`Add`/CAS 在**低竞争**下稳赢（一条指令 ~5 ns）。但**高竞争**下自旋重试会退化：
+
+```text
+低竞争 (没人抢):
+   CAS 一次成功 ── ~5 ns ── 完事                    ✅ atomic 完胜
+
+高竞争 (N 个核狂抢同一个值):
+   每个核: load → 算 → CAS失败 → 重来 → CAS失败 → ...
+            └── 失败的每一轮都在【白烧 CPU】
+   且 N 个核反复写【同一个缓存行】
+        → 缓存行在各核间来回弹 (cache-line ping-pong)
+        → 核间互联/总线被打满, 越抢越慢
+```
+
+三个具体代价：
+
+| 代价 | 说明 |
+|---|---|
+| **忙等烧 CPU** | 自旋失败不让出核，纯空转；竞争越激烈浪费越多 |
+| **缓存行乒乓** | 所有核抢写同一缓存行，MESI 不停互相 invalidate，吞吐反降 |
+| **饥饿 / 不公平** | CAS 只保证"**有人**能成功"(lock-free)，不保证"**每个人**都能"(非 wait-free)——倒霉的 G 可能一直重试失败 |
+
+**对比 mutex**：竞争激烈时 mutex 会把抢不到的 G **挂起（让出 CPU）**，等释放再唤醒一个。单次有挂起开销，但**不占着核空转**，整体吞吐和 CPU 利用率往往更好（这正是 [Mutex 自旋几次就转入挂起](sync-mutex.html) 的原因）。
+
+> **所以"atomic 一定比 mutex 快"是错的：**
+> - 低竞争 / 短临界区 → atomic 赢
+> - 高竞争 + 单点热值 → mutex(让 G 睡)可能更好，或用**分片(sharding)**把热点打散（如 `counter[P]` 每核一个再求和）
+> - 缓解自旋 → **指数退避(backoff)**：失败后等一小会儿再重试，减少乒乓
+
+---
+
+## 十二、一图总结
+
+```
+                  原子操作的本质
+                        │
+                CPU 单条指令完成"读-改-写"
+                + 内存屏障 (跨 G 可见性)
+                        │
+        ┌───────────────┴────────────────┐
+        ▼                                ▼
+     x86: lock 前缀                ARM: LL/SC 乐观重试
+     (lock xadd, lock cmpxchg)     (ldxr, stxr 失败重试)
+
+   Go API:
+   ┌──────────────────────────────────────────────────┐
+   │ 类型化 (推荐):                                    │
+   │   atomic.Int64    Bool    Pointer[T]   Uint32    │
+   │ 通用:                                             │
+   │   atomic.Value (要 type assert)                  │
+   │                                                  │
+   │ 五个操作:                                         │
+   │   Load / Store / Add / Swap / CompareAndSwap     │
+   └──────────────────────────────────────────────────┘
+
+   CAS 工作机制:
+     compare_and_swap(ptr, old, new):
+       if *ptr == old:  *ptr = new; return true
+       else:            return false
+
+   CAS 用法范式 — 自旋重试:
+     for {
+       old := load()
+       new := f(old)        // 算新值
+       if CAS(old, new) { break }
+       // 失败 → 别人改了 → 重试
+     }
+
+   ABA 陷阱 (正确性):
+     A → X → A 的中间变化看不到, CAS 仍成功
+     解: 带版本号 / Hazard Pointer / 直接加锁
+
+   自旋代价 (性能):
+     低竞争稳赢; 高竞争退化 → 忙等烧 CPU + 缓存行乒乓 + 可能饥饿
+     缓解: 指数退避 / 分片打散热点 / 干脆用 mutex 让 G 睡
+
+   atomic vs mutex 决策:
+     单值改      → atomic
+     多字段改    → mutex
+     整体替换    → atomic.Pointer
+     读多写少    → atomic.Pointer 或 RWMutex
+     需要等待    → mutex + Cond / 或 channel
+
+   内存语义 (happens-before):
+     atomic.Store 之前的所有写,
+     在另一 G 的 atomic.Load 看到该值之后必可见
+```
+
+**一句话**：atomic = **CPU 单条指令级原子操作**（`lock` 前缀 / LL-SC），**CAS 是其中最重要的乐观锁原语**，无锁数据结构的基石。**简单单值改用 atomic，复杂多步用 mutex**；做 lock-free 算法时小心 **ABA**——多数场景下 mutex 一刀切性能就够，**只在 benchmark 确认锁是瓶颈时**才上 atomic + CAS。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/atomic-cas" data-base="../../"></script>
+</body>
+</html>

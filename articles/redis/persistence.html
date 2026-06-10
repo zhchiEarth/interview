@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redis持久化的原理及优化 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Redis持久化的原理及优化
+
+> 一句话：Redis 是内存数据库，进程一退数据就没了；持久化就是把内存数据落到磁盘，重启后能恢复——RDB 存"快照"、AOF 存"操作日志"，4.0 后两者可以混合，各自的瓶颈都绕不开 **fork** 这道坎。
+
+本篇是**持久化总览 + 优化**：把 RDB / AOF / 混合三种机制讲清楚，重点放在 fork、写时复制（COW）和生产环境调优。两种机制的逐项对比、AOF 的 appendfsync 三档与重写细节、以及"到底怎么选"，放在 [AOF 与 RDB 深入](aof-rdb.html) 里展开。
+
+> 本文以 **Redis 7.x** 行为为基准，涉及版本差异处会显式标注（4.0 混合持久化、7.0 Multi-Part AOF 等）。
+
+## 一、为什么要持久化
+
+Redis 把数据全部放在内存，读写都走内存所以快。但内存是易失的：
+
+```text
+                    进程崩溃 / 机器断电 / kill -9
+                              │
+   内存里的全部数据  ──────────┴──────────→  瞬间清零
+```
+
+如果只把 Redis 当纯缓存（数据源头在 MySQL，丢了能回源重建），可以不开持久化。但很多场景下 Redis 是"准存储"：
+
+- 重启 / 故障后需要**快速恢复**到崩溃前的状态，而不是冷启动后被穿透打挂下游
+- 主从复制、集群的**全量同步**也依赖 RDB 文件来传输基线数据
+
+所以持久化解决的核心问题是：**进程没了，数据还在；重启后能恢复**。Redis 给了两条路——RDB（快照）和 AOF（日志），下面分别看。
+
+## 二、RDB 快照：某一时刻的内存全景
+
+RDB（Redis DataBase）是**某个时间点的内存全量快照**，序列化成一个紧凑的二进制文件（默认 `dump.rdb`）。
+
+### 2.1 SAVE vs BGSAVE
+
+```text
+SAVE     主线程亲自写 RDB
+         └─ 写盘期间 Redis 完全阻塞,不能处理任何命令  ← 生产禁用
+
+BGSAVE   主线程 fork 出一个子进程,由子进程写 RDB
+         └─ 主线程继续对外服务,只在 fork 那一瞬间短暂阻塞  ← 默认/推荐
+```
+
+`save` 配置触发的、主从全量同步触发的，底层走的都是 **BGSAVE**。SAVE 只在极特殊场景（如关机前）才会出现。
+
+### 2.2 save 配置：什么时候自动触发快照
+
+`redis.conf` 里的 `save <秒> <改动次数>` 表示"在 N 秒内发生了至少 M 次写改动，就触发一次 BGSAVE"，可以配多条，满足任意一条即触发：
+
+```text
+save 3600 1        # 1 小时内至少 1 次改动
+save 300 100       # 5 分钟内至少 100 次改动
+save 60 10000      # 1 分钟内至少 10000 次改动
+
+# 写成 save ""  表示关闭自动 RDB
+```
+
+直觉：**改得越频繁，存得越勤**。也可以手动执行 `BGSAVE`，或在 `SHUTDOWN`（不带 nosave）时自动存一次。
+
+### 2.3 fork + 写时复制（COW）是 RDB 的灵魂
+
+子进程怎么能在主线程还在改数据的同时，导出一份"干净一致"的快照？靠的是操作系统的 **fork + Copy-On-Write（写时复制）**。
+
+```text
+fork 那一刻:
+   父进程(主线程)               子进程
+        │                          │
+        └─────────┬────────────────┘
+                  ↓
+       两个进程的"页表"都指向同一批物理内存页
+       （注意:拷贝的是页表,不是真实数据,所以 fork 很快）
+
+随后主线程继续处理写命令:
+   主线程要改 key X 所在的内存页
+        │
+        ① OS 发现这页被父子共享 → 触发 COW
+        ② 复制出一份新页给主线程去改
+        ③ 子进程仍看着那份"老页"
+        ↓
+   子进程导出的始终是 fork 那一刻的一致快照
+```
+
+要点：
+
+- **fork 不拷贝数据**，只拷贝**页表**（虚拟地址到物理页的映射），所以 fork 本身通常很快
+- fork 之后，只有**被写的内存页**才会真正复制一份（写时才复制），没改的页父子继续共享
+- 子进程看到的是**冻结在 fork 时刻**的内存视图，因此 RDB 是某个时间点的一致快照
+
+> 这正是 RDB 的两个代价的来源：fork 时要拷页表（大内存会卡），以及写得越多 COW 复制的页越多（内存可能放大）。第六节细讲。
+
+### 2.4 RDB 的特点速记
+
+- 文件是**紧凑的二进制**，体积小，加载时直接按格式还原内存，**恢复速度快**
+- 是某个时间点的快照，**两次快照之间宕机会丢这段数据**（默认配置下可能丢几分钟）
+
+RDB 与 AOF 的逐项对比、各自适用场景，见 [AOF 与 RDB 深入](aof-rdb.html)。
+
+## 三、AOF：把写命令追加成日志
+
+AOF（Append Only File）记录的不是数据快照，而是**每一条修改数据的写命令**（按 Redis 协议格式追加到文件末尾）。重启时把这些命令**重放**一遍，就重建出了内存数据。
+
+```text
+客户端: SET k1 v1
+        LPUSH list a
+        SET k1 v2
+            │
+            ↓ 先执行命令(改内存),再把命令追加到 AOF
+   aof 文件: SET k1 v1
+             LPUSH list a
+             SET k1 v2
+            ↑ 重启时从头重放这些命令 → 内存被重建
+```
+
+### 3.1 appendfsync 三档（一句话）
+
+写进 AOF 不等于落到磁盘——内核还有一层缓冲。`appendfsync` 决定**多久 fsync 一次到磁盘**：
+
+| 取值 | 一句话 | 安全性 / 性能 |
+|---|---|---|
+| `always` | 每条写命令都 fsync | 最安全、最慢 |
+| `everysec` | 每秒 fsync 一次（默认） | 折中，宕机最多丢约 1 秒 |
+| `no` | 何时 fsync 交给操作系统 | 最快、最不安全 |
+
+> 三档的取舍细节、以及"写后日志"为什么这样设计，在 [AOF 与 RDB 深入](aof-rdb.html) 里展开。
+
+### 3.2 AOF 重写（rewrite）概念
+
+AOF 是命令日志，时间久了会越来越大（上面例子里 `SET k1 v1` 后又 `SET k1 v2`，前一条其实是冗余的）。**AOF 重写**就是：扫描当前内存里的实际数据，生成一份能重建出相同数据的**最小命令集**，替换掉臃肿的旧文件。
+
+```text
+重写前:  SET k1 v1 / SET k1 v2 / LPUSH list a / ... (一堆历史)
+重写后:  SET k1 v2 / RPUSH list a                    (按现状直接生成)
+```
+
+重写同样靠 **fork 子进程**完成，机制和触发条件（`auto-aof-rewrite-percentage` 等）在深入篇细讲。
+
+## 四、混合持久化（RDB + AOF，4.0+）
+
+纯 RDB 恢复快但可能丢数据；纯 AOF 安全但文件大、重放慢。**Redis 4.0 引入混合持久化**（配置 `aof-use-rdb-preamble yes`，4.0 之后默认开启），把两者的优点合在一起。
+
+关键点：它作用在 **AOF 重写**时——重写产生的新 AOF 文件，**开头是一段 RDB 格式的二进制全量快照，后面跟着重写之后新产生的增量写命令（AOF 文本格式）**。
+
+```text
+混合持久化的 AOF 文件结构:
+
+   ┌────────────────────────────┬─────────────────────────┐
+   │   RDB 格式的二进制全量快照   │   增量写命令(AOF 文本)    │
+   │  （重写时的内存全景,紧凑）   │  （重写之后新来的命令）   │
+   └────────────────────────────┴─────────────────────────┘
+         恢复时:先按 RDB 加载这段              再重放这些命令
+         (快)                                 (补上最后那点增量)
+```
+
+效果：
+
+- **恢复快**——大头用 RDB 加载，不用逐条重放海量命令
+- **丢数据少**——增量部分仍是 AOF，受 `appendfsync` 保护
+
+> 混合持久化是目前**生产环境最推荐**的方案。注意它本质上仍走 AOF 体系（要 `appendonly yes`），只是重写时用 RDB 当"前缀"。
+
+## 五、Redis 7 的 Multi-Part AOF（多部件 AOF）
+
+Redis 7.0 重构了 AOF 的落盘形态，引入 **Multi-Part AOF**，把过去"一个 AOF 文件"拆成多个文件，由一个清单（manifest）统一管理：
+
+```text
+appenddirname "appendonlydir"   (7.0 起 AOF 放进独立目录)
+   │
+   ├── appendonly.aof.1.base.rdb     base 文件:重写时的全量快照(混合时是 RDB 格式)
+   ├── appendonly.aof.1.incr.aof     incr 文件:base 之后的增量写命令
+   └── appendonly.aof.manifest       manifest:记录当前由哪些 base/incr 文件组成
+```
+
+- **base 文件**：一次重写生成的基线（开启混合持久化时就是 RDB 格式）
+- **incr 文件**：基线之后追加的增量命令
+- **manifest 清单**：声明这套 AOF 由哪些文件组成
+
+解决的痛点：7.0 之前重写要把"重写期间的增量"额外合并回主文件，逻辑复杂且容易在中途崩溃时出问题；拆成 base + incr 后，重写只需生成新的 base 并切换 manifest 指向，**老文件原样保留、切换更干净、崩溃更易恢复**。
+
+## 六、优化：所有瓶颈都绕着 fork 和磁盘
+
+理解了原理，调优的着力点就清晰了——RDB 的 BGSAVE、AOF 的重写都依赖 **fork** 和 **磁盘 IO**。
+
+### 6.1 大内存导致 fork 阻塞（拷页表）
+
+fork 不拷数据，但要**拷贝父进程的页表**。实例内存越大，页表越大，拷页表耗时越长——这段时间主线程是**被阻塞**的（fork 是同步系统调用）。
+
+```text
+内存 1GB   → 页表小 → fork 几毫秒,几乎无感
+内存 数十GB → 页表大 → fork 可能几十~上百毫秒,期间所有请求卡住
+```
+
+应对：
+
+- **控制单实例内存**（经验上建议单实例不要太大，比如别超过约 10GB 量级，按业务压测为准），过大就拆分实例 / 用集群分片
+- Linux 开启 **透明大页（THP）会放大 fork 期间的 COW 复制单位**（一页从 4KB 变 2MB），官方建议**关闭 THP**：`echo never > /sys/kernel/mm/transparent_hugepage/enabled`
+- 避开业务高峰做 BGSAVE / 重写；监控 `latest_fork_usec`（最近一次 fork 耗时，`INFO stats` 里）
+
+### 6.2 COW 导致内存可能翻倍
+
+fork 后主线程每改一页，COW 就复制一页。**极端情况下（fork 期间全量数据都被改写过），物理内存可能接近翻倍**。
+
+```text
+正常: 子进程导出期间只改了一部分页 → 多占用一部分内存
+最坏: 写入量巨大,几乎每页都被 COW → 内存接近 2 倍 → 可能触发 OOM
+```
+
+应对：
+
+- 给机器**预留足够内存余量**，别让 `used_memory` 贴着物理内存上限跑
+- `vm.overcommit_memory = 1`（允许 overcommit），否则 fork 在内存吃紧时可能直接失败
+- 让快照 / 重写**避开大批量写入**的时段
+
+### 6.3 AOF 重写时机
+
+重写太频繁 → 反复 fork、浪费 CPU/IO；太少 → AOF 文件膨胀、重启重放慢。靠两个参数控制自动触发：
+
+```text
+auto-aof-rewrite-percentage 100   # 比上次重写后大小增长 ≥ 100%(翻倍)才触发
+auto-aof-rewrite-min-size  64mb   # 且当前文件至少要到 64mb,避免小文件频繁重写
+```
+
+两个条件**同时满足**才自动重写。也可手动 `BGREWRITEAOF`。重写的内部机制（重写缓冲、与主流程的协作）见 [AOF 与 RDB 深入](aof-rdb.html)。
+
+### 6.4 磁盘 IO 与 appendfsync
+
+`appendfsync always` 每条命令都 fsync，磁盘慢时会直接拖垮写入吞吐；`everysec` 是绝大多数场景的推荐档。此外：
+
+- 把 AOF / RDB 放在**性能好的盘**（SSD），别和高 IO 业务抢盘
+- `no-appendfsync-on-rewrite yes`：重写期间暂不主动 fsync，**避免重写产生的大量磁盘 IO 和主流程 fsync 互相打架**导致主线程卡顿（代价是重写期间宕机会多丢一点数据）
+
+### 6.5 推荐方案小结
+
+```text
+纯缓存(可回源)         → 可关闭持久化,或只开 RDB
+要快速恢复+少丢数据     → 开 AOF + 混合持久化(aof-use-rdb-preamble yes)
+                          appendfsync everysec
+                          关闭 THP,预留内存,避开高峰做重写
+单实例内存别太大        → 控制 fork 成本;过大就分片
+```
+
+> 至于"RDB 和 AOF 到底怎么选、appendfsync 三档细节、重写流程"，全部在 [AOF 与 RDB 深入](aof-rdb.html) 展开。
+
+## 一句话总结
+
+> **持久化 = 把内存数据落盘以便重启恢复**：RDB 是紧凑的时间点快照（恢复快、可能丢数据），AOF 是写命令日志（更安全、文件大）。两者底层都靠 **fork + COW** 让子进程导出一致视图，因此调优的核心永远是 **控制 fork 成本（小实例、关 THP、预留内存、避开高峰）和磁盘 IO**。生产推荐 **AOF + 混合持久化（4.0+）**，Redis 7 的 **Multi-Part AOF（base + incr + manifest）** 让重写更干净。逐项对比与策略选择见 [AOF 与 RDB 深入](aof-rdb.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="redis/persistence" data-base="../"></script>
+</body>
+</html>

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slice 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Slice 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **slice = (Data, Len, Cap) 三件套 header**，按值传 header、但**共享底层数组**；append **cap 够 → 原地写（共享，危险）/ cap 不够 → 扩容分家**。防坑三件套：**三索引限 cap · Clone 深拷 · 预分配 cap**。
+
+记不全时，按这条**记忆主线：一张图 + 一个机制 + 三个坑**展开（详细推演看[正文](slice.html)）：
+
+---
+
+## 🖼 一张图 —— header 三件套（24 字节）
+
+```text
+slice header               底层数组（堆 / 栈）
+┌───────────┐              ┌───┬───┬───┬───┬───┬───┐
+│ Data  ───┼────────────▶ │ 1 │ 2 │ 3 │ ? │ ? │ ? │
+│ Len = 3  │              └───┴───┴───┴───┴───┴───┘
+│ Cap = 6  │                ↑           ↑           ↑
+└───────────┘              Data      Len 边界     Cap 边界
+```
+
+- **Len** = 现在有几个，`s[i]` 合法范围 `[0, Len)`，越界 panic。
+- **Cap** = 从 Data 起底层数组能装几个，append 在 cap 内不扩容。
+- slice **本身**是这 24 字节 header（值）；**数据**在它指向的底层数组（共享）。
+
+---
+
+## ⚙️ 一个机制 —— append 看 cap 够不够
+
+```text
+s = append(s, x)
+   cap 够   → 原地写 buf[Len]，Len++        （O(1)，仍共享底层 → 危险）
+   cap 不够 → 扩容：申请新数组 + 拷贝旧的 + 写新的（分家，跟原 slice 脱钩）
+```
+
+- **扩容因子**（Go 1.18+）：`cap < 256` 翻倍 ×2；`cap ≥ 256` 渐变到约 1.25×。实际 cap 还按内存 size class 对齐，**常比算出来的大一点**。
+- **铁律**：append 一定 `s = append(s, ...)` **接住返回值**——它返回的是一个新 header。
+
+---
+
+## ⚠️ 三个坑 —— 全来自"共享底层数组"
+
+```text
+① 切片改元素 → 改到原数组      b := a[1:3]; b[0]=9  →  a[1] 也变 9
+② append 越过 high → 覆盖原数组  b 的 cap 还够时 append 会写进 a 的后续格子
+       修法：三索引 a[1:3:3] 把 cap 限死 → append 必扩容、必分家
+③ 切大数组留一小段 → 整块卡 GC   Data 指向大数组开头，100MB 都回收不了
+       修法：slices.Clone（或 make + copy）深拷贝
+```
+
+**函数传参**（header 按值传）：改元素影响外面、append 看 cap 不一定、`s = ...` 重新赋值不影响外面。
+
+---
+
+## 🛡 防坑 + 性能小抄
+
+```text
+append 必接返回值       s = append(s, ...)
+截取后想 append         三索引 a[lo:hi:hi] 限 cap，防覆盖
+切大数组留小段          slices.Clone 深拷贝，放 GC 回收大块
+预知容量                make([]T, 0, n) 预分配，免反复扩容
+清空复用                s = s[:0]（Len=0，cap 留着，原地再 append）
+判空                    len(s) == 0（同时覆盖 nil 和空）
+```
+
+---
+
+## 附 · nil slice vs 空 slice
+
+```text
+var a []int    → nil：Data=nil， a==nil 为 true，  JSON 出 "null"
+b := []int{}   → 空：Data 非 nil，b==nil 为 false， JSON 出 "[]"
+```
+
+- 功能几乎等价（len / cap / range / append 都一样），**只在 `==nil` 和 JSON 序列化时有别**。
+- 返空集合返 `nil` 更省；判空一律用 `len(s) == 0`。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/slice-memo" data-base="../../"></script>
+</body>
+</html>

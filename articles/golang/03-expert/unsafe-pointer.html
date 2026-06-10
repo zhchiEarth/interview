@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>unsafe.Pointer 6 条规则 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# unsafe.Pointer 6 条规则
+
+> 一句话：unsafe.Pointer 能在指针类型间转换，但只有 6 种合法用法；用错就是未定义行为，GC 也可能搬走对象。
+
+## 6 条规则（官方文档原话精简）
+
+1. **`*T1 ↔ *T2`**（通过 unsafe.Pointer 中转）
+2. **`uintptr ← unsafe.Pointer`**（看一下数值，不能反向）
+3. **`unsafe.Pointer ← uintptr` 算偏移要立即用**：
+
+   ```go
+   p := unsafe.Pointer(uintptr(unsafe.Pointer(&s)) + offsetA)  // ✅
+   // 不能拆成两行存 uintptr
+   ```
+
+4. **syscall.Syscall 接受 uintptr 参数**（编译器特殊处理保活）
+5. **reflect.Value.Pointer / UnsafeAddr**（同上）
+6. **reflect.SliceHeader / StringHeader**（已不推荐，1.20+ 用 unsafe.Slice/String/SliceData/StringData）
+
+## 为什么 uintptr 不能存
+
+GC 移动对象时只识别 unsafe.Pointer 类型；uintptr 在 GC 看来只是个数字，对象搬了 uintptr 还指向旧地址。
+
+```go
+// ❌ 错误
+addr := uintptr(unsafe.Pointer(&x))
+// GC 来了，x 可能搬家
+y := *(*int)(unsafe.Pointer(addr))  // 野指针
+
+// ✅ 算偏移要单语句完成
+y := *(*int)(unsafe.Pointer(uintptr(unsafe.Pointer(&x)) + 8))
+```
+
+## 1.20+ 安全工具
+
+```go
+unsafe.Slice(p, n)        // ptr → []T，自动加保活
+unsafe.SliceData(s)       // []T → ptr
+unsafe.String(p, n)
+unsafe.StringData(s)
+```
+
+## 何时不得不用
+
+- 序列化（避免拷贝大 buffer）
+- mmap 对接 C 结构
+- 极端性能场景的 string ↔ []byte
+
+## 一句话总结
+
+> 6 条规则记牢，uintptr 不能跨语句存；1.20+ 的 unsafe.Slice / String 比手写更安全。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/unsafe-pointer" data-base="../../"></script>
+</body>
+</html>

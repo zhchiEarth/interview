@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZooKeeper vs KRaft · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# ZooKeeper vs KRaft
+
+> 一句话：Kafka 把"存元数据 + 选 Controller"的活从外部的 ZooKeeper 收回到自己内部，用 Raft 协议让一组 Controller 节点自管元数据，故障恢复更快、扩展性更强、运维只剩一套系统。
+
+## 一、ZK 时代：ZooKeeper 在 Kafka 里干什么
+
+在 KRaft 之前，Kafka 集群**强依赖外部 ZooKeeper** 来管理集群状态：
+
+```text
+        ┌──────────────  ZooKeeper 集群  ──────────────┐
+        │  /brokers     broker 注册 & 存活感知           │
+        │  /topics      topic / partition / 副本分配     │
+        │  /controller  谁是 Controller（抢节点选举）     │
+        │  ISR、配置、ACL …                              │
+        └───────────────────────────────────────────────┘
+              ▲                          ▲
+              │ 注册 / watch              │ watch
+        ┌─────┴─────┐              ┌─────┴─────┐
+        │  Broker 1 │  ……          │  Broker N │
+        │（其中一个兼任 Controller）              │
+        └───────────┘              └───────────┘
+```
+
+- **存元数据**：broker 列表、topic / partition、副本分配、**ISR**、动态配置、ACL 等都写在 ZK 里。
+- **Controller 选举**：哪个 broker 当 Controller，靠**抢着创建 ZK 的 `/controller` 临时节点**决定，其余 broker watch 它。
+- **broker 注册与故障感知**：broker 启动时在 ZK 注册临时节点，会话断开（宕机）节点消失，集群据此感知上下线。
+
+---
+
+## 二、ZK 架构的四个问题
+
+| # | 问题 | 说明 |
+|---|---|---|
+| ① | **元数据规模有上限** | 分区数受 ZK 能承载的元数据量限制；分区一多，**watch 通知风暴**让 ZK 和 Controller 不堪重负 |
+| ② | **Controller 故障切换慢** | 新 Controller 上任要**从 ZK 全量拉取**所有元数据到内存再对外服务，集群越大恢复越慢 |
+| ③ | **运维两套系统** | 既要部署运维 Kafka，又要部署运维 ZooKeeper，监控、扩缩容、版本兼容都翻倍 |
+| ④ | **元数据传播有延迟** | 变更先写 ZK，再由 Controller 经 watch 感知、推送给各 broker，**多一跳、有延迟**，大规模下尤其明显 |
+
+```text
+ZK 模式元数据变更链路（多跳、有延迟）：
+  Controller 改元数据 → 写 ZK → ZK 触发 watch → Controller 感知
+       → Controller 逐个通知 broker（RPC）→ broker 更新本地缓存
+```
+
+---
+
+## 三、KRaft：把元数据管理收回 Kafka 自己
+
+**KRaft = Kafka Raft Metadata mode**。去掉 ZooKeeper，改用 **Raft 共识协议**，让**一组专门的 Controller 节点（quorum，仲裁组）**自己管理集群元数据。
+
+```text
+       ┌────────── Controller Quorum（Raft，奇数个，如 3 个）──────────┐
+       │   Active Controller（Raft Leader）                            │
+       │     ↑ 选举 / 复制                                              │
+       │   Standby Controller × 2（Raft Follower）                     │
+       │                                                               │
+       │   元数据 = 一个内部日志 topic：__cluster_metadata（事件日志）   │
+       └───────────────────────────────────────────────────────────────┘
+                         │ broker 像消费者一样"订阅"元数据日志
+              ┌──────────┼──────────┐
+          Broker 1   Broker 2   Broker N
+```
+
+- **没有外部 ZK**：选举、元数据存储全部内置。
+- **元数据本身就是一份日志**：所有元数据变更以**事件**形式追加进内部 topic **`__cluster_metadata`**。Active Controller 是 Raft Leader，写入这份日志并复制给其他 Controller。
+- **broker 像消费者一样追这份日志**：broker 不再被动等 Controller 一条条 RPC 通知，而是**主动拉取（replay）元数据日志**来更新本地缓存，传播更快、更一致。
+
+> 版本节点：**2.8 推出 KRaft 预览**；**3.3 起 KRaft 生产可用**；**3.5 起标记 ZooKeeper 进入废弃（deprecation）倒计时**；**4.0 正式移除 ZooKeeper**（仅支持 KRaft）。
+
+---
+
+## 四、KRaft 的好处
+
+- **故障恢复快**：新 Active Controller 直接基于已复制到本地的**元数据日志**继续服务，**无需从 ZK 全量拉取**，切换近乎秒级。
+- **扩展性强**：突破 ZK 的元数据瓶颈，官方目标支持**百万级分区**。
+- **运维更简单**：**单一系统**，不用再单独部署 / 监控 / 升级 ZooKeeper。
+- **元数据传播更快**：基于日志拉取的增量复制，取代 ZK watch + 逐个 RPC 的多跳模型。
+
+---
+
+## 五、对比表（一图记住差异）
+
+| 维度 | ZooKeeper 模式 | KRaft 模式 |
+|---|---|---|
+| **元数据存储** | 外部 ZooKeeper（znode 树） | 内部日志 topic `__cluster_metadata`（Raft 复制） |
+| **Controller 选举** | 抢建 ZK `/controller` 临时节点 | Controller quorum 内 **Raft 选举** Leader |
+| **扩展性** | 分区数受限、watch 风暴 | 支持**百万级分区** |
+| **故障恢复** | 新 Controller **全量拉取** ZK 元数据，慢 | 直接读本地元数据日志，**近乎秒级** |
+| **运维** | Kafka + ZK **两套系统** | **单一系统**，自包含 |
+| **元数据传播** | 写 ZK → watch → 逐个 RPC，多跳有延迟 | broker 拉取元数据日志，增量、低延迟 |
+
+> 关联阅读：Controller / Partition Leader 的选举与 Epoch 防脑裂见 [高可用：Controller 选举](election.html)；ISR / 副本同步见 [副本机制](replica.html)；全局视角见 [Kafka 知识地图](knowledge-graph.html)。
+
+---
+
+## 一句话总结
+
+> ZK 时代 ZooKeeper 负责**存元数据 + 选 Controller + 感知 broker**，但带来**规模上限、切换慢、两套系统、传播延迟**四大痛点；**KRaft（2.8 预览 / 3.3 生产可用 / 3.5 起废弃 ZK 倒计时 / 4.0 移除 ZK）**用 **Raft + Controller quorum** 把元数据收进内部日志 `__cluster_metadata`，换来**秒级故障恢复、百万级分区、单一系统、更快传播**。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/kraft" data-base="../"></script>
+</body>
+</html>

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>三种数据模型：Aggregate / Unique / Duplicate · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 三种数据模型：Aggregate / Unique / Duplicate
+
+> 一句话：Apache Doris 建表时**必须**先定义一组 **Key 列**和一种**数据模型**，模型决定了「**相同 Key 的多行数据如何处理**」——**Duplicate（明细模型）**原样全留、不聚合（Key 只当排序键）；**Aggregate（聚合模型）**把相同 Key 的 Value 列按建表指定的聚合函数（SUM/MAX/REPLACE/BITMAP_UNION 等）**预聚合**；**Unique（唯一模型）**保证 Key 唯一、新数据**覆盖**旧数据（upsert），本质是 Aggregate 的 REPLACE 特例，且自 1.2 起新建表默认走 **Merge-on-Write** 实现以换取接近明细模型的查询速度。
+
+> 本文以 **Apache Doris 2.x** 为基准（涉及 1.2 引入的特性会显式标注）。相关：[存储与数据划分：分区 / 分桶 / Tablet](storage.html)、[索引机制](index.html)、[物化视图与 Rollup](materialized-view.html)。
+
+## 一、为什么建表必须选「Key 列 + 数据模型」
+
+Doris 是列存分析型数据库，数据按 **Key 列排序**后存储。建表时除了字段定义，还要回答两个问题：
+
+1. **哪些列是 Key 列**——Key 列既是**排序键**，又承担**模型语义**（决定「相同」的判定）。
+2. **用哪种数据模型**——`DUPLICATE KEY` / `AGGREGATE KEY` / `UNIQUE KEY`，决定**相同 Key 的多行怎么合并**。
+
+```text
+              写入若干行（可能有相同 Key）
+                        │
+                        ▼
+            ┌──────────────────────────┐
+            │   相同 Key 的多行怎么办？    │  ← 由「数据模型」决定
+            └──────────────────────────┘
+              │            │            │
+         DUPLICATE     AGGREGATE      UNIQUE
+        全部保留       按函数聚合      覆盖（保留最新）
+        (不合并)       (SUM/MAX..)    (upsert)
+```
+
+> 记忆钩子：**Key 列是「排序 + 怎么算相同」的双重身份**；模型则是「相同了之后怎么处理」。三模型的区别，本质就是对「相同 Key 多行」的三种处理策略：**留全部 / 算合计 / 取最新**。
+
+## 二、Duplicate 明细模型
+
+**不做任何聚合，原样保留写入的每一行。** Key 列在这里**只起排序作用**（叫 `DUPLICATE KEY`，相同 Key 的行不会被合并、不会被去重）。
+
+```sql
+-- 明细模型：日志/埋点等需要保留每条原始记录的场景
+CREATE TABLE log_detail (
+    log_time  DATETIME,
+    user_id   BIGINT,
+    url       VARCHAR(512),
+    status    INT,
+    cost_ms   INT
+)
+DUPLICATE KEY(log_time, user_id)   -- 仅作排序键，不去重不聚合
+DISTRIBUTED BY HASH(user_id) BUCKETS 10
+PROPERTIES ("replication_num" = "3");
+```
+
+- 写入的两行即使 `(log_time, user_id)` 完全相同，也**各自独立保留**。
+- 适合**日志、明细、埋点**等「需要看到每一条原始数据」的场景。
+- 查询最灵活：可任意维度过滤/聚合，但不享受预聚合加速（明细量大时靠分区裁剪 + 索引提速，见 [存储与数据划分：分区 / 分桶 / Tablet](storage.html)、[索引机制](index.html)）。
+
+> 注意：Doris 2.x 起明细模型可以**不指定 Key 列**（系统按列顺序选前若干列作排序键，或建为无排序列的明细表）。但 Key 列仍是排序键，决定了数据的物理有序性与前缀过滤效率。
+
+## 三、Aggregate 聚合模型
+
+**相同 Key 的多行，其 Value 列会按建表时为每列指定的聚合函数「预聚合」**——导入与后台 Compaction 阶段就把相同 Key 合并掉，只保留聚合后的结果。
+
+```sql
+-- 聚合模型：报表/指标，写入即预聚合
+CREATE TABLE site_visit (
+    dt        DATE,
+    page_id   INT,
+    city      VARCHAR(32),
+    pv        BIGINT      SUM      DEFAULT "0",   -- 累加
+    uv        BITMAP      BITMAP_UNION,           -- 精确去重（bitmap 并）
+    max_cost  INT         MAX,                    -- 取最大
+    last_ref  VARCHAR(64) REPLACE                 -- 取最后写入值
+)
+AGGREGATE KEY(dt, page_id, city)   -- 维度列即 Key
+DISTRIBUTED BY HASH(page_id) BUCKETS 10
+PROPERTIES ("replication_num" = "3");
+```
+
+聚合模型里，列分两类：
+
+- **Key 列**：维度（`dt, page_id, city`），相同 Key 的行会被合并。
+- **Value 列**：指标，**每列都必须声明聚合函数**。
+
+常用聚合函数：
+
+| 函数 | 含义 | 典型用途 |
+|---|---|---|
+| **SUM** | 累加 | PV、订单金额、计数 |
+| **MAX / MIN** | 取最大 / 最小 | 峰值、最早/最晚时间 |
+| **REPLACE** | 用新值覆盖旧值（取最后写入） | 维度属性、状态 |
+| **REPLACE_IF_NOT_NULL** | 新值非 NULL 才覆盖（NULL 不覆盖） | 部分列更新、避免 NULL 冲掉旧值 |
+| **HLL_UNION** | HyperLogLog 并集（近似去重计数） | 近似 UV，省空间 |
+| **BITMAP_UNION** | Bitmap 并集（精确去重计数） | 精确 UV、留存等 |
+
+- 适合**报表、指标看板**等「只关心聚合结果、不关心明细」的场景：导入即预聚合，**省存储、查询快**。
+- 代价：**丢失明细**（合并后看不到原始行），且查询的聚合方式必须与建表声明匹配才能直接用预聚合结果。
+- 进阶提速可建 Rollup / 物化视图按更粗维度再预聚合，见 [物化视图与 Rollup](materialized-view.html)。
+
+> 注意：HLL / BITMAP 这类去重计数列，写入时需用对应函数（如 `to_bitmap()`、`hll_hash()`）加工，查询时用 `bitmap_union_count` / `approx_count_distinct` 等取结果。
+
+## 四、Unique 唯一模型
+
+**保证 Key 唯一：相同 Key 的新数据覆盖旧数据（upsert 语义）。** 它本质上是**聚合模型里所有 Value 列都用 REPLACE 的特例**——所以 Doris 内部可以用聚合框架来实现它。
+
+```sql
+-- 唯一模型：有主键、需要按主键更新/覆盖的业务表
+CREATE TABLE user_profile (
+    user_id   BIGINT,
+    name      VARCHAR(64),
+    level     INT,
+    update_at DATETIME
+)
+UNIQUE KEY(user_id)   -- user_id 唯一，新写入覆盖旧行
+DISTRIBUTED BY HASH(user_id) BUCKETS 10
+PROPERTIES (
+    "replication_num" = "3",
+    "enable_unique_key_merge_on_write" = "true"  -- 1.2+ 新建表默认即为 MoW
+);
+```
+
+唯一模型有**两种实现方式**，是面试高频点：
+
+### 4.1 Merge-on-Read（MoR，旧实现）
+
+- 写入只追加新版本，**不处理旧版本**——写入快、写放大小。
+- 查询时需要**读取多个版本并在读路径合并**（按 Key 取最新版本），相同 Key 多版本越多、查询越慢。
+- 因为读时要合并，**无法充分利用谓词下推/部分索引**，查询性能弱于明细模型。
+
+### 4.2 Merge-on-Write（MoW，1.2+ 新建表默认）
+
+- 写入时就用 **delete bitmap** 标记被本次写入覆盖的**旧行**（在旧 rowset 里打删除标记）。
+- 读取时旧版本已被标记删除，**几乎不需要在读路径做合并** → **查询性能接近 Duplicate 明细模型**。
+- 代价：**写放大更大**（写入时要定位旧行、维护 delete bitmap），写入吞吐略低于 MoR。
+
+```text
+                MoR（读时合并）              MoW（写时标记）
+写入            只追加新版本，快             定位旧行 + 写 delete bitmap，较重
+旧版本          全部留着，读时挑最新         写入时即被 bitmap 标记为删除
+查询            读多版本 + 合并 → 慢         旧版本已被标记，几乎不合并 → 快
+适合            写多读少、能接受读慢          读多写少、要求查询快（默认推荐）
+```
+
+> 记忆钩子：**MoR「写时偷懒、读时还债」，MoW「写时多干、读时省事」。** 1.2+ 新建唯一表**默认 MoW**，是 Doris 把 upsert 表查询性能拉到接近明细模型的关键。可通过 `enable_unique_key_merge_on_write` 控制（建表时确定，已建表不可随意切换）。
+
+- 适合**有主键、需要按主键更新/覆盖**的业务场景（如订单状态表、用户画像）。
+- MoW 下还支持**部分列更新（partial update）**，无需读全行即可只更新部分列。
+
+## 五、三模型横向对比
+
+| 维度 | Duplicate 明细 | Aggregate 聚合 | Unique 唯一 |
+|---|---|---|---|
+| **是否聚合** | 否，全部保留 | 是，按列指定函数预聚合 | 否（语义上=全列 REPLACE） |
+| **能否按 Key 更新** | 不能（只追加） | 间接（REPLACE 列覆盖） | **能（upsert，按主键覆盖）** |
+| **Key 列作用** | 仅排序键 | 排序键 + 聚合维度 | 排序键 + 唯一约束 |
+| **保留明细** | 是 | **否**（合并后丢明细） | 否（只留最新版本） |
+| **查询性能** | 高（直接扫明细） | 高（命中预聚合） | MoR 较慢 / **MoW 接近明细** |
+| **写入开销** | 低 | 中（导入即聚合） | MoR 低 / MoW 较高（写放大） |
+| **典型场景** | 日志、埋点、明细 | 报表、指标看板 | 有主键的业务表、画像 |
+| **建表关键字** | `DUPLICATE KEY(...)` | `AGGREGATE KEY(...)` + Value 列函数 | `UNIQUE KEY(...)` |
+
+三段最小建表示例放一起对照：
+
+```sql
+-- Duplicate：Key 仅排序，不去重不聚合
+CREATE TABLE t_dup (k1 INT, k2 INT, v1 INT, v2 VARCHAR(32))
+DUPLICATE KEY(k1, k2)
+DISTRIBUTED BY HASH(k1) BUCKETS 8;
+
+-- Aggregate：Value 列必须声明聚合函数
+CREATE TABLE t_agg (k1 INT, k2 INT, v1 BIGINT SUM, v2 INT MAX)
+AGGREGATE KEY(k1, k2)
+DISTRIBUTED BY HASH(k1) BUCKETS 8;
+
+-- Unique：Key 唯一，新数据覆盖旧（默认 MoW）
+CREATE TABLE t_uniq (k1 INT, k2 INT, v1 INT, v2 VARCHAR(32))
+UNIQUE KEY(k1, k2)
+DISTRIBUTED BY HASH(k1) BUCKETS 8;
+```
+
+> 选型口诀：**要看每条明细 → Duplicate；只要聚合指标、省存储 → Aggregate；有主键要 upsert → Unique（默认 MoW）。**
+
+## 六、Key 列的双重作用（贯穿三模型）
+
+不论哪种模型，**Key 列都同时承担两个角色**：
+
+```text
+Key 列
+ ├─ 排序键：数据在 Segment 内按 Key 有序存放
+ │          → 前缀列等值/范围查询可走前缀索引、加速过滤
+ └─ 模型语义：
+      Duplicate → 只排序，不影响合并
+      Aggregate → 决定「哪些行算同一组」去聚合
+      Unique    → 决定「哪些行算同一主键」去覆盖
+```
+
+因此 **Key 列的选择**既影响查询过滤效率（前缀有序），又影响数据合并语义——是建表设计的核心决策。排序/前缀索引细节见 [索引机制](index.html)。
+
+## 一句话总结
+
+> Doris 建表必须定义 **Key 列 + 数据模型**，模型决定「相同 Key 多行如何处理」：**Duplicate** 全保留、Key 仅排序，适合日志明细；**Aggregate** 按列指定函数（SUM/MAX/MIN/REPLACE/REPLACE_IF_NOT_NULL/HLL_UNION/BITMAP_UNION 等）预聚合，省存储查询快，适合报表指标但丢明细；**Unique** 保证主键唯一、新数据覆盖旧（upsert），本质是全列 REPLACE 的 Aggregate 特例，有 **MoR（读时合并、查询慢）** 与 **MoW（1.2+ 默认，写时用 delete bitmap 标记旧行，查询接近明细模型、代价是写放大）** 两种实现。Key 列始终是「排序键 + 模型语义」的双重身份。延伸见 [存储与数据划分：分区 / 分桶 / Tablet](storage.html)、[索引机制](index.html)、[物化视图与 Rollup](materialized-view.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/data-model" data-base="../"></script>
+</body>
+</html>

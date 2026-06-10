@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>物化视图与 Rollup · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 物化视图与 Rollup
+
+> 一句话：物化视图（MV）和 Rollup 都是**空间换时间**——把昂贵的聚合 / join 结果**预先算好存下来**；用户照常查 base 表，**优化器自动判断能否改写到代价更低的预计算结构**（透明改写），命中就快好几个数量级。
+
+> 本文基准 **Apache Doris 2.x**；异步物化视图（async MV）为 **2.1+** 引入。相关：[Doris 索引机制](index.html)、[三种数据模型](data-model.html)、[查询执行](query.html)。
+
+## 一、为什么需要预计算
+
+OLAP 查询常是"对一张大宽表反复做相同维度的聚合"，比如每天按城市、按渠道统计销售额。每来一次查询都从几亿行明细现算，既慢又浪费。预计算的思路：
+
+```text
+没有预计算: 每次查询 → 扫几亿行明细 → 现场 GROUP BY 聚合      (慢)
+有预计算  : 提前把「按城市的销售额」算好存成一份小表
+            查询时优化器发现能用它 → 直接读这份小结果         (快)
+```
+
+Doris 提供三种预计算结构，能力从弱到强：**Rollup → 同步物化视图(sync MV) → 异步物化视图(async MV)**。它们共享同一个核心机制——**查询自动路由 / 透明改写**。
+
+## 二、查询自动改写（路由）——三者的共同灵魂
+
+关键点：**用户永远查 base 表，不需要、也不应该在 SQL 里手写视图名**。优化器（CBO）在生成执行计划时，会判断：这条查询要的列 / 聚合，能不能用某个已有的预计算结构等价地、更便宜地算出来？能就**自动改写**过去，并在多个候选里挑**代价最小**的那个。
+
+```text
+SELECT city, SUM(amount) FROM sales GROUP BY city;   -- 用户写的是 base 表 sales
+
+优化器:
+  候选0: 直接扫 base 表 sales(几亿行)              代价高
+  候选1: 用 rollup r_city(已按 city 预聚合,几千行)  代价低  ✅ 选它
+  → 改写后实际读 r_city,结果完全等价
+```
+
+判断"是否命中"可看 `EXPLAIN`——计划里实际访问的表 / rollup 名就能看出走没走预计算（详见[查询执行](query.html)）。
+
+## 三、Rollup —— 最早、最基础的派生预聚合表
+
+**Rollup 是基于 base 表的一份"派生表"**：你从 base 表里**挑部分列**，可以**重新指定 Key（排序）顺序**，并按聚合模型做**预聚合**，Doris 据此额外维护一份数据。
+
+它解决两类问题：
+
+1. **固定维度组合的预聚合报表**：把常用的"按某些维度 SUM/COUNT"提前算好；
+2. **换一套排序前缀**：base 表的前缀索引只有一种 Key 顺序（见[Doris 索引机制](index.html)），建一个**调整了 Key 列顺序**的 rollup，就等于多了一份不同最左前缀的索引，让另一类过滤也能走前缀。
+
+```sql
+-- base 表(聚合模型): 明细维度多
+-- 建一个按 city 预聚合的 rollup
+ALTER TABLE sales ADD ROLLUP r_city (city, amount);
+--                              ▲ 选列+重排Key; amount 按 base 的 SUM 聚合预聚合
+
+-- 用户照常查 base, 命中则自动走 r_city
+SELECT city, SUM(amount) FROM sales GROUP BY city;
+```
+
+特点：**单表**；数据导入时随 base 表**同步更新、强一致**；查询命中时优化器自动选**代价最小**的 rollup。局限：只能做"选列 + 重排 + 聚合"，**不能带复杂表达式、不能跨表 join**。
+
+## 四、同步物化视图（sync MV）—— Rollup 的增强
+
+**sync MV 本质是 rollup 的加强版**，仍是**单表**、数据导入时**同步更新、强一致**，但表达能力更强：可以带**部分聚合函数、列表达式**（如 `SUM(a*b)`、`bitmap_union` 精确去重、`COUNT(DISTINCT)` 的近似等），不再局限于"原样选列再聚合"。
+
+```sql
+-- 在单表上建同步物化视图
+CREATE MATERIALIZED VIEW mv_city_uv AS
+SELECT city,
+       SUM(amount)           AS total_amt,
+       bitmap_union(to_bitmap(user_id)) AS uv_bitmap   -- 预计算精确去重
+FROM sales
+GROUP BY city;
+
+-- 查询命中自动改写
+SELECT city, SUM(amount), COUNT(DISTINCT user_id) FROM sales GROUP BY city;
+```
+
+可以这么记：**Rollup 是 sync MV 的一个子集**（Doris 内部很大程度统一了二者的实现）。sync MV / rollup 的最大卖点是**强一致**——每次导入都同步刷新，查到的永远是最新数据；代价是**只能单表**、写入会带上维护开销。
+
+## 五、异步物化视图（async MV，2.1+）—— 跨表、可刷新、透明改写
+
+这是 2.1 引入的能力，补齐了 sync MV 的两大短板：
+
+- **数据源可以是多表 join、复杂查询**（子查询、多层聚合等），不再限于单表；
+- **刷新是异步的**：按**定时调度**或**手动**触发刷新，因此**不是强一致**（与 base 表存在刷新间隔内的延迟）；支持**分区级增量刷新**，只刷有变化的分区，省资源；
+- 同样支持**透明改写**：即使用户查的是 base 表（而非 MV 名），优化器也能自动判断并用上这个 async MV。
+
+```sql
+CREATE MATERIALIZED VIEW mv_order_user
+BUILD IMMEDIATE
+REFRESH AUTO ON SCHEDULE EVERY 1 HOUR     -- 异步: 每小时刷新一次(非强一致)
+AS
+SELECT u.city, o.product_id, SUM(o.amount) AS amt
+FROM orders o JOIN users u ON o.user_id = u.id   -- 多表 join,sync MV 做不到
+GROUP BY u.city, o.product_id;
+
+-- 用户查 base 表的 join, 优化器可透明改写到上面的 MV
+SELECT u.city, SUM(o.amount)
+FROM orders o JOIN users u ON o.user_id = u.id
+GROUP BY u.city;
+```
+
+权衡：**异步 = 牺牲实时一致性，换来跨表预计算与刷新的灵活**。适合对延迟不敏感、但 join/聚合很重的看板、报表场景。
+
+## 六、对比表（Rollup / sync MV / async MV）
+
+| 维度 | Rollup | 同步物化视图 sync MV | 异步物化视图 async MV（2.1+） |
+|---|---|---|---|
+| 数据源 | **单表** | **单表** | **多表 join / 复杂查询** |
+| 表达能力 | 选列 + 重排 Key + 预聚合 | + 部分聚合函数 / 列表达式 | 几乎任意 SELECT（join、子查询、多级聚合） |
+| 刷新方式 | 导入时**同步** | 导入时**同步** | **异步**（定时调度 / 手动触发，可分区增量） |
+| 一致性 | **强一致** | **强一致** | **非强一致**（有刷新延迟） |
+| 自动改写 | 支持（自动选最小代价） | 支持 | 支持（**透明改写**，查 base 表也能用上） |
+| 典型场景 | 固定维度报表、换排序前缀加速过滤 | 单表预聚合 + 精确去重 / 表达式 | 跨表宽表看板、重 join/聚合的离线报表 |
+
+记忆主线：
+
+```text
+能力递增:  Rollup ⊂ sync MV(都单表、强一致、同步)  <  async MV(多表、异步、非强一致)
+共同点:    用户都查 base 表,优化器「自动改写」到代价最小的预计算结构
+取舍:      要强一致 → sync 系(单表);  要跨表/复杂 → async(放弃强一致)
+```
+
+## 一句话总结
+
+> 物化视图与 Rollup 是 Doris 的**空间换时间**：预计算结果存下来，用户照常查 base 表，**优化器自动改写**到代价最小的预计算结构。**Rollup** 是单表派生预聚合表（选列 + 重排 Key + 预聚合，**同步、强一致**，还能当"另一套排序前缀"加速过滤）；**同步物化视图（sync MV）** 是 Rollup 的增强（仍**单表、同步、强一致**，可带聚合函数 / 表达式 / 精确去重）；**异步物化视图（async MV，2.1+）** 支持**多表 join / 复杂查询**，**定时或手动异步刷新（非强一致）**，并支持**透明改写**（查 base 表也能自动用上）。选型：要实时强一致用 sync 系（单表），要跨表复杂预计算就用 async（接受刷新延迟）。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="doris/materialized-view" data-base="../"></script>
+</body>
+</html>

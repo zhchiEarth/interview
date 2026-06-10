@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>range 的坑 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# range 的坑 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **range 在循环开始前就把表达式求值并拷贝 header**（长度/header 锁定，但 `s[_i]` 仍按当前内存读），每轮的 **v 也是元素拷贝**。记 7 坑：**①拷贝非引用 ②循环变量复用(1.22 修) ③map 顺序随机 ④边改 map 未定义 ⑤边改 slice 用旧 header ⑥chan 等 close 才退 ⑦string 的 i 是字节索引、r 是 rune**。
+
+记不全时，按这条**记忆主线：一个求值模型 + 七个坑 + 1.22/1.23 升级**展开（详细推演看[正文](range-gotchas.html)）：
+
+---
+
+## 🧩 一个模型 —— "开始时求值并保存"
+
+```go
+// for i, v := range s 等价于:
+_s := s; _len := len(_s)          // 拷 header + 锁定长度
+for _i := 0; _i < _len; _i++ {
+    i, v := _i, _s[_i]            // v 是元素拷贝; _s[_i] 按当前内存读
+}
+```
+- 长度与 header 开始时定 → 循环内 `append(s,...)` 不影响本次循环；但**改元素值能被看到**。
+- map / chan 无"固定长度"概念，行为不同（见坑 3/4/6）。
+
+## ⚠️ 七个坑
+
+```text
+① 值拷贝非引用 → 大 struct 每轮拷贝, 且改的是副本
+   修: for i := range arr { arr[i].field=9; process(&arr[i]) }
+② 循环变量复用: 1.21- 闭包/取址全指同一个 v(都=3); 1.22+ 每轮独立
+   老项目修: v := v (任何版本安全); 依赖新行为 go.mod 写 go 1.22
+③ map 顺序随机(runtime 故意打乱) → 抽 key 排序:
+   sort.Strings(keys) 或 1.23: slices.Sorted(maps.Keys(m))
+④ 边遍历边改 map: 删当前 key 合法; 新增 key spec 未定义; 改 value 一般没事
+   修: 先收集 toAdd/toDel, 循环后批量改
+⑤ 边遍历边改 slice: append 用开始时拷的 header, 不影响本次(不会死循环)
+   真要变长度: for i:=0; i<len(s); i++ (len 每轮求值)
+⑥ range chan: 必须等 close 才退出, 没 close → 永远阻塞
+   修: 发送方 defer close(ch)
+⑦ range string: i 是字节索引(é 占 2 字节, i 会跳), r 是 rune(int32, 解码 UTF-8)
+   要 byte 用 s[i] (uint8, 不解码)
+```
+
+## 🆕 1.22 / 1.23 升级
+
+```text
+1.22: 循环变量每轮独立(修坑②) + range over int → for i := range 5 (0..4)
+1.23: range over func → iter.Seq, yield(v) 返 false 即停 (迭代器做成语言原语)
+```
+- 性能：`for i := range s` 等价 `for i:=0;i<len(s);i++`；取值版 `for i,v` 每轮拷贝 v，**大对象集合用 `for i := range` 免拷贝**。
+- checklist：改元素值/大对象→`for i := range`；闭包捕获→1.22+ 安全否则 `v:=v`；map 要顺序→抽 key 排序；边改 map→收集批量改；range chan→确保会 close。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/range-gotchas-memo" data-base="../../"></script>
+</body>
+</html>

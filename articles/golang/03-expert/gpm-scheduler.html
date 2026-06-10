@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go语言的GPM调度器是什么? · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Go语言的GPM调度器是什么?
+
+> GPM 是 Go 运行时的**协程调度器**：把海量 goroutine（G）调度到少量 OS 线程（M）上跑，中间用调度位（P）持有**无锁本地队列**。一句话——**G 是任务、M 是工人、P 是工位**，M 必须占一个 P 才能干活。它实现了 **M:N 调度**：n 个协程复用 m 个线程。
+
+## 一、它解决什么问题：M:N 调度
+
+| | OS 线程 | goroutine |
+|---|---|---|
+| 栈 | 1~8MB 固定 | **2KB 起，动态扩缩**（最大 1GB）|
+| 创建 / 切换 | 陷内核，μs 级 | 用户态，~100ns（只换寄存器）|
+| 撑得住的数量 | 几千就吃力 | **几十万轻松** |
+
+"一个 goroutine 一个线程"会被线程数量直接压垮（10 万线程 = 几十 GB 栈 + 切换风暴）。GPM 做 **M:N**：少量 M 复用，海量 G 排队，调度器决定「哪个 M 此刻跑哪个 G」。
+
+> 历史：Go 1.0 只有 G、M + 一个全局队列（GM 模型），全局锁是瓶颈；**1.1 引入 P** 把队列本地化、消锁，才成了今天的 GMP。
+
+---
+
+## 二、三个角色：G / M / P
+
+### G（goroutine）—— 要执行的任务
+
+```go
+type g struct {
+    stack        stack   // 栈区间 [lo, hi]，2KB 起、可增长
+    sched        gobuf   // 切换现场：sp/pc/bp（让出时存、恢复时取）
+    atomicstatus uint32  // 状态机
+    m            *m      // 当前在哪个 M 上
+    goid         int64
+}
+```
+
+切换 G = 把寄存器存进 `sched`（gobuf）/ 再从 `sched` 恢复，**极廉价**。状态机关键几态：
+
+```text
+_Grunnable  在队列里等跑
+_Grunning   正在某 M 上执行
+_Gwaiting   阻塞中（channel/锁/netpoll），不在队列
+_Gsyscall   在系统调用里
+_Gdead      已结束 / 空闲待复用
+```
+
+### M（machine）—— 真正上 CPU 的 OS 线程
+
+```go
+type m struct {
+    g0       *g       // 调度专用 goroutine（系统栈）
+    curg     *g       // 当前在跑的用户 G
+    p        puintptr // 绑定的 P
+    spinning bool     // 是否在自旋找活
+}
+```
+
+- **g0**：每个 M 有个特殊的 g0，**调度器代码本身跑在 g0 的栈上**。"跑用户 G ↔ 跑调度逻辑" 就是在 `curg` 和 `g0` 之间切栈。
+- M 必须**先持有一个 P** 才能执行用户 G。
+
+### P（processor）—— 调度位 / 逻辑 CPU
+
+```go
+type p struct {
+    status   uint32
+    runq     [256]guintptr // 本地运行队列（环形，无锁）
+    runqhead uint32
+    runqtail uint32
+    runnext  guintptr      // 下一个优先跑的 G（单槽，缓存最热）
+    mcache   *mcache       // 本地内存分配缓存
+}
+```
+
+- **数量 = `GOMAXPROCS` = CPU 核数**：同时刻最多这么多 G 真并行。
+- 本地队列 256 槽，head/tail 原子操作 → **入队出队无锁**（99% 的调度走这）。
+- 还挂着 [mcache](memory-allocator.html)——内存分配也按 P 本地化、无锁。
+
+### 三者关系
+
+```text
+   P0(工位)        P1            P2          ← 共 GOMAXPROCS 个
+   runnext: G      runnext: -    runnext: G
+   runq: [G G G]   runq: [G G]   runq: [G]
+     ▲               ▲             ▲
+    M0(工人)        M1            M2          ← M 数量不定，占到 P 才能干活
+        全局队列 sched.runq [G G …]  （所有 P 共享，有锁，兜底）
+```
+
+---
+
+## 三、调度循环：一个 M 怎么转起来
+
+M 启动后进入一个**死循环**（跑在 g0 栈上）：
+
+```text
+schedule():
+  g = findrunnable()      // 找一个可运行 G（找不到就阻塞休眠，直到有活）
+  execute(g):
+     g.status = _Grunning
+     gogo(&g.sched)       // 切到 g 的栈和 PC，开始/恢复执行
+  ── 用户 G 跑 ──
+  G 阻塞 / 让出 / 结束 → mcall 切回 g0 → 回到 schedule() 顶部
+```
+
+「跑调度」和「跑用户代码」在**两个栈**之间来回切：
+
+```text
+        ┌──────────────── M（OS 线程）─────────────────┐
+        │                                               │
+   在 g0 栈跑调度逻辑              在 curg 栈跑用户代码
+   schedule()/findrunnable  ─── gogo ───►   你的 goroutine 执行
+        ▲                                       │
+        └──── mcall（G 阻塞 / 让出 / 结束）◄──────┘
+
+  "进调度" = 切到 g0 栈；"去干活" = 切到某个 G 的栈
+```
+
+核心是 `findrunnable()` 的**五级查找**：
+
+| 顺序 | 来源 | 说明 |
+|---|---|---|
+| 1 | `runnext` → 本地 `runq` | 单槽 + 256 槽，**无锁**。channel 唤醒的 G 进 runnext，缓存最热 |
+| 2 | 全局队列 | 加 `sched.lock`；且**每调度 61 次强制先查一次全局**（防全局队列饿死）|
+| 3 | netpoll | 非阻塞拿 epoll 就绪的网络 / 定时器 G（见 [netpoller](netpoller.html)）|
+| 4 | **work-steal** | 随机选另一个 P，偷它本地队列的**一半**；最多 4 轮，末轮还偷 runnext / 查 timer |
+| 5 | 都没有 | 释放 P、M 休眠（`stopm`），等被唤醒 |
+
+- **work stealing**：随机起点避免所有空闲 M 扑向同一个 P；偷"一半"是为了让被偷的 P 之后还有活、降低再偷频率。
+
+```text
+   M0 的 P0 空了        随机挑中 P1（有 6 个 G）
+   runq: [   空   ]     runq: [G G G G G G]
+        │                      │
+        └──── 偷走一半(3 个)───┘
+   偷后  P0: [G G G]     P1: [G G G]   ← 两边均衡，谁都不必马上再偷
+```
+- **spinning M（自旋）**：找不到活的 M 不立刻睡，**先自旋一会儿**找活——唤醒/新建线程要 μs 级，自旋更便宜。自旋 M 数受限（约 ≤ GOMAXPROCS/2）。有新 G 就绪且已有自旋 M 时，就不必再唤醒新线程。
+
+---
+
+## 四、goroutine 怎么交出 CPU：让出与抢占
+
+### ① 主动让出
+
+- channel / 锁 / select 阻塞 → `gopark`：G 置 `_Gwaiting`、与 M 解绑，M 回 `schedule()` 跑别人；条件满足时 `goready` 唤醒它。
+- `runtime.Gosched()`：主动让出，G 重新入全局队列。
+
+### ② 协作式抢占（Go 1.13 及以前）
+
+编译器在**每个函数序言**插了栈增长检查；runtime 想抢占时把 G 的 `stackguard0` 设成特殊值，下次函数调用触发检查 → 顺便发现抢占标志 → 让出。
+
+**致命缺陷**：
+
+```go
+for { /* 循环体里没有任何函数调用 */ }   // 永远到不了抢占点
+// → Go 1.13- 这个 G 把整个 P 锁死，别人没法跑
+```
+
+### ③ 异步抢占（Go 1.14+，关键改进）
+
+```text
+G 跑死循环（无函数调用，协作式抢占够不着它）
+        │
+   sysmon 发现它已跑 > 10ms
+        │ preemptM
+        ▼
+   给 G 所在的 M 发 SIGURG 信号 ──── 强行打断线程 ────┐
+        │                                            ▼
+   信号处理函数 sighandler 在安全点把 asyncPreempt 注入执行流
+        │
+        ▼
+   保存全部寄存器现场 → mcall 切回 g0 → schedule() → 换别的 G 跑
+```
+
+**为什么用信号**：信号能**强行打断**正在跑的线程，不依赖 G 主动调用函数——**死循环也能被抢占**。这是 Go 调度从"半协作"迈向"真抢占"的标志。
+
+---
+
+## 五、阻塞不卡线程：syscall 与网络
+
+G 阻塞分两类，各有专门机制，绝不让一个慢阻塞拖死 M/P：
+
+- **阻塞 syscall**（文件 IO、cgo…）→ **hand-off**：sysmon 把 P 从陷在内核的 M 上摘走、交给别的 M，P 上其他 G 照跑。详见 [syscall hand-off](syscall-handoff.html)。
+- **网络 / 定时器** → **netpoll**：fd 非阻塞 + epoll，G 挂到 epoll 上、**不占线程**，就绪再唤醒。详见 [netpoller](netpoller.html)。
+
+---
+
+## 六、sysmon：不绑 P 的后台监工
+
+一个独立线程，不占用 P，专管「兜底」：
+
+- `retake`：① P 处于 `_Psyscall` 太久 → hand-off；② G 跑 >10ms → 异步抢占
+- 触发 **netpoll**（捞网络就绪 G）、**forcegc**（兜底 GC）、**scavenge**（还内存给 OS）
+- 自身**指数退避**调度：20μs 起步，最多 10ms
+
+---
+
+## 七、面试常追的几个"为什么"
+
+- **为什么 P 数 = GOMAXPROCS？** 同时刻最多核数个线程能真并行；P 数 = 核数 → 每核一个工位、缓存友好，又天然把并行度限制住。
+- **runnext 单槽干嘛用？** channel / 网络唤醒的 G 放这，**下一个就跑**——这类 G 往往正被别人等着、且缓存最热，优先它能降延迟。
+- **61 这个数？** 防止只盯本地队列导致全局队列里的 G 饿死，每 61 次调度强制查一次全局。
+- **自旋 M 为什么值得？** 线程睡/醒走内核 μs 级，短暂自旋等活更便宜；但自旋烧 CPU，所以限制数量。
+- **调度何时发生？** 主动 `Gosched` / 阻塞 gopark / syscall 返回 / 被异步抢占 / GC 需要 STW——这几个时机都会回到 `schedule()`。
+
+---
+
+## 八、状态机速查
+
+```text
+G:  _Grunnable → _Grunning →（_Gwaiting / _Gsyscall）→ _Grunnable → _Gdead
+P:  _Pidle ↔ _Prunning ↔ _Psyscall（M 进 syscall）/ _Pgcstop（GC STW）
+M:  自旋找活 ↔ 跑 G ↔ stopm 休眠
+```
+
+---
+
+## 九、一图总览 + 必记数字
+
+```text
+        全局队列 sched.runq （有锁，兜底）
+                  ↑↓
+   P0           P1           P2        ← GOMAXPROCS 个工位
+ runnext+runq    …            …
+   ↑M0          ↑M1          ↑M2       ← M 占到 P 才能跑 G
+        ↑ netpoll  (epoll 就绪的网络 G)
+        ↑ sysmon   (10ms 异步抢占 / 20μs hand-off / GC / 还内存)
+```
+
+```text
+2KB   G 初始栈         256  P 本地队列容量
+61    每 61 次查全局     10ms 异步抢占阈值     20μs sysmon 起步退避
+GOMAXPROCS = P 数 = 核数
+```
+
+> **GPM = G(任务) + M(线程) + P(工位)**：M 占 P 跑 G，本地队列无锁、work-steal 均衡负载、全局队列兜底；syscall 用 hand-off、网络用 netpoll 让阻塞不卡线程；sysmon 后台监工 + 异步抢占（SIGURG）保证连死循环都能被打断。这套就是 Go「几十万协程随便起」的底座。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/gpm-scheduler" data-base="../../"></script>
+</body>
+</html>

@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GMP 速记卡</title>
+<style>
+  :root {
+    --bg: #fafaf7;
+    --surface: #ffffff;
+    --border: #e8e4d8;
+    --text: #1a1a17;
+    --muted: #6b6961;
+    --hint: #9a978e;
+    --g-bg: #e1f5ee; --g-text: #085041; --g-border: #5dcaa5;
+    --m-bg: #e6f1fb; --m-text: #0c447c; --m-border: #85b7eb;
+    --p-bg: #faeeda; --p-text: #633806; --p-border: #ef9f27;
+    --accent-bg: #faece7; --accent-text: #712b13;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a17; --surface: #242420; --border: #3a3a35;
+      --text: #e8e4d8; --muted: #a8a59c; --hint: #6b6961;
+      --g-bg: #0a3a2d; --g-text: #9fe1cb;
+      --m-bg: #0a2845; --m-text: #b5d4f4;
+      --p-bg: #3d2a08; --p-text: #fac775;
+      --accent-bg: #3a1d10; --accent-text: #f5c4b3;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 80px;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.7; font-size: 15px;
+  }
+  .container { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 28px; font-weight: 500; margin: 0 0 4px; letter-spacing: -0.5px; }
+  .subtitle { color: var(--muted); margin: 0 0 40px; font-size: 14px; }
+  h2 {
+    font-size: 13px; font-weight: 500; color: var(--hint);
+    text-transform: uppercase; letter-spacing: 1.5px; margin: 48px 0 16px;
+  }
+  .core {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px 32px; font-size: 18px; line-height: 1.9;
+  }
+  .core p { margin: 0; padding: 6px 0; }
+  .tag {
+    display: inline-block; padding: 2px 10px; border-radius: 4px;
+    font-weight: 500; font-size: 17px; margin-right: 4px;
+  }
+  .tag-g { background: var(--g-bg); color: var(--g-text); }
+  .tag-m { background: var(--m-bg); color: var(--m-text); }
+  .tag-p { background: var(--p-bg); color: var(--p-text); }
+  .diagram {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px;
+  }
+  .global-queue {
+    background: var(--g-bg); border: 1px dashed var(--g-border);
+    border-radius: 8px; padding: 12px 16px; text-align: center;
+    margin-bottom: 8px; color: var(--g-text); font-size: 13px;
+  }
+  .arrow { text-align: center; color: var(--hint); margin: 4px 0; font-size: 18px; }
+  .diagram-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-top: 8px;
+  }
+  .p-column {
+    background: var(--p-bg); border: 1px solid var(--p-border);
+    border-radius: 8px; padding: 14px; text-align: center;
+  }
+  .p-name { font-weight: 500; color: var(--p-text); font-size: 16px; margin-bottom: 8px; }
+  .local-q {
+    background: var(--g-bg); border-radius: 4px; padding: 6px;
+    color: var(--g-text); font-size: 12px; margin-bottom: 8px; letter-spacing: 4px;
+  }
+  .m-tag {
+    background: var(--m-bg); color: var(--m-text); border-radius: 4px;
+    padding: 4px 0; font-size: 12px; font-weight: 500;
+  }
+  .legend {
+    display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px;
+    color: var(--muted); padding-top: 16px; border-top: 1px solid var(--border); margin-top: 24px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+  .story {
+    background: var(--accent-bg); border-radius: 12px;
+    padding: 24px 28px; color: var(--accent-text);
+  }
+  .story p { margin: 6px 0; font-size: 15px; }
+  .story strong { font-weight: 500; }
+  .whys { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .why-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 22px;
+  }
+  .why-num { font-size: 13px; color: var(--hint); margin-bottom: 6px; letter-spacing: 0.5px; }
+  .why-q { font-weight: 500; margin: 0 0 8px; font-size: 15px; }
+  .why-a { color: var(--muted); font-size: 14px; margin: 0; }
+  details {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 8px; overflow: hidden;
+  }
+  summary {
+    padding: 14px 18px; cursor: pointer; font-weight: 500; font-size: 15px;
+    list-style: none; user-select: none; display: flex; align-items: center; gap: 12px;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: '+'; color: var(--hint); font-size: 18px; width: 16px;
+  }
+  details[open] summary::before { content: '−'; }
+  .answer {
+    padding: 0 18px 18px 46px; color: var(--muted); font-size: 14px; line-height: 1.7;
+  }
+  .q-num { color: var(--hint); font-weight: 400; margin-right: 4px; }
+  .memory-card {
+    background: #1a1a17; color: #e8e4d8; border-radius: 12px;
+    padding: 28px 32px; font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13.5px; line-height: 2;
+  }
+  .memory-card p { margin: 0; }
+  .mc-section {
+    margin-top: 14px; padding-top: 14px; border-top: 1px solid #3a3a35;
+  }
+  .mc-section:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+  .mc-label {
+    color: #9a978e; font-size: 11px; letter-spacing: 1px;
+    text-transform: uppercase; margin-bottom: 4px;
+  }
+  .mc-g { color: #5dcaa5; }
+  .mc-m { color: #85b7eb; }
+  .mc-p { color: #ef9f27; }
+  .footer { text-align: center; color: var(--hint); font-size: 12px; margin-top: 40px; }
+  @media (max-width: 600px) {
+    .whys { grid-template-columns: 1fr; }
+    .core { font-size: 16px; padding: 20px 22px; }
+  }
+  @media print {
+    body { background: white; color: black; padding: 20px; }
+    details[open] .answer { display: block; }
+    summary::before { display: none; }
+    .memory-card { background: #f5f5f0; color: #1a1a17; border: 2px solid #1a1a17; }
+    .mc-g { color: #085041; } .mc-m { color: #0c447c; } .mc-p { color: #633806; }
+    .core, .diagram, .why-card, details, .story { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>GMP 速记卡</h1>
+  <p class="subtitle">Go 调度模型 · 从核心到细节层层展开</p>
+
+  <h2>① 三行核心 · 60 秒能说清</h2>
+  <section class="core">
+    <p><span class="tag tag-g">G</span> 是 goroutine,<span class="tag tag-m">M</span> 是 OS 线程,<span class="tag tag-p">P</span> 是调度上下文。</p>
+    <p><span class="tag tag-m">M</span> 必须拿到 <span class="tag tag-p">P</span> 才能跑 <span class="tag tag-g">G</span>。</p>
+    <p><span class="tag tag-p">P</span> 的数量 = <code>GOMAXPROCS</code> = 默认 CPU 核数。</p>
+  </section>
+
+  <h2>② 关系图 · 闭眼能默画</h2>
+  <section class="diagram">
+    <div class="global-queue"><strong>全局队列</strong>(所有 P 共享)· G G G G G G</div>
+    <div class="arrow">↓</div>
+    <div class="diagram-grid">
+      <div class="p-column">
+        <div class="p-name">P0</div>
+        <div class="local-q">G G G G</div>
+        <div class="m-tag">M0</div>
+      </div>
+      <div class="p-column">
+        <div class="p-name">P1</div>
+        <div class="local-q">G G G</div>
+        <div class="m-tag">M1</div>
+      </div>
+      <div class="p-column">
+        <div class="p-name">P2</div>
+        <div class="local-q">G G</div>
+        <div class="m-tag">M2</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-dot" style="background: var(--g-border)"></span>G = goroutine</div>
+      <div class="legend-item"><span class="legend-dot" style="background: var(--m-border)"></span>M = OS 线程</div>
+      <div class="legend-item"><span class="legend-dot" style="background: var(--p-border)"></span>P = 调度位 + 本地队列</div>
+    </div>
+  </section>
+
+  <h2>③ 餐厅故事 · 一个比喻顶千言</h2>
+  <section class="story">
+    <p><strong>G</strong> 是顾客(订单),<strong>M</strong> 是服务员,<strong>P</strong> 是餐桌。</p>
+    <p>服务员要站在餐桌旁才能服务。每张桌子有自己的待处理订单。</p>
+    <p>桌子忙不过来 → 别的服务员来 <strong>偷一半订单</strong>(work stealing)。</p>
+    <p>服务员去后厨等菜 → <strong>换人接桌</strong>(系统调用 hand-off)。</p>
+  </section>
+
+  <h2>④ 两个为什么 · 抓住本质</h2>
+  <section class="whys">
+    <div class="why-card">
+      <div class="why-num">为什么 1</div>
+      <p class="why-q">为什么需要 P 这一层?</p>
+      <p class="why-a">每个 P 一个本地队列,<strong>减少全局锁竞争</strong>。多核扩展性靠它。</p>
+    </div>
+    <div class="why-card">
+      <div class="why-num">为什么 2</div>
+      <p class="why-q">为什么 P 会和 M 解绑?</p>
+      <p class="why-a">系统调用阻塞时,P 让出去服务别的 G,<strong>不被一个阻塞拖累</strong>。</p>
+    </div>
+  </section>
+
+  <h2>⑤ 自测五问 · 答得出就过关</h2>
+  <section>
+    <details>
+      <summary><span class="q-num">Q1.</span>G、M、P 分别是什么?</summary>
+      <div class="answer">G = goroutine(用户写的执行单元)。M = Machine,绑定一个 OS 线程。P = Processor,逻辑调度器,持有本地运行队列。</div>
+    </details>
+    <details>
+      <summary><span class="q-num">Q2.</span>为什么需要 P 这一层?</summary>
+      <div class="answer">早期 GM 模型用全局队列 + 全局锁,多核扩展性差。引入 P 后每个 P 有本地队列,M 拿 G 优先访问本地,锁竞争少。同时 P 的数量限制了真正的并行度(= GOMAXPROCS)。</div>
+    </details>
+    <details>
+      <summary><span class="q-num">Q3.</span>新建的 goroutine 进哪个队列?</summary>
+      <div class="answer">优先进当前 P 的本地队列。本地队列满了(默认 256)才放全局队列。这样大多数情况下不需要全局锁。</div>
+    </details>
+    <details>
+      <summary><span class="q-num">Q4.</span>一个 P 的本地队列空了怎么办?</summary>
+      <div class="answer">按顺序找:① 全局队列;② netpoller 里准备好的 G;③ <strong>从其他 P 偷一半 G</strong>(work stealing);④ 都没有就让 M 进入休眠。Work stealing 是自动负载均衡的关键。</div>
+    </details>
+    <details>
+      <summary><span class="q-num">Q5.</span>系统调用阻塞时会发生什么?</summary>
+      <div class="answer">M 陷入内核等待。P 与这个 M 解绑,找一个空闲 M(或新建一个)继续跑队列里的 G。系统调用返回后,原 M 尝试拿回一个 P;拿不到就把 G 扔回全局队列,自己休眠。这样一个阻塞不会拖累整个 P 的所有 G。</div>
+    </details>
+  </section>
+
+  <h2>⑥ 极简卡片 · 贴在显示器边</h2>
+  <section class="memory-card">
+    <div class="mc-section">
+      <div class="mc-label">三个角色</div>
+      <p><span class="mc-g">G</span> = goroutine &nbsp;&nbsp; <span class="mc-m">M</span> = OS 线程 &nbsp;&nbsp; <span class="mc-p">P</span> = 调度位</p>
+      <p><span class="mc-m">M</span> 拿 <span class="mc-p">P</span> 才能跑 <span class="mc-g">G</span> &nbsp;|&nbsp; <span class="mc-p">P</span> 数 = GOMAXPROCS</p>
+    </div>
+    <div class="mc-section">
+      <div class="mc-label">两个队列</div>
+      <p>每 <span class="mc-p">P</span> 一个本地队列 + 一个全局队列</p>
+    </div>
+    <div class="mc-section">
+      <div class="mc-label">P 存在的两个意义</div>
+      <p>① 本地队列 → 减锁竞争</p>
+      <p>② 系统调用时和 M 解绑 → P 找新 M 继续跑</p>
+    </div>
+    <div class="mc-section">
+      <div class="mc-label">Work Stealing</div>
+      <p>空 <span class="mc-p">P</span> 偷别人一半 <span class="mc-g">G</span></p>
+    </div>
+  </section>
+
+  <p class="footer">学完 24 小时再默写一遍 · 卡壳处再回来看</p>
+</div>
+</body>
+</html>

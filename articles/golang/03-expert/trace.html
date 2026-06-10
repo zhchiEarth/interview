@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>trace 工具实战 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# trace 工具实战
+
+> 一句话：runtime/trace 记录调度器、GC、syscall、网络的精细事件；适合看"延迟尖峰、GC pause、并发瓶颈"。
+
+## 采集
+
+```go
+import "runtime/trace"
+
+f, _ := os.Create("trace.out")
+trace.Start(f)
+defer trace.Stop()
+// ... 跑要观察的逻辑
+```
+
+或线上用 pprof 端点：
+
+```bash
+curl 'http://localhost:6060/debug/pprof/trace?seconds=10' > trace.out
+go tool trace trace.out
+```
+
+## 浏览器界面看什么
+
+| 视图 | 用途 |
+|---|---|
+| **View trace** | 总览：每个 P 的时间线，G 切换、syscall、GC |
+| **Goroutine analysis** | 按 G 看延迟构成（执行/等待/syscall/GC） |
+| **Network blocking profile** | 网络 IO 等待 |
+| **Synchronization blocking** | chan / Mutex 等待 |
+| **Syscall blocking** | syscall 等待 |
+| **Scheduler latency** | G 从 ready 到真正跑的延迟（关键指标） |
+| **GC** | 每次 STW 时长、并发标记区间 |
+
+## 典型问题对应
+
+| 现象 | 看哪 |
+|---|---|
+| 偶发延迟尖峰 | scheduler latency / GC |
+| GC 拖慢业务 | GC 视图，看 STW 时长 |
+| 一个 G 卡很久 | goroutine analysis |
+| 锁竞争严重 | sync blocking |
+
+## trace vs pprof
+
+- pprof：**统计**，告诉你"哪里花时间"
+- trace：**时间线**，告诉你"什么时候发生了什么"
+
+两者互补；先 pprof 找热点，再 trace 看时序。
+
+## 一句话总结
+
+> trace 是细粒度时间线，专治"为什么偶尔慢一下"——GC pause、调度延迟、锁等待都能看到。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/trace" data-base="../../"></script>
+</body>
+</html>

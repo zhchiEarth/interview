@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL vs MySQL 怎么选 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# PostgreSQL vs MySQL 怎么选
+
+> 一句话：**PostgreSQL** 是「功能强大、标准严谨、可扩展」的对象关系型数据库（ORDBMS），擅长复杂查询 / GIS / JSON / 数据完整性 / 分析型负载；**MySQL** 是「简单、快、生态成熟」的关系型数据库，擅长高并发的简单读写、互联网常规业务。两者都很能打，**选型看场景，不是看谁绝对强**——需要丰富特性与强一致选 PG，需要极致生态与读写简单高并发选 MySQL。
+
+> 本文以 **PostgreSQL 14+/16** 与 **MySQL 8.0（InnoDB 引擎）** 为基准；涉及版本差异处会显式标注。相关：[PostgreSQL 进程与内存架构](architecture.html)、[MVCC 与 VACUUM](mvcc-vacuum.html)、[索引类型](index.html)、[流复制与高可用](replication.html)、[WAL 与持久化](wal.html)。
+
+## 一、先给结论：两者的定位差异
+
+| 维度 | PostgreSQL | MySQL |
+|---|---|---|
+| 自我定位 | **对象关系型数据库 ORDBMS**：标准兼容、可扩展、功能全 | 关系型数据库 RDBMS：简单、快、易用 |
+| 设计哲学 | 正确性 / 标准 / 可扩展优先，特性丰富 | 性能 / 易用 / 生态优先，互联网普及 |
+| 一句话标签 | 「最先进的开源数据库」 | 「最流行的开源数据库」 |
+| 典型用户 | 金融、GIS、分析、复杂业务、需要数据完整性的系统 | 互联网 Web、CMS、高并发 OLTP、SaaS |
+| 许可证 | **PostgreSQL License**（类 BSD/MIT，极宽松） | **GPLv2**（社区版）+ Oracle 商业双授权 |
+
+记忆钩子：**PG = 「学院派，特性全、标准严」；MySQL = 「实用派，跑得快、生态广」**。PG 是一个数据库内核 + 一大堆可插拔扩展；MySQL 是一个内核 + 可插拔存储引擎。
+
+## 二、核心架构与实现的大对比
+
+这是面试最常被追问的一张表，逐项都要能展开说。
+
+| 对比项 | PostgreSQL | MySQL（InnoDB） |
+|---|---|---|
+| **连接模型** | **多进程**：每连接 fork 一个 backend 进程（独立内存空间） | **多线程**：每连接一个线程（共享进程内存） |
+| 连接开销 | fork 开销大、每连接内存高 → **强烈建议上连接池**（PgBouncer） | 线程相对轻量，但高连接数仍建议池化 |
+| **MVCC 实现** | **多版本元组直接存在堆表里**：UPDATE 不原地改，而是插入新版本元组、旧版本留在原页（靠 `xmin`/`xmax` 标记可见性），旧版本由 **VACUUM** 回收 | **undo 回滚段（rollback segment）**：原地更新数据页，旧版本写进 undo log，由 purge 线程清理 |
+| MVCC 副作用 | 表会**膨胀（bloat）**，依赖 autovacuum 回收；好处是回滚极快（旧版本本就在原地） | undo 段需清理，长事务会撑大 undo；回滚需用 undo 反做 |
+| **表组织** | **堆表（heap）+ 独立索引**：表数据按插入堆放，无聚簇；**没有「主键聚簇」概念** | **聚簇索引（clustered index）**：表数据按主键 B+ 树物理组织，叶子节点就是行数据 |
+| 二级索引 | 索引叶子存 **TID**（指向堆中元组的物理位置），需回堆取数据 | 二级索引叶子存**主键值**，需「回表」用主键再查聚簇索引 |
+| **索引类型** | 极丰富：B-tree、**Hash、GiST、SP-GiST、GIN、BRIN**，配合 PostGIS / 全文检索 | 主要 **B+ 树**；另有全文索引、空间索引（R-tree），类型远少于 PG |
+| **默认隔离级别** | **Read Committed（RC）** | **Repeatable Read（RR）** |
+| **复制** | **WAL 流复制（物理复制）** + **逻辑复制**（基于逻辑解码，可跨大版本/选表） | **binlog 复制**（statement / row / mixed），逻辑层面 |
+| SQL 标准与高级特性 | 标准兼容度高：窗口函数、CTE（含递归 + 可写 CTE）、**JSONB**、数组类型、范围类型、自定义类型/域、表达式索引、物化视图、`RETURNING`、丰富的 `GENERATED` 列 | 8.0 起补齐了窗口函数、CTE、JSON（非二进制索引化弱于 JSONB）、`GENERATED` 列，但仍少数组/自定义类型/范围类型 |
+| **扩展生态** | **扩展机制（CREATE EXTENSION）**：PostGIS、pg_trgm、pgvector、TimescaleDB、citus、postgres_fdw 等 | 插件式**存储引擎**（InnoDB / MyISAM / Memory…）+ 插件，但没有 PG 那种「装个扩展加一类能力」的范式 |
+| 存储过程语言 | PL/pgSQL，且可挂 PL/Python、PL/Perl、PL/v8 等多语言 | 仅自带 SQL/PSM 存储过程 |
+| 协议 | 自有 wire protocol（5432） | 自有 wire protocol（3306） |
+
+> 关于 MVCC 两种实现的取舍、autovacuum 与表膨胀，展开见 [MVCC 与 VACUUM](mvcc-vacuum.html)；索引类型逐个对比见 [索引类型](index.html)；复制方案见 [流复制与高可用](replication.html)。
+
+### 2.1 进程 vs 线程：一句话能说清的本质
+
+```text
+PostgreSQL（多进程）                    MySQL（多线程）
+┌─────────────┐                       ┌──────────────────────┐
+│ postmaster  │  监听 5432            │  mysqld 单进程         │
+│  主控进程    │                       │   ├─ 连接线程 1        │
+│   │ fork     │                       │   ├─ 连接线程 2        │  共享进程
+│   ├─ backend1│ ← 连接1（独立内存）    │   ├─ 连接线程 3        │  内存
+│   ├─ backend2│ ← 连接2（独立内存）    │   └─ 后台线程...        │
+│   └─ 后台进程组│                       └──────────────────────┘
+└─────────────┘
+进程隔离强、崩溃影响小，                线程轻、共享内存通信快，
+但每连接内存高 → 必须连接池             高连接数仍需池化
+```
+
+进程与内存细节（含各后台进程、shared_buffers / work_mem）见 [PostgreSQL 进程与内存架构](architecture.html)。
+
+### 2.2 MVCC 实现差异（高频追问）
+
+```text
+UPDATE t SET v=2 WHERE id=1;   -- 把 v 从 1 改成 2
+
+PostgreSQL（堆内多版本）：
+   旧元组 (id=1,v=1, xmax=本事务)   ← 标记为「被本事务删除」，留在原页
+   新元组 (id=1,v=2, xmin=本事务)   ← 同表内插入新版本
+   → 旧版本日后由 VACUUM 回收；回滚=直接丢弃新元组，极快
+   → 副作用：表会膨胀，索引也要为新元组加项
+
+MySQL InnoDB（undo 回滚段）：
+   数据页原地改成 v=2
+   旧值 v=1 写进 undo log（回滚段）
+   → 回滚=用 undo 把页改回 v=1；读旧快照=顺 undo 链重建
+   → 副作用：长事务撑大 undo，purge 线程负责清理
+```
+
+## 三、隔离级别的关键差异
+
+二者**默认隔离级别不同**，这是迁移时最容易踩的坑：
+
+| | PostgreSQL 默认 | MySQL（InnoDB）默认 |
+|---|---|---|
+| 默认级别 | **Read Committed（RC）** | **Repeatable Read（RR）** |
+| 幻读处理 | RC 下每条语句取新快照；RR/Serializable 下 PG 用 **SSI（可串行化快照隔离）** 真正防写偏序 | RR 下用快照读 + **间隙锁 / Next-Key Lock** 抑制幻读 |
+| Serializable | 真正的**可串行化**（SSI，乐观，冲突时报序列化失败让你重试） | 退化为加锁串行，并发下锁争用更重 |
+
+```sql
+-- 查看当前默认隔离级别
+-- PostgreSQL:
+SHOW default_transaction_isolation;   -- read committed
+-- MySQL 8.0:
+SELECT @@transaction_isolation;       -- REPEATABLE-READ
+```
+
+> 易踩坑：把 MySQL 经验（默认 RR、同一事务多次读结果一致）直接套到 PG，PG 默认 RC 下同一事务两次查询可能读到别人已提交的新数据。需要可重复读要显式 `BEGIN ISOLATION LEVEL REPEATABLE READ`。
+
+## 四、各自更适合的场景
+
+### 选 PostgreSQL 的场景
+
+```text
+✅ 复杂查询 / 分析：窗口函数、递归 CTE、丰富索引（GIN/BRIN）、并行查询、物化视图
+✅ 地理空间 GIS：PostGIS 是事实标准，几乎没有对手
+✅ JSON 文档化存储：JSONB 二进制存储 + GIN 索引，可对 JSON 字段建索引/查询
+✅ 强数据完整性：CHECK / 排他约束 / 域 / 真正的事务 DDL（DDL 可回滚）
+✅ 向量检索 / AI：pgvector 扩展，直接在库里做相似度检索
+✅ 需要自定义类型 / 扩展能力：CREATE TYPE / CREATE EXTENSION
+✅ 时序：TimescaleDB；分布式：Citus
+```
+
+### 选 MySQL 的场景
+
+```text
+✅ 高并发的简单 OLTP：海量「按主键点查 / 简单条件」的读写
+✅ 互联网常规业务：成熟度高、招人易、运维资料铺天盖地
+✅ 生态与工具链：从云托管(RDS)、中间件(ShardingSphere/Vitess)到分库分表方案极其成熟
+✅ 读多写少 + 一主多从：binlog 复制 + 读写分离方案非常成熟
+✅ 团队已有 MySQL 经验栈、聚簇索引下主键点查极快
+```
+
+### 一句话选型决策树
+
+```text
+要 GIS / 复杂分析 / JSONB / 自定义类型 / 向量 / 事务性 DDL ？ ── 是 → PostgreSQL
+            │否
+高并发简单读写 + 生态/招人/分库分表方案成熟度优先 ？      ── 是 → MySQL
+            │都不强烈
+团队已有技术栈 / DBA 经验在哪边 ？                       → 跟随团队栈，降低运维风险
+```
+
+> 注意：两者性能差距在多数常规业务里**没有量级差异**，真正拉开差距的是**特性契合度**和**团队运维熟练度**。不要被「谁更快」带偏——选错特性栈的返工成本，远大于那点性能差。
+
+## 五、容易答错的点（面试加分纠偏）
+
+- **「PG 没有聚簇索引所以慢」** —— 不准确。PG 是堆表 + 独立索引，主键点查走索引再回堆，确实比 InnoDB 聚簇主键点查多一跳；但 PG 可用 `CLUSTER` 命令按某索引物理重排（一次性、非自动维护），且范围/分析查询常因独立索引+丰富索引类型反而更优。
+- **「PG 的 VACUUM 是缺点」** —— 它是堆内 MVCC 的必然配套，autovacuum 自动跑；真正要关注的是大表/高更新表的 vacuum 调优与表膨胀，而非「有 VACUUM = 差」。
+- **「MySQL 8.0 有了 JSON 就追平 PG」** —— MySQL JSON 与 PG **JSONB** 不是一回事：JSONB 是二进制存储且可用 GIN 索引高效检索内部键值，索引化能力更强。
+- **「PG 默认也是 RR」** —— 错。**PG 默认 RC，MySQL 默认 RR**，这是高频送分/送命题。
+- **DDL 事务性** —— PG 的 DDL 可包在事务里回滚（迁移友好）；MySQL 8.0 的 DDL 多为原子但不可与 DML 一起回滚。
+
+## 一句话总结
+
+> **PostgreSQL = 功能强大、标准严谨、可扩展的 ORDBMS**（多进程、堆表+独立索引、MVCC 旧版本存堆里靠 VACUUM 回收、默认 **RC**、索引类型丰富、WAL 流复制+逻辑复制、JSONB/数组/自定义类型/扩展生态），适合**复杂查询 / GIS / JSON / 强完整性 / 分析**；**MySQL = 简单快、生态成熟的 RDBMS**（多线程、InnoDB 聚簇索引、undo 段实现 MVCC、默认 **RR**、binlog 复制），适合**高并发简单读写 / 互联网业务 / 成熟分库分表生态**。选型记一句：**要特性与严谨选 PG，要生态与简单高并发选 MySQL，拿不准跟团队已有栈走**。延伸见 [PostgreSQL 进程与内存架构](architecture.html)、[MVCC 与 VACUUM](mvcc-vacuum.html)、[索引类型](index.html)、[流复制与高可用](replication.html)。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pg/vs-mysql" data-base="../"></script>
+</body>
+</html>

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>syscall 阻塞时 P 怎么 hand-off？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# syscall 阻塞时 P 怎么 hand-off？
+
+> 一句话：M 进 syscall 会陷入内核、可能卡很久。runtime 的策略是**乐观假设它快返回**——先不动 P，让 M 带着 P 一起进 syscall；一旦 sysmon 发现 syscall 拖太久、或系统有活没人干，就把 **P 从这个 M 身上摘下来交给别的 M**（`handoffp`），保证 P 本地队列里其它 G 不被一个慢 syscall 拖死。
+
+## 先搞懂：hand-off 是什么
+
+「hand-off」字面是**交接 / 移交**。在 Go 调度器里特指一件具体的事：
+
+> **当 M（OS 线程）陷入阻塞 syscall 时，把它身上的 P 摘下来、交给另一个 M 继续跑——这个「转交 P」的动作就叫 hand-off。**
+
+为什么非转不可：M 是线程，进阻塞 syscall 会被内核挂起；但 P 持着一个**本地队列（最多 256 个 G）**，不能让一个慢 syscall 把这几百个 G 全卡死。
+
+```text
+        转交前                              hand-off 后
+  M1 ──持有──► P ──► [G G G … 队列]    M1（卡在 syscall，已没 P）
+   │                                      ⋮
+   └─ 陷入阻塞 syscall               M2 ──接管──► P ──► [G G G … 队列] 继续跑
+```
+
+**一句话本质：「阻塞的线程别拖累调度位」**——把 P 从陷在 syscall 里的 M 转交给另一个 M。下面拆它怎么发生。
+
+---
+
+## 一、先分清：什么 syscall 才走这条路
+
+| IO 类型 | 走哪条路 |
+|---|---|
+| 网络 socket 读写 | **netpoller**（非阻塞 fd + epoll），M 根本不阻塞 → 不触发 hand-off。见 [netpoller](netpoller.html) |
+| **真阻塞 syscall**：普通磁盘文件读写、部分 pipe、cgo 调用、阻塞设备 IO | **本文的 `entersyscall` / `handoffp`** |
+
+> 关键认知：**能 epoll 的（网络）走异步、不占 M；不能 epoll 的（文件等）只能真阻塞 M**，于是才需要 hand-off 把 P 救出来。
+
+---
+
+## 二、核心矛盾：M 会被内核挂起，但 P 不该跟着卡
+
+- **M** 是 OS 线程，进阻塞 syscall 时内核可能把它**挂起**，啥也干不了。
+- **P** 是调度位 + 本地队列（256 个 G），它**不该**跟着这个 M 一起冻住——队列里还有几百个 G 等着跑。
+
+```text
+   M ──持有──► P ──► [G1 G2 G3 … G256]   队列里几百个 G 等着跑
+   │
+   └─ 陷入阻塞 syscall（卡 10s）
+        若 P 跟着一起冻 → 这几百个 G 全饿死 ✗
+        ↓ 解法
+        把 P 摘走交给别的 M → G 照常跑 ✓
+```
+
+→ 所以要把 **P 和阻塞的 M 解绑**。这正是 [GMP](gpm-scheduler.html) 把队列挂在 P（而非 M）上的伏笔：**M 阻塞 ≠ 队列阻塞**。
+
+P 有个专门的状态表达「我的 M 进 syscall 了」：
+
+```text
+_Prunning  → 正常执行
+_Psyscall  → 持有它的 M 进了 syscall（半挂状态，等着被原 M 抢回 or 被 handoff）
+_Pidle     → 空闲，在 sched.pidle 链上
+```
+
+---
+
+## 三、entersyscall：乐观——先别动 P
+
+进 syscall 前，runtime 调 `entersyscall`：
+
+```text
+entersyscall():
+  保存现场（PC/SP 到 g.sched）
+  P.status = _Psyscall        // 标记，但 P 仍"留给"原 M
+  M 与 P 解除"运行"绑定，但保留弱关联（oldp 记下来）
+  → 真正陷入内核执行 syscall
+```
+
+**为什么不立刻 hand-off？** 因为**绝大多数 syscall 是微秒级就返回的**。如果每次都立刻把 P 交出去、返回时再抢一个回来，调度开销（可能要唤醒/新建 M）反而比 syscall 本身还贵。
+
+→ 所以乐观赌它快回：**P 留在 `_Psyscall`**，原 M 返回时能**零成本抢回同一个 P**（见第六节快路径）。真卡住了，再由 sysmon 兜底。
+
+---
+
+## 四、谁真正 hand-off：sysmon 的 retake
+
+后台监控线程 **sysmon**（指数退避 20μs ~ 10ms 跑一轮）在 `retake` 里扫描所有 `_Psyscall` 的 P，**满足任一条件就 `handoffp` 把 P 摘走**：
+
+```text
+对处于 _Psyscall 的 P，且已观察过 ≥1 个 sysmon tick（防误抢秒回的 syscall）：
+
+  ① P 本地队列还有 G          → 有活在等，立刻 handoff（别让它们干等）
+  ② 没有空闲 P 且没有自旋 M    → 系统满载，这个 P 必须被用起来
+  ③ 该 syscall 已阻塞 > 10ms   → 确实卡很久了，handoff
+  以上任一成立 → handoffp(P)
+```
+
+> 注意：常说的「超过 10ms 才 hand-off」是**简化**。实际上只要本地还有活、或系统没有空闲 P/自旋 M，**几十 μs 内就会 hand-off**，不会傻等满 10ms。
+
+`handoffp` 做什么：
+
+```text
+handoffp(P):
+  有空闲 M(sched.midle)？ → 唤醒它接管 P
+  没有                    → newm() 新建一个 M（= 新 OS 线程）接管 P
+  P 重新变 _Prunning，继续跑本地队列里的 G
+```
+
+---
+
+## 五、entersyscallblock：悲观——已知会阻塞，进之前就交 P
+
+对于 runtime **明确知道会长时间阻塞**的 syscall（某些 runtime 内部阻塞操作），走 `entersyscallblock`：**进 syscall 之前就主动 `handoffp`**，不等 sysmon。
+
+```text
+entersyscall      乐观：留着 P，赌快回，慢了让 sysmon 摘   ← 绝大多数 syscall
+entersyscallblock 悲观：进之前就交出 P                     ← 已知必阻塞
+```
+
+---
+
+## 六、exitsyscall：syscall 返回后怎么拿回 P
+
+syscall 返回，M 调 `exitsyscall` 想恢复执行当前 G——需要一个 P：
+
+```text
+快路径 exitsyscallfast：
+  原来那个 P 还在 _Psyscall、没被 sysmon 抢走？
+    → 直接抢回来，无任何调度开销，继续跑当前 G   ← 最常见（快 syscall）
+  否则试着捡一个空闲 P
+    → 拿到就用
+
+慢路径 exitsyscall0（一个 P 都抢不到）：
+  当前 G 扔进【全局运行队列】
+  M 停下来（stopm）进 sched.midle 空闲线程列表，睡觉
+  → 等以后某个 P 空出来时再被唤醒去跑
+```
+
+**核心**：原 M 返回后能不能接着跑当前 G，取决于「**它的 P 有没有被 handoff 走**」。没走 → 秒接；走了 → G 进全局队列、M 去睡。
+
+---
+
+## 七、完整时间线
+
+```text
+时间 ──────────────────────────────────────────────────►
+
+       G 调阻塞 syscall
+          │ entersyscall：P→_Psyscall，M 带 P 陷内核
+          ▼
+   ┌──────────────── 快返回（μs 级）────────────────┐
+   │ exitsyscallfast：P 还在 → 抢回 → 继续跑 G       │   ← 占多数，零调度开销
+   └─────────────────────────────────────────────────┘
+
+   ┌──────────────── 慢阻塞（>10ms 或系统忙）────────┐
+   │ sysmon.retake 发现 → handoffp                    │
+   │   → 空闲 M 接管 P（或 newm 新建 M）继续跑本地 G   │   ← P 被救走，队列不卡
+   │                                                  │
+   │ 稍后 syscall 返回：                               │
+   │   exitsyscall 抢不到 P → G 进全局队列、原 M 睡    │
+   └──────────────────────────────────────────────────┘
+```
+
+---
+
+## 八、副作用：线程数（M）会涨
+
+`handoffp` 把 P 交给**新建的 M** = 新 OS 线程。所以：
+
+- **P 数恒定** = `GOMAXPROCS`（同一时刻最多这么多 G 并行）
+- 但 **M 数不固定**：每个卡在阻塞 syscall 里的 M 都占一根线程，handoff 又会拉起新 M → **大量并发阻塞 syscall 会让线程数远超 GOMAXPROCS**（上限 `sched.maxmcount = 10000`）。
+
+这就是为什么：**大量阻塞文件 IO / cgo 会看到线程数暴涨**；而**网络 IO 走 [netpoller](netpoller.html) 不阻塞 M，线程数稳定**。生产里高并发文件操作要留意这个。
+
+---
+
+## 九、和 GMP / netpoller 的关系
+
+- 本文是 [GMP](gpm-scheduler.html) 「P 与 M 可解绑」设计的**兑现**——队列挂 P 而非 M，正是为了这一刻能把 P 转走。
+- 与 [netpoller](netpoller.html) 互补：**网络 IO 用 epoll 异步、压根不阻塞 M**；**文件等真阻塞 IO 没法 epoll，只能阻塞 M + hand-off P** 来止损。
+
+---
+
+## 一句话总结
+
+> 阻塞 syscall 会卡住 M（OS 线程）。runtime **乐观**地让 M 带着 P 进 syscall（`entersyscall`，赌快回、能零成本抢回）；真卡久了，**sysmon 把 P 摘下来交给别的 M**（`handoffp`），让 P 本地队列里其它 G 继续跑。代价是**线程数可能涨**——这也是网络 IO 走 netpoller、文件 IO 才走 hand-off 的原因。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/syscall-handoff" data-base="../../"></script>
+</body>
+</html>

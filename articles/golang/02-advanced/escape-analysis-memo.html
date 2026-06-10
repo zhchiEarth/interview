@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>逃逸分析 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 逃逸分析 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **逃逸 = 编译期判「变量引用能不能在函数返回前完全消失」**：能 → **栈**（移 SP，免费）/ 不能（或证不了）→ **堆**（mallocgc + GC）。5 大根因：**边界越界 · interface 装箱 · 大小未知/过大 · 闭包捕获 · 跨 goroutine/channel**。
+
+记不全时，按这条**记忆主线：一条判定 + 5 个根因 + 一组命令**展开（详细推演看[正文](escape-analysis.html)）：
+
+---
+
+## ⚖️ 一条判定 —— 寿命超不超出栈帧
+
+```text
+变量引用会不会流出当前函数边界?
+  否(编译器确定无疑) → ✅ 栈
+  是 / 编译器证不了否 → ⚠️ 堆 (保守, 宁可慢也不许悬空指针)
+```
+- `&x` 取地址本身**不逃**，只有地址「流出」才逃。
+- `new(T)` / `make([]T, 4)` 不流出时**也在栈**——别背「new/make 一定堆」。
+- 跨函数分析：callee 不保存 `p` → caller 的 `&x` 不逃（`p does not escape`）。
+
+## 🔥 5 个根因 —— 覆盖所有逃逸场景
+
+| 根因 | 本质 | 典型 |
+|---|---|---|
+| ① 边界越界 | 地址流出栈帧 | `return &p` / `global = &p` |
+| ② interface 装箱 | data 部分指针指堆 | `fmt.Println(x)` / `var i any = 42` |
+| ③ 未知/过大 | 大小是变量 / 超栈阈值 | `make([]int, n)` / `[1e6]int` |
+| ④ 闭包捕获 | 闭包带走变量引用 | `return func(){ base+x }` |
+| ⑤ 跨 G / channel | 跨执行流证不了寿命 | `go f(p)` / `ch <- d` |
+
+```text
+再压 3 类: 边界逃逸=①④⑤  类型擦除=②  物理装不下=③
+```
+- map / chan 几乎总在堆（`runtime.makemap`/`makechan` 直接 mallocgc）。
+- string 字面量底层字节在只读段（rodata），既不栈也不堆。
+- 栈默认起步 2KB；单变量超 ~64KB 一般直接堆。
+
+## 🛠 一组命令 —— 怎么看、怎么验
+
+```bash
+go build -gcflags="-m"      # 每个变量逃没逃
+go build -gcflags="-m -m"   # 为什么逃(详细推导)
+go test -bench -benchmem    # 看 allocs/op, 目标 0
+go tool pprof -alloc_space  # 找热点分配
+```
+- 关键词：`moved to heap: x`（搬堆）/ `does not escape`（没逃）/ `leaking param: x`（参数漏出，可能拖累调用方）。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/escape-analysis-memo" data-base="../../"></script>
+</body>
+</html>

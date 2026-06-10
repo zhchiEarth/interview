@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kafka 为什么这么快 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Kafka 为什么这么快
+
+> 一句话：Kafka 把"磁盘当流水账顺序写、用操作系统 Page Cache 兜读写、用零拷贝把数据直接从内核送上网卡、Producer 攒批压缩、再靠分区水平并行"这 5 招叠加，做到了单机几十万到百万级 TPS。
+
+Kafka 是磁盘存储系统，却能跑出接近内存的吞吐，靠的不是某一个黑魔法，而是 **5 个杀手锏的叠加**。下面逐个拆开讲。
+
+相关阅读：[Kafka 存储机制与 offset 查找](storage.html)、[Kafka 知识地图](knowledge-graph.html)。
+
+---
+
+## 一、顺序写磁盘：partition 是 append-only log
+
+人们对"磁盘慢"的印象来自**随机 IO**——机械盘要不停寻道（seek），SSD 也有写放大和寻址开销。但**顺序写**完全是另一回事。
+
+Kafka 的每个 partition 在物理上就是一串**只追加（append-only）**的日志文件，新消息永远写到末尾，**从不修改、从不插入中间**。
+
+```text
+随机写（慢）                      顺序写（快）
+┌───────────────────┐            ┌───────────────────┐
+│ 磁头到处跳：       │            │ 磁头/写指针只往后：│
+│  ...写 块7...      │            │  m0 m1 m2 m3 m4 →  │
+│  跳到 块2 写...    │            │  └ 一路追加，不回头│
+│  跳到 块9 写...    │            │                    │
+│  每次都要寻道      │            │  几乎无寻道开销    │
+└───────────────────┘            └───────────────────┘
+```
+
+| 写入方式 | 量级（经验值，与硬件相关） | 主要开销 |
+|---|---|---|
+| 内存随机写 | ~GB/s | 几乎无 |
+| 磁盘**顺序**写 | 数百 MB/s（HDD 也能上百 MB/s） | 几乎无寻道 |
+| 磁盘**随机**写 | 几百 KB ~ 几 MB/s（HDD 尤甚） | 寻道 + 旋转延迟 |
+
+> 结论：**顺序写磁盘的速度，可以逼近甚至媲美随机写内存**，远远甩开随机写磁盘。Kafka 用 append-only log 把所有写入都变成了顺序写。
+>
+> 配套机制见 [存储机制](storage.html)：日志被切成 segment，索引也是顺序追加的稀疏索引。
+
+---
+
+## 二、Page Cache：把缓存交给操作系统，不放 JVM 堆
+
+Kafka 用 Scala/Java 写，但它**刻意不把消息数据缓存在 JVM 堆里**，而是直接依赖操作系统的 **Page Cache（页缓存）**。
+
+```text
+        写路径                          读路径
+Producer ─► Broker                Broker ──► Consumer
+   write() 到 Page Cache             命中 Page Cache 直接给
+        │  (内存)                          ▲
+        ▼                                   │
+   OS 异步刷盘 (flush)              未命中才读磁盘，读完也进 Page Cache
+        │
+        ▼  .log 文件
+```
+
+为什么这么设计：
+
+- **避免 GC 灾难**：消息动辄几十 GB，若放 JVM 堆，会造成巨大的 GC 压力和停顿；交给 OS 的 Page Cache 则与堆无关，不触发 GC。
+- **避免双份缓存**：若进程内再缓存一份，数据会同时存在于 JVM 堆 + Page Cache，浪费内存。直接用 Page Cache 只存一份。
+- **重启不丢缓存**：Page Cache 属于操作系统。Kafka 进程重启（甚至崩溃重启）后，**Page Cache 还在**，预热成本低；而进程内缓存一重启就清空。
+- **写靠 OS 异步刷盘**：写入只是写进 Page Cache 就返回，由操作系统按自己的策略异步刷盘（pdflush / 脏页回写）。Kafka 默认**不强制每条 fsync**，靠多副本（replica）来保证持久性，而不是靠单机立即落盘。
+
+> 代价提醒：因为依赖异步刷盘，**机器断电时尚未刷盘的 Page Cache 数据会丢**。所以 Kafka 的"不丢"不靠单机 fsync，而靠 `acks=all` + 多副本 + `min.insync.replicas`（见知识地图的可靠性章节）。
+
+---
+
+## 三、零拷贝 zero-copy（sendfile）：数据不进用户态
+
+消费时，Broker 要把磁盘/Page Cache 里的消息发给 Consumer。**传统 IO** 这条路要绕一大圈：
+
+```text
+传统 read + write（4 次拷贝 + 2 次上下文切换）
+─────────────────────────────────────────────
+磁盘 ─DMA─► [内核 Page Cache]
+              │  ① copy 到用户缓冲区（CPU）
+              ▼
+        [用户态 应用缓冲区]
+              │  ② copy 回内核 socket 缓冲区（CPU）
+              ▼
+        [内核 Socket Buffer] ─DMA─► 网卡
+
+拷贝 4 次：DMA入 + CPU出 + CPU入 + DMA出
+上下文切换 2 次：read() 一来回 + write() 一来回（用户态↔内核态）
+```
+
+数据其实只是"过个手"就发出去，根本不需要进用户态。Kafka 用 `sendfile`（Java 的 `FileChannel.transferTo`）做**零拷贝**：
+
+```text
+零拷贝 sendfile（数据不进用户态）
+─────────────────────────────────────────────
+磁盘 ─DMA─► [内核 Page Cache] ──────► 网卡
+                    │  （现代内核：只把
+                    │    文件描述符+长度
+                    │    传给 socket，数据
+                    │    由 DMA 直接读走）
+                    ▼
+              不经过用户态应用缓冲区！
+```
+
+| 对比项 | 传统 read+write | 零拷贝 sendfile |
+|---|---|---|
+| 数据拷贝次数 | 4 次（2 次 CPU 拷贝） | 2 次 DMA（基本无 CPU 拷贝） |
+| 用户态/内核态切换 | 2 次来回 | 1 次（只发起 sendfile） |
+| 数据是否进用户态 | 是（白白过一遍应用内存） | **否** |
+
+要点：
+
+- 零拷贝省掉了**用户态那两次 CPU 拷贝**和大部分上下文切换，CPU 和内存带宽都省了。
+- 配合**第二招 Page Cache**：消费热数据时通常直接命中 Page Cache，从 Page Cache 经 DMA 直达网卡，磁盘都不用读。
+- 注意：**Broker 端做消息转换/解压时零拷贝会失效**。这也是为什么推荐 Producer、Broker、Consumer 用**一致的压缩格式**，让 Broker 能原样转发（见第四招）。
+
+---
+
+## 四、批量 + 压缩：以"批"为单位省网络和磁盘
+
+Kafka 不是来一条发一条，而是 **Producer 端攒批（RecordBatch）**，整批一起发、一起压、一起落盘。
+
+**Producer 攒批的两个旋钮：**
+
+| 参数 | 含义 | 调大的效果 |
+|---|---|---|
+| `batch.size` | 单个分区批次的字节上限（默认 16KB） | 批更大、吞吐更高、延迟略升 |
+| `linger.ms` | 没攒满也最多等这么久就发（默认 0） | 给攒批一点等待时间，换更高吞吐 |
+
+> `batch.size` 和 `linger.ms` 是**满了就发 / 到点就发**，谁先到看谁。`linger.ms=0` 时也仍会把同一次发送循环内就绪的消息凑成一批。
+
+**整批压缩（compression.type）：**
+
+```text
+   ┌── RecordBatch（攒一批）──┐
+   │ msg0 msg1 msg2 ... msgN  │  ──► 整批一次性压缩 ──► 一个压缩后的批
+   └──────────────────────────┘        （lz4 / zstd / snappy / gzip）
+```
+
+- **整批压缩比逐条压缩好得多**：消息间往往有大量相似内容（同样的字段名、相似的 JSON 结构），批越大压缩率越高。
+- **常用算法权衡**：`lz4` / `snappy` 压缩快、CPU 低，吞吐场景常用；`zstd` 压缩率高、也较快，新版本推荐；`gzip` 压缩率高但 CPU 重。
+- **Broker 按压缩格式存储和转发**：Broker 通常**不解压**，直接把压缩批写进 `.log`、原样发给 Consumer，由 **Consumer 端解压**。这样磁盘、网络全程传的都是压缩数据，省网络又省磁盘，还能配合第三招零拷贝原样转发。
+
+> 一句话：批量摊薄了每条消息的固定开销（网络往返、请求头、磁盘 IO），压缩进一步压缩了网络和磁盘的字节数。
+
+---
+
+## 五、分区并行：partition 是并行的基本单位
+
+前四招让**单个 partition** 又快又省。第五招解决**横向扩展**：partition 是 Kafka 并行的基本单位。
+
+```text
+Topic: orders（切成 3 个 partition，散在不同 Broker）
+   ├ Partition 0 @ Broker1 ─┐
+   ├ Partition 1 @ Broker2 ─┤  写：多 Producer 并行写不同 partition
+   └ Partition 2 @ Broker3 ─┘      多 Broker 分摊磁盘/网络 IO
+
+         消费：同一 Consumer Group 内，一个 partition 只给一个 Consumer
+   Consumer Group A
+   ├ Consumer-1 ◄── P0, P1
+   └ Consumer-2 ◄── P2     （加 Consumer 到与分区数 1:1，吞吐线性增长）
+```
+
+- **写并行**：多个 partition 分散在多个 Broker → 多块磁盘、多张网卡同时干活，写入压力被摊开。
+- **读并行**：同一 Consumer Group 内，**一个 partition 只能被一个 Consumer 消费**，所以**消费并行度上限 = partition 数**。Consumer 数 ≈ partition 数时吞吐最佳，多出来的 Consumer 只能闲着。
+- **水平扩展**：吞吐不够就加 partition + 加 Broker + 加 Consumer，近似线性扩展。
+
+> 提醒：partition **不是越多越好**——文件句柄、内存、Leader 选举耗时都会随分区数上升。具体取舍见 [Kafka 知识地图](knowledge-graph.html) 的"分区数怎么定"。
+
+---
+
+## 一句话总结
+
+> Kafka 快 = **顺序写**（append-only log 把随机 IO 变顺序 IO）+ **Page Cache**（读写走 OS 缓存，不进 JVM 堆，免 GC、重启不丢）+ **零拷贝**（sendfile 让数据从 Page Cache 经 DMA 直达网卡、不进用户态）+ **批量压缩**（攒批整压、Broker 原样转发，省网络省磁盘）+ **分区并行**（partition 是并行单位，水平扩展）。前四招让单分区又快又省，第五招让整体能横向放大。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="kafka/performance" data-base="../"></script>
+</body>
+</html>

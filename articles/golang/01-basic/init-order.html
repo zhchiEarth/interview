@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>init 函数与包初始化顺序 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# init 函数与包初始化顺序
+
+## 一、为什么要关心这个
+
+Go 程序启动顺序看似简单——但**多个文件 + 多个包 + 全局变量 + init 函数**组合起来，顺序可能让你意外：
+
+```go
+// a.go
+var A = computeA()    // 这一行什么时候跑?
+func init() { ... }   // 这一行又什么时候?
+
+// b.go (同一个包)
+var B = A + 1         // B 依赖 A, 哪个先?
+```
+
+理解初始化顺序，是 Go 服务正确启动的基础。
+
+---
+
+## 二、整体顺序：包级 → init → main
+
+Go 程序启动的完整流程：
+
+```
+1. 编译器从 main 包开始, 递归解析所有 import
+   ↓
+2. 按 import 图深度优先, 初始化每个被导入的包
+   ↓
+   每个包内部:
+     a. 包级变量按依赖关系 + 声明顺序初始化
+     b. init() 函数按声明顺序执行
+   ↓
+3. 一个包只初始化一次, 即使被多处导入
+   ↓
+4. 最后初始化 main 包 (变量 → init)
+   ↓
+5. 调用 main()
+```
+
+```
+   main 包
+     │ import
+     ▼
+   pkg/a
+     │ import
+     ▼
+   pkg/b ── 先全部初始化完
+     ↑
+   pkg/c (也被 pkg/a import) 也先完
+     ↑
+   pkg/a 然后初始化
+     ↑
+   main 最后
+     ↓
+   main()
+```
+
+---
+
+## 三、包级变量的初始化
+
+包级（package-level）变量按**依赖关系 + 声明顺序**初始化：
+
+```go
+// a.go
+var A = computeA()       // ① A 不依赖别人, 但定义在 a.go
+
+// b.go
+var B = A + 1            // ② B 依赖 A, 必须 A 先
+var C = computeC()        // ③ C 独立, 但在 B 后面
+```
+
+实际顺序：
+
+```
+1. A (依赖空, 先按声明顺序)
+2. B (依赖 A, A 准备好后)
+3. C (依赖空, 按声明顺序)
+```
+
+### 关键规则
+
+- **没有依赖时**：按源文件**逐行声明顺序**初始化
+- **有依赖时**：依赖被先初始化
+- **多个文件**：编译器把所有 `.go` 文件的包级声明**合并**后按顺序处理
+- **循环依赖**：编译器报错（变量循环依赖）
+
+### 函数 vs 表达式
+
+```go
+var X = sideEffect()      // 调用函数, 立即求值 — 算作初始化
+var Y int                  // 零值 0, 不需要单独初始化
+const C = 5                // 编译期常量, 不算初始化阶段
+```
+
+---
+
+## 四、init 函数
+
+`init` 是个**特殊函数**——签名固定，不能调用：
+
+```go
+func init() {
+    // 没参数, 没返回值
+    // 不能手动调用
+}
+```
+
+### 特点
+
+| 性质 | 含义 |
+|---|---|
+| 签名 | `func init()`——无参无返回 |
+| **可以有多个** | 同一包、同一文件都行，按**声明顺序**执行 |
+| 跑失败（panic） | **整个程序无法启动**（init 是启动路径） |
+| 不能手动调用 | 编译器只在初始化阶段自动调 |
+| 没有 init 也行 | 大多数包不需要 init |
+
+### 多个 init 的执行顺序
+
+```go
+// a.go
+func init() { fmt.Println("a-1") }
+func init() { fmt.Println("a-2") }
+
+// b.go
+func init() { fmt.Println("b-1") }
+```
+
+执行顺序：
+
+```
+取决于编译器看到文件的顺序 (一般按文件名字母序):
+  a-1
+  a-2
+  b-1
+```
+
+⚠️ **不要依赖跨文件的 init 顺序**——文件名一改顺序可能变。
+
+### 同一文件内多个 init
+
+按**声明顺序**执行，这个有保证：
+
+```go
+// a.go
+func init() { fmt.Println("first") }
+func init() { fmt.Println("second") }
+
+// 一定先 first 再 second
+```
+
+---
+
+## 五、跨包的初始化：深度优先
+
+```
+main 包 import "a" "b"
+a 包  import "c"
+b 包  import "c"
+```
+
+初始化顺序：
+
+```
+1. c (a 和 b 都依赖, 先初始化, 且只初始化一次)
+2. a 或 b (没有相互依赖, 顺序看 import 顺序)
+3. main
+```
+
+**规则**：
+
+- 一个包**只初始化一次**——即使被多个包导入
+- 依赖的包**一定**先初始化完
+- 同级独立包按 import 顺序（不推荐依赖这个）
+
+---
+
+## 六、init 的常见用途
+
+### ✅ 用 init 的合理场景
+
+#### ① 注册插件 / 驱动
+
+```go
+package mysql
+
+import "database/sql"
+
+func init() {
+    sql.Register("mysql", &mysqlDriver{})
+}
+```
+
+```go
+package main
+import _ "github.com/go-sql-driver/mysql"   // 仅触发其 init
+
+// 之后 sql.Open("mysql", ...) 就能用了
+```
+
+这是 Go 标准库**最经典的 init 用法**——用空导入 `_` 触发包 init 注册驱动。
+
+#### ② 校验编译期约束
+
+```go
+func init() {
+    if unsafe.Sizeof(SomeStruct{}) != expectedSize {
+        panic("struct size mismatch")
+    }
+}
+```
+
+#### ③ 预生成全局表
+
+```go
+var lookupTable [256]int
+
+func init() {
+    for i := 0; i < 256; i++ {
+        lookupTable[i] = compute(i)
+    }
+}
+```
+
+### ❌ 不要用 init 的场景
+
+| 反模式 | 原因 |
+|---|---|
+| 读配置文件 | 增加全局状态，难测，副作用隐藏 |
+| 启动 goroutine | 容易导致 init 阶段死锁 / 资源未准备 |
+| 连数据库 | 启动顺序不可控，初始化失败程序起不来 |
+| 业务逻辑初始化 | 应该通过显式 `New()` 函数 |
+
+**原则**：**能用显式 `New()` 替代 init 的就不要用 init**——可测试、可控、错误能 return 而不是 panic。
+
+---
+
+## 七、空导入 `_`：只跑 init
+
+```go
+import _ "github.com/lib/pq"
+```
+
+`_` 前缀表示**只引入这个包让它的 init 跑**——不使用包里的任何符号。
+
+典型场景：
+
+- 注册数据库驱动（如上）
+- 注册编解码器（`image/png` 用作 image 的 decoder）
+- 注册插件 / 中间件
+
+```go
+import (
+    _ "image/png"   // 让 image.Decode 支持 PNG
+    _ "image/jpeg"  // 支持 JPEG
+)
+```
+
+---
+
+## 八、常见踩坑
+
+### ① 依赖跨文件 init 顺序
+
+```go
+// a.go
+var x = "hello"
+func init() { fmt.Println("a:", x) }
+
+// b.go
+func init() { x = "world" }
+```
+
+**顺序不可靠**——`a` 还是 `b` 先取决于文件名字母序。**永远不要在 init 里依赖另一个 init 的副作用**。
+
+### ② init 内启动 goroutine 然后等结果
+
+```go
+var data Data
+
+func init() {
+    go fetchData(&data)   // ❌ init 立刻返回, data 还没填好
+}
+```
+
+main 跑起来时 `data` 可能还是零值。**init 里启动后台任务要慎重**——通常用显式 `Init()` 函数 + main 显式等待。
+
+### ③ init 里访问外部资源（DB / 网络）
+
+```go
+func init() {
+    db = connectDB()   // ❌ 启动时数据库可能没起来, 整个程序起不来
+}
+```
+
+→ **应该用显式 `New()` + 让 caller 决定何时连**：
+
+```go
+func NewService(ctx context.Context) (*Service, error) {
+    db, err := connectDB(ctx)
+    if err != nil { return nil, err }
+    return &Service{db: db}, nil
+}
+```
+
+### ④ 循环导入
+
+```go
+// pkg/a
+import "pkg/b"
+
+// pkg/b
+import "pkg/a"
+```
+
+编译错：`import cycle not allowed`。**包之间不允许循环导入**——重新设计包结构（抽取公共部分到第三个包）。
+
+---
+
+## 九、一图总结
+
+```
+            Go 程序启动顺序
+                    │
+                    ▼
+   ┌──────────────────────────────────────┐
+   │ 1. 从 main 包递归找所有 import       │
+   │                                       │
+   │ 2. 按依赖图深度优先初始化:           │
+   │      a. 包级变量 (按依赖+声明顺序)   │
+   │      b. init() 函数 (按声明顺序)     │
+   │                                       │
+   │ 3. 每个包只初始化一次                │
+   │                                       │
+   │ 4. 最后初始化 main 包                │
+   │                                       │
+   │ 5. 调用 main()                        │
+   └──────────────────────────────────────┘
+
+   init 的特点:
+     ✅ 一个文件可多个 init (按声明顺序)
+     ✅ 多文件按文件名字母序 (别依赖)
+     ❌ 不能手动调
+     ❌ 跑 panic 程序起不来
+
+   常用模式:
+     ✅ 注册插件/驱动 (database/sql 风格)
+     ✅ 编译期约束校验
+     ✅ 预生成全局表
+
+   反模式:
+     ❌ init 里连 DB / 读文件 / 起 goroutine
+     ❌ init 间互相依赖副作用
+     ❌ 业务逻辑初始化 → 用 New() 替代
+
+   空导入:
+     import _ "pkg"   // 只触发 init, 不用包符号
+
+   依赖原则:
+     能用 New() 显式构造 → 不用 init
+     init 仅用于"注册"这种纯副作用的事
+```
+
+**一句话**：Go 启动顺序 = **import 图深度优先 → 每个包内变量按依赖初始化 → init() → main()**——一个包只初始化一次，同文件多个 init 按声明顺序，**跨文件按文件名字母序但不要依赖**。**init 仅用于"注册插件"这种纯副作用**——**业务逻辑初始化用显式 `New()`**，错误能 return 而不是让进程起不来。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/init-order" data-base="../../"></script>
+</body>
+</html>

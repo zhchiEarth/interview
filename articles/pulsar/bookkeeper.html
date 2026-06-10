@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BookKeeper 存储原理 · 知识图谱</title>
+<link rel="stylesheet" href="../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# BookKeeper 存储原理
+
+> 一句话：BookKeeper 把一个 Topic 存成一串只追加的 **Ledger**，每条 **Entry** 按 **E / Qw / Qa** 三个数字在一组 **Bookie** 上条带化多副本写入；Bookie 内部用 **Journal（顺序 WAL）+ EntryLog（批量数据）+ RocksDB 索引**做到读写磁盘分离。
+
+## 一、核心概念：Bookie / Ledger / Entry
+
+```text
+Topic 的数据
+  = Ledger-1 → Ledger-2 → Ledger-3 → …   （一串只追加的日志段）
+
+每个 Ledger
+  = Entry-0, Entry-1, Entry-2, …          （只追加的条目）
+
+每个 Entry
+  = 一条或一批消息（可批量）
+```
+
+| 概念 | 是什么 | 类比 |
+|------|------|------|
+| **Bookie** | 一个存储节点（BookKeeper 服务进程 + 本地盘） | 存储集群里的一台机器 |
+| **Ledger** | 只追加的日志段，**写满 / 切换后不可变** | 类比 Kafka segment，但**分布式** |
+| **Entry** | 写入的最小单元，一条或一批消息 | Kafka 里一批 record |
+
+要点：
+
+- **一个 Topic 的数据 = 一串 Ledger**，由 Broker 端的 ManagedLedger 管理首尾位置；
+- Ledger 一旦关闭就不可变，删除是**整段 Ledger** 级别（不是逐条删）；
+- 与 Kafka segment 最大不同：segment 是单 Broker 本地文件，**Ledger 的 Entry 天然分散在多个 Bookie 上**。
+
+## 二、三个数字：E / Qw / Qa（重点）
+
+每个 Ledger 创建时定下三个参数，决定它「用几台机器、写几份、几份算成功」：
+
+| 参数 | 全称 | 含义 |
+|------|------|------|
+| **E** | Ensemble Size | 这个 Ledger 一共用到几个 Bookie（副本池大小） |
+| **Qw** | Write Quorum | 每条 Entry 实际写几份副本 |
+| **Qa** | Ack Quorum | 收到几个 Bookie 的 ack 就算写成功 |
+
+恒等约束：**Qa ≤ Qw ≤ E**。
+
+```text
+例：E=3, Qw=3, Qa=2  （ensemble 恰好 = 副本数）
+Entry-0 → Bookie A, Bookie B, Bookie C   收到任意 2 个 ack 即成功
+
+例：E=5, Qw=3, Qa=2  （E > Qw → 条带化 striping）
+Entry-0 → A B C
+Entry-1 →   B C D     每条 Entry 在 ensemble 里轮流挑 Qw 个 Bookie
+Entry-2 →     C D E
+Entry-3 → A     D E
+…
+```
+
+两个关键推论：
+
+- **Qa < Qw → 不等最慢副本**：只要 Qa 份落盘就返回成功，尾延迟可控；落后的副本异步补齐；
+- **E > Qw → 条带化（striping）**：连续 Entry 轮流落到不同 Bookie 子集，于是**单个 Topic / Ledger 的写入也能分散到多台 Bookie 并行**，而不是堆在固定几台上。这是 BookKeeper 区别于「一个分区固定一组副本」的核心。
+
+## 三、Bookie 写路径：读写磁盘分离
+
+单个 Bookie 内部把「保证持久化的写」和「实际数据落盘」拆开，让读不干扰写：
+
+```text
+       写入一条 Entry
+            │
+            ▼
+   ┌──────────────────┐   顺序追加，fsync 后即 ack
+   │ Journal（WAL）    │   ← 保证持久化 + 低延迟（顺序写最快）
+   └────────┬─────────┘
+            │ 写完 Journal 即可返回成功
+            ▼
+   ┌──────────────────┐   后台批量、按 Ledger 聚合刷盘
+   │ EntryLog         │   ← 真正的数据文件
+   └────────┬─────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │ Index / Ledger   │   ← (ledgerId, entryId) → EntryLog 中的位置
+   │ 元数据（RocksDB） │
+   └──────────────────┘
+
+   读路径：查 RocksDB 索引 → 读 EntryLog / 读缓存
+           （走独立磁盘 / 缓存，不抢 Journal 的写带宽）
+```
+
+| 组件 | 职责 | 盘的角色 |
+|------|------|--------|
+| **Journal** | 顺序写的 WAL，fsync 落盘后即向客户端 ack | 用快盘/独立盘做**顺序写**，保证持久化与低写延迟 |
+| **EntryLog** | 实际数据文件，后台批量刷入 | 承载真实数据，可与读共用 |
+| **Index（RocksDB）** | 记录每条 Entry 在 EntryLog 中的位置 | Ledger / Entry 元数据索引 |
+
+设计目的：**写只追求顺序写 Journal 的极致低延迟**；**读走 EntryLog 与缓存**，两条路径走不同磁盘 / 不同负载，互不抢占——写不被读拖慢。
+
+## 四、故障与恢复
+
+**1）写入期间某个 Bookie 挂了**
+
+不阻塞、不重试到死，而是**换一组 Bookie 开新 Ledger 继续写**：
+
+```text
+正在写 Ledger-7（ensemble: A B C），Bookie B 宕机
+   → Broker（ManagedLedger）关闭 Ledger-7
+   → 用健康的 Bookie 组（如 A C D）创建 Ledger-8
+   → 后续 Entry 写入 Ledger-8，写入不中断
+```
+
+**2）副本数不足 → Auto-Recovery（re-replication）**
+
+某个 Bookie 长期下线，它持有的 Entry 副本数低于 Qw，触发自动补副本：
+
+```text
+检测：Auditor 发现某 Bookie 失联 / 某 Ledger 副本不足
+补齐：Replication Worker 从仍存活的副本读出 Entry
+      → 写到新的健康 Bookie，把副本数补回 Qw
+结果：最终恢复到目标副本数，无需人工搬数据
+```
+
+要点：故障处理「换组继续」+「后台补副本」两手；客户端写入几乎无感，恢复过程不阻塞新写入。
+
+## 五、相关阅读
+
+- 上游架构：[存算分离：Broker 无状态 + BookKeeper](storage-compute.html)
+- [分区 Topic 与无缝扩容](partitioned-topic.html)
+- [Pulsar vs Kafka](vs-kafka.html)
+- 总览：[Pulsar 渐进式理解](deep-dive-overview.html)
+
+## 一句话总结
+
+> BookKeeper = **Topic 存成一串只追加 Ledger，Entry 按 E/Qw/Qa 在多个 Bookie 上条带化多副本写**；Bookie 内部用 **Journal 保证低延迟持久化、EntryLog 批量落数据、RocksDB 建索引**实现读写分离；坏一个 Bookie 就换组开新 Ledger，副本不足由 Auto-Recovery 自动补齐。
+</script>
+<script src="../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../assets/viewer.js" data-current-id="pulsar/bookkeeper" data-base="../"></script>
+</body>
+</html>

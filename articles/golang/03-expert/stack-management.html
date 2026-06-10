@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>栈管理：分段栈 → 连续栈 · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# 栈管理：分段栈 → 连续栈
+
+> 一句话：每个 G 起步 2KB 栈；栈不够时**整个栈拷贝**到更大的新栈，遍历指针修正——这是 Go 1.4 之后的设计。
+
+## 演进
+
+| 版本 | 方案 | 痛点 |
+|---|---|---|
+| 1.0~1.3 | 分段栈（不够就 malloc 一段，链表） | 频繁切换有 hot split 问题 |
+| **1.4+** | **连续栈**：栈拷贝 + 指针修正 | 拷贝有成本但更稳定 |
+
+## 栈增长流程
+
+```text
+1. 函数序言（prologue）检查 SP 离栈底是否够
+2. 不够 → 调 morestack
+3. 分配 2× 大小新栈
+4. 拷贝旧栈数据到新栈
+5. 遍历栈中所有指针，重写指向新栈的偏移
+6. 切到新栈继续执行
+```
+
+最大栈 1GB（1.2+），超出 panic。
+
+## 栈缩
+
+GC 时看活跃使用量；用得少就缩回去（一般半数）。
+
+## 为什么 G 能这么轻
+
+- 起步 2KB（线程是 2MB）
+- 拷贝栈是 G 的事，跟 OS 无关
+- 没 syscall 也没系统调度
+
+## 写代码注意
+
+- 别取栈上变量地址保存太久（逃逸到堆），但**栈上指针在拷贝时会被自动修正**，不用担心移动后失效
+- 大数组别放栈上（动辄触发栈增长 + 拷贝）
+
+## 一句话总结
+
+> 连续栈：起步 2KB，2× 增长，拷贝旧栈+修正指针；这是 G 能像协程一样轻的根本。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/03-expert/stack-management" data-base="../../"></script>
+</body>
+</html>

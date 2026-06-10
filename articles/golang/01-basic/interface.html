@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Interface 底层是怎么实现的？ · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+# Interface 底层是怎么实现的？
+
+## 一、interface 是干嘛的
+
+**让代码"对契约编程"，而不是"对具体类型编程"**。
+
+```go
+// ❌ 对具体类型编程
+func writeToFile(f *os.File, data []byte) { ... }
+func writeToBuffer(b *bytes.Buffer, data []byte) { ... }
+// 每加一种 sink 都要写新函数
+
+// ✓ 对接口编程
+func write(w io.Writer, data []byte) { w.Write(data) }
+// 任何"有 Write 方法"的东西都能传进来
+```
+
+`io.Writer` 是个**契约**：只要你有 `Write([]byte) (int, error)`，你就是 Writer——不管底层是文件、网络、内存。
+
+Go interface 提供三件事：
+
+| 能力 | 用途 |
+|---|---|
+| **多态** | 同段代码处理不同具体类型 |
+| **解耦** | 接口定义在用户侧，实现散落各处 |
+| **类型擦除** | `any` 装任意类型，需要时断言回来 |
+
+---
+
+## 二、Go interface 的隐式实现：duck typing
+
+Go 跟 Java/C# **最大区别**：
+
+```java
+// Java: 必须显式 implements
+class MyFile implements Writer { ... }
+```
+
+```go
+// Go: 没有 implements 关键字
+type MyFile struct{}
+func (f *MyFile) Write(p []byte) (int, error) { ... }
+
+var w io.Writer = &MyFile{}   // ✓ 自动满足
+```
+
+**"长得像鸭子、叫起来像鸭子，那它就是鸭子"**。编译器根据**方法集**自动判断。
+
+### 好处
+
+- **解耦**：实现方不需要知道接口定义在哪
+- **后期抽象**：先写具体类型，之后再提取接口
+- **接口小而精**：Go 鼓励 1~3 个方法的小接口（`io.Reader` / `error`）
+
+---
+
+## 三、底层结构：iface vs eface
+
+Go 在内部用**两种结构**表示 interface：
+
+| 类型 | 用在 | 字段 |
+|---|---|---|
+| **`iface`** | 带方法的接口（`io.Writer`、`error`、...） | tab + data |
+| **`eface`** | 空接口（`interface{}` / `any`） | _type + data |
+
+### iface — 带方法的接口
+
+```go
+type iface struct {
+    tab  *itab            // 类型 + 方法表 (16 字节)
+    data unsafe.Pointer   // 实际数据指针 (8 字节)
+}
+```
+
+```
+iface (16 字节, 一对指针):
+  ┌──────────────────────┐
+  │  tab  ──────────────┼─→ *itab (类型描述+方法表)
+  ├──────────────────────┤
+  │  data ──────────────┼─→ 实际数据
+  └──────────────────────┘
+```
+
+### eface — 空接口
+
+```go
+type eface struct {
+    _type *_type          // 类型描述
+    data  unsafe.Pointer  // 实际数据指针
+}
+```
+
+```
+eface (16 字节):
+  ┌──────────────────────┐
+  │ _type ──────────────┼─→ *_type
+  ├──────────────────────┤
+  │ data  ──────────────┼─→ 实际数据
+  └──────────────────────┘
+```
+
+**eface 没方法表**——空接口本来就没方法可调，要调先 type assertion 变具体类型。
+
+> `data` 指针是 [逃逸分析](../02-advanced/escape-analysis.html) 里讲的"interface 装箱"的核心——data 必须指向真实数据存储，而那个存储**几乎总是堆**。
+
+---
+
+## 四、itab 详解：方法表是核心
+
+```go
+type itab struct {
+    inter *interfacetype  // 接口本身的描述
+    _type *_type          // 实际具体类型描述
+    hash  uint32          // _type.hash 拷贝, type switch 加速用
+    _     [4]byte
+    fun   [1]uintptr      // 方法表 (变长!)
+}
+```
+
+```
+itab 内存布局:
+  ┌─────────────────────────┐
+  │ inter  → *interfacetype │  ← "我是哪个接口"  (io.Writer)
+  ├─────────────────────────┤
+  │ _type  → *_type          │  ← "我装的具体类型" (*os.File)
+  ├─────────────────────────┤
+  │ hash   uint32            │  ← type switch 加速
+  ├─────────────────────────┤
+  │ fun[0] uintptr ──────────┼─→ (*os.File).Write 的地址
+  │ fun[1] uintptr ──────────┼─→ (*os.File).Method2 的地址
+  │ ...                      │
+  └─────────────────────────┘
+```
+
+**itab = 接口 × 具体类型的"桥梁"**——告诉运行时：
+
+- 接口要求哪些方法
+- 这个具体类型对应每个方法的实现在哪个函数地址
+
+### itab 的全局缓存
+
+itab 不是每次赋值都新建——**全局有 hash 表 `runtime.itabTable`**：
+
+```
+key:   (interfacetype, _type) 二元组
+value: *itab
+
+第一次 var w io.Writer = file:
+  ① 查 itabTable → 没有
+  ② 构造 itab:
+     - 扫 *os.File 的方法集
+     - 找出每个 io.Writer 方法的实现, 填进 fun[]
+  ③ 塞进 itabTable
+  ④ 返回 *itab
+
+之后 var w2 io.Writer = file2 (类型仍是 *os.File):
+  → 命中! 直接返回缓存
+```
+
+**关键**：
+
+- **每个 (接口, 具体类型) 组合一份 itab，全程序共享**
+- 构造只发生**一次**
+- 后续赋值只是拷贝 (tab, data) 两指针——**几乎零开销**
+
+### 接口不满足在哪检查
+
+```go
+var w io.Writer = struct{}{}   // ❌ 编译期报错: 缺 Write 方法
+```
+
+编译器构造 itab 时**如果方法缺失就直接编译失败**。Go 的接口检查 = **编译期 + 运行时缓存**。
+
+---
+
+## 五、interface 赋值时发生什么
+
+```go
+var w io.Writer = file   // file 是 *os.File
+```
+
+```
+1. 查 itabTable[(io.Writer, *os.File)] → 拿到 *itab (大概率命中)
+2. 把 (itab, file) 这对 (16 字节) 放进 w
+3. file 本身如果在栈上, 可能逃逸到堆 (interface 装箱)
+```
+
+### 装箱代价
+
+**赋值类型**（不是指针）：
+
+```go
+var i any = 42      // ❌ 42 被复制到堆, eface.data 指向堆上的 42
+```
+
+详见 [逃逸根因 ② interface 装箱](../02-advanced/escape-analysis.html)——这是**最常见的隐式堆分配**。
+
+**赋指针类型**：
+
+```go
+file := &os.File{...}
+var w io.Writer = file   // file 本身就是指针, data 直接拷贝, 不额外装箱
+```
+
+→ **小值类型多次装箱 interface 是性能陷阱**——比如 hot path 上 `fmt.Println(x)` 把 int 装进 any。
+
+---
+
+## 六、方法调用：itab.fun 的间接跳转
+
+```go
+var w io.Writer = file
+w.Write(buf)
+```
+
+汇编层面（伪代码）：
+
+```
+1. load w.tab → r1
+2. check r1 != nil (不然 nil pointer panic)
+3. load r1.fun[0] → r2    ← Write 是接口第 0 个方法
+4. load w.data → r3       (作为 receiver)
+5. call r2 (r3, buf)       ← 间接调用
+```
+
+**关键**：方法地址要从 `itab.fun` 取——一次内存间接寻址。
+
+### vs 直接调用
+
+```go
+file.Write(buf)
+```
+
+```
+1. 加载 file.Write 的函数地址 (编译期就知道)
+2. call (直接)
+```
+
+**间接 vs 直接**：
+
+- 多一次内存读（取 `itab.fun[i]`）
+- **无法 inline**（编译时不知道跳哪）
+- 间接跳转 CPU 分支预测不准
+
+实测：interface 调用比直接调用慢 **2~3 倍**。绝大多数业务代码无感，**热路径才警惕**。
+
+---
+
+## 七、类型断言：拿回具体类型
+
+```go
+var i io.Reader = file
+f, ok := i.(*os.File)
+```
+
+底层：
+
+```
+1. 拿 i.tab._type
+2. 和 *os.File 的 _type 指针比较
+3. 相等 → ok=true, f = i.data 转 *os.File
+4. 不等 → ok=false, f = nil
+```
+
+两种语法：
+
+```go
+f := i.(*os.File)         // 不带 ok, 失败直接 panic
+f, ok := i.(*os.File)     // 带 ok, 失败 ok=false 不 panic
+```
+
+### 断言到另一个接口
+
+```go
+var i any = file
+r, ok := i.(io.Reader)
+```
+
+要**重新构造 itab**：
+
+```
+1. 拿 i 的 *_type (具体类型)
+2. 在 itabTable 里查 (io.Reader, *_type)
+   命中 → 用那 itab 构造新 iface
+   未命中 → 检查具体类型是否实现 io.Reader, 是则构造并缓存
+```
+
+→ 第一次稍慢，之后缓存命中很快。
+
+---
+
+## 八、type switch
+
+```go
+switch v := i.(type) {
+case int:    ...
+case string: ...
+case *os.File: ...
+}
+```
+
+编译器生成：
+
+```
+取 i.tab.hash (或 eface 的 i._type.hash)
+按 hash 快速过滤每个 case (hash 可能撞, 命中后做完整 _type 比较)
+```
+
+**`itab.hash` 字段就是为这个准备的**——避免每个 case 都做完整指针比较。
+
+### case 顺序的影响
+
+类型 switch 是**线性扫描**（不是 jump table）——**热路径上把高频类型放最前面**。
+
+---
+
+## 九、interface == nil 的经典坑
+
+**Go 最容易踩的接口陷阱**：
+
+```go
+func mayFail() error {
+    var p *MyErr   // p 是 nil
+    return p
+}
+
+err := mayFail()
+err == nil          // false! 不是 true!
+```
+
+### 为什么
+
+`err` 是 iface = `(tab, data)`。
+
+**只有 tab 和 data 都为 nil 时，err 才等于 nil**。
+
+```
+return p (p 是 nil *MyErr):
+  → 构造 iface
+  → tab = (*MyErr, error) 的 itab (非 nil!)
+  → data = p (nil 指针)
+  → 返回 iface{tab: 非nil, data: nil}
+                ↑
+            tab 非 nil → err != nil
+```
+
+```
+真正的 nil interface:
+  iface{tab: nil, data: nil}
+```
+
+### 直观图
+
+```
+err = mayFail() 后:
+  ┌──────────────────────┐
+  │ tab → itab(*MyErr,   │  ← 非 nil!
+  │           error)     │
+  ├──────────────────────┤
+  │ data → nil           │
+  └──────────────────────┘
+   ↑
+   err != nil
+```
+
+### 正确写法
+
+```go
+func mayFail() error {
+    var p *MyErr
+    if cond { p = &MyErr{...} }
+    if p == nil {
+        return nil    // ← 显式返回 nil interface
+    }
+    return p
+}
+```
+
+### 这个坑出现在哪
+
+- 函数返回 `error` 接口、内部用具体指针
+- `interface{}` 装了一个 nil 指针
+- 几乎所有 Go 团队都踩过——`go vet` 现在能检出大部分
+
+---
+
+## 十、嵌入接口
+
+```go
+type ReadWriter interface {
+    io.Reader   // 嵌入 Reader (Read 方法)
+    io.Writer   // 嵌入 Writer (Write 方法)
+}
+```
+
+底层：`ReadWriter` 的 `interfacetype` 包含 Read + Write 两个方法。生成 itab 时编译器**为具体类型找两个方法的实现**填进 `fun[]`。
+
+嵌入是**纯语法糖**——本质上是方法集合并。
+
+### 嵌入接口 vs 嵌入具体类型
+
+```go
+type MyReader struct { io.Reader }   // 嵌入接口
+type MyFile   struct { *os.File }    // 嵌入具体类型
+```
+
+| 嵌入 | 效果 |
+|---|---|
+| **嵌入接口** | 自动有接口的方法签名；具体实现要在赋值时给 |
+| **嵌入具体类型** | 自动有具体类型的所有方法 |
+
+---
+
+## 十一、性能档位 + 何时优化
+
+| 操作 | 开销 |
+|---|---|
+| interface 赋值（指针类型） | ~1 ns |
+| **interface 赋值（值类型，装箱）** | **~30 ns**（堆分配 + 拷贝） |
+| 通过 interface 调方法 | ~3 ns（vs 直接调 ~1 ns） |
+| 类型断言（带 ok） | ~1 ns |
+| 断言到另一个接口 | ~5 ns |
+| type switch | ~2-3 ns 每 case |
+
+**实战建议**：
+
+- **绝大多数代码不用管**——2-3 ns 差异业务里感觉不到
+- **热路径（百万 QPS）才优化**：用泛型 / 具体类型 / sync.Pool 减少装箱
+- **频繁装箱小值类型最贵**——hot path 上别用 fmt 系列
+
+---
+
+## 十二、一图总结
+
+```
+                Go interface 两种表示
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+     iface (带方法接口)              eface (空接口 any)
+   ┌────────────────┐             ┌──────────────────┐
+   │ tab  *itab     │             │ _type *_type     │
+   │ data 指针      │             │ data  指针        │
+   └────────────────┘             └──────────────────┘
+
+   itab 内部:
+     inter → 接口类型
+     _type → 具体类型
+     hash  → type switch 加速
+     fun[] → 方法表 (具体类型方法地址)
+
+   全局 itabTable 缓存 (接口, 具体类型) → *itab
+
+   赋值 var w io.Writer = file:
+     itabTable 查表 → 拿 itab → 拷 (tab, data) 进 w
+     编译期检查方法集是否满足接口
+
+   方法调用 w.Write(buf):
+     load w.tab → tab.fun[0] → 间接调用
+     比直接慢 2-3× (无法 inline)
+
+   类型断言 f, ok := i.(*os.File):
+     比较 i.tab._type 和 *os.File 的 _type 指针 (~1 ns)
+
+   type switch:
+     用 itab.hash 快速过滤 + 完整 _type 比较
+
+   ★ 经典坑 ★
+   interface == nil 只在 (tab, data) 都 nil 时成立
+   返回具体类型的 nil 指针 → 接口不是 nil!
+
+   性能档位:
+     指针装 interface:     ~1 ns
+     值装 interface (装箱): ~30 ns  ← 最贵!
+     interface 方法调用:    ~3 ns
+     断言:                 ~1 ns
+```
+
+**一句话**：interface 在底层就是 **(类型描述 / itab, 数据指针)** 一对指针——**iface 带方法表，eface 不带**。**itab 全局缓存**，赋值几乎零开销；**方法调用通过 `itab.fun` 间接跳转**，慢 2-3 倍但 inline 不了。**`interface == nil` 只在 tab 和 data 都为 nil 时成立**——返回 nil 具体指针时 tab 非 nil，是 Go 最常见的"我以为是 nil 但不是"的坑。
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/01-basic/interface" data-base="../../"></script>
+</body>
+</html>

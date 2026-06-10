@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sync.RWMutex 记忆法（速记版） · 知识图谱</title>
+<link rel="stylesheet" href="../../../assets/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="site-title-link" href="../../../index.html">
+        <h1 class="site-title">知识图谱</h1>
+        <p class="site-subtitle">后端工程师 · 速记 / 速答 / 速过</p>
+      </a>
+    </div>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="meta" id="meta"></div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en" disabled>English</option>
+        </select>
+      </div>
+    </header>
+    <article class="article" id="article"></article>
+  </main>
+</div>
+<script id="content" type="text/markdown">
+<!-- [skill: go-team-standards · 技术文档] sync.RWMutex 速记 memo -->
+# sync.RWMutex 记忆法（速记版）
+
+> ## 🧠 只需要记这一行
+>
+> **RWMutex（24 字节）= 内嵌 `Mutex w` 串行写者 + `readerCount` 正负双重含义 + `writerSem`/`readerSem` 双信号量**；**写者优先**靠声明瞬间 `readerCount -= 1<<30` 变负、新读者立即让位实现；**只在「读极多写极少 + 临界区不短」才比 Mutex 划算**，其它场景反而慢。
+
+记不全时，按这条**记忆主线：一个魔法字段 + 两套加解锁 + 几个坑**展开（详细推演看[正文](sync-rwmutex.html)）：
+
+---
+
+## ⚙️ 一个魔法字段 —— `readerCount` 正负双重含义
+
+```text
+readerCount = +N → N 个读者在临界区, 写者可来抢
+            =  0 → 没读者没写者
+            < 0 → 有写者已声明 (减去了 rwmutexMaxReaders = 1<<30)
+```
+- 写者声明：`AddInt32(&readerCount, -(1<<30))` 立刻变负；Unlock 时 `+ (1<<30)` 加回正数。
+- 妙处：新读者 `readerCount.Add(1)` **一条原子加**即判断 ——`<0` 有写者在等就让位，`≥0` 直接进。免去「读 count → 查写者 → CAS+1」三步竞态。
+- 24 字节 = `w` Mutex(8) + writerSem/readerSem(4+4) + readerCount/readerWait(4+4)。
+
+## 🔁 两套加解锁 —— 读路径无锁、写路径四步
+
+```text
+RLock:   readerCount.Add(1)  ≥0 直接进(~5ns) / <0 挂 readerSem
+RUnlock: readerCount.Add(-1) <0 时 readerWait.Add(-1)==0 → 唤醒 writerSem
+
+Lock:  ① w.Lock()                  写者间串行
+       ② readerCount -= maxR       宣告写, 新读者必须等
+       ③ readerWait = 现有读者数 r  我要等这 r 个退出
+       ④ r!=0 → 挂 writerSem        最后一个 RUnlock 唤醒我
+Unlock:① readerCount += maxR       回正数
+       ② 循环 Semrelease readerSem  一次性唤醒所有等待读者(并发涌入)
+       ③ w.Unlock()                放下一个写者进申请阶段
+```
+- 两个信号量分工：`writerSem` 写者等读者退（最后一个 RUnlock 唤）；`readerSem` 写者持锁期到来的读者（写者 Unlock 唤、一次 N 个）。合成一个就分不清叫醒写者还是所有读者。
+
+## 🐢 性能法则 —— 何时用、何时别用
+
+| 场景 | 取舍 |
+|---|---|
+| 读极多写极少(>10:1) + 临界区不短 | **RWMutex 优** ✅ |
+| 读多但临界区极短(<100ns) | Mutex 反而快（原子加抢共享 cache line，颠簸） |
+| 读写各半 / 写多 | Mutex 优（写要「宣告+等读者+独占+唤醒」全套，慢 5-10×） |
+
+- RLock 主体就是 1 次原子加 ~5ns，几乎无锁 → 这是读多场景优势源头；临界区太短则协调成本摊不开。
+
+## ⚠️ 几个坑 —— 全是死锁/饿死
+
+```text
+① RLock 升级 Lock  自己持读锁、写锁等读锁退 → 死锁(无升级语义, 先 RUnlock 再 Lock)
+② Lock 降级 RLock  写锁没放, RLock 等不到 → 死锁(Downgrade 提案未实现)
+③ 读锁内嵌读锁     期间有写者插入 → readerCount 已负, 内层 RLock 挂起自等 → 死锁(读锁不可重入)
+④ 长读             RLock 内做几秒重活 → 写者全等、新读者被"写者优先"挡住 → 写饿死
+⑤ 不能 copy        内嵌 Mutex + 原子计数器都不能复制(go vet 检查)
+```
+</script>
+<script src="../../../assets/manifest.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="../../../assets/viewer.js" data-current-id="golang/02-advanced/sync-rwmutex-memo" data-base="../../"></script>
+</body>
+</html>
