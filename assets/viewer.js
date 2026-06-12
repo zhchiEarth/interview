@@ -194,8 +194,39 @@
     }, { passive: true });
   }
 
+  function setupMobileNav() {
+    const sidebar = document.querySelector(".sidebar");
+    const header = document.querySelector(".sidebar-header");
+    if (!sidebar || !header || header.querySelector(".nav-toggle")) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "nav-toggle";
+    btn.setAttribute("aria-label", "目录");
+    const sync = () => {
+      btn.textContent = sidebar.classList.contains("open") ? "✕ 关闭" : "☰ 目录";
+    };
+    btn.addEventListener("click", () => {
+      const opening = !sidebar.classList.contains("open");
+      sidebar.classList.toggle("open");
+      sync();
+      if (opening) {
+        // 展开时把“当前正在看的文档”那条滚到目录中部，而不是停在最顶上
+        const nav = sidebar.querySelector(".nav");
+        const active = sidebar.querySelector(".nav-item.active");
+        if (nav && active) {
+          const cr = nav.getBoundingClientRect();
+          const ar = active.getBoundingClientRect();
+          nav.scrollTop += (ar.top - cr.top) - nav.clientHeight / 2 + ar.height / 2;
+        }
+      }
+    });
+    header.appendChild(btn);
+    sync();
+  }
+
   setSiteHeader();
   renderSidebar();
   renderArticle();
   restoreSidebarScroll();
+  setupMobileNav();
 })();
